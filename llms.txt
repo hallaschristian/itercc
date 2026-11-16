@@ -1,0 +1,191 @@
+# IterCC
+
+> IterCC is a Python package for high-accuracy closed-shell coupled-cluster
+> calculations: full CCSD, CCSDT and CCSDTQ ground-state energies, singlet
+> EOM-CCSDT excitation energies, and CCSDT dipole polarizabilities (static,
+> frequency-dependent, damped). It runs on a compiled multi-core CPU core or on
+> NVIDIA GPUs (CuPy). Inputs are molecular-orbital integrals; a PySCF adapter
+> builds them. Energies are in hartree (Eh), polarizabilities in atomic units.
+
+This file is the complete usage guide for AI assistants. Follow it literally;
+everything here is tested. Repository: https://github.com/hallaschristian/itercc
+
+## Install
+
+```sh
+pip install "itercc[pyscf] @ git+https://github.com/hallaschristian/itercc"   # or: pip install ".[pyscf]" in a clone
+```
+
+Linux or WSL, Python >= 3.10, a C++17 compiler with OpenMP (g++ >= 8). The
+compiled core builds itself on first use (about 10 s, cached in
+`~/.cache/itercc`). Without a compiler IterCC still works but warns and is many
+times slower. GPU use additionally needs `pip install cupy-cuda12x`.
+
+## The standard workflow
+
+Every calculation is: PySCF RHF -> `from_rhf` -> `RestrictedCC` (CCSDT) ->
+optional EOM / response / CCSDTQ.
+
+```python
+from pyscf import gto, scf
+from itercc import RestrictedCC, EOMSinglet, DipoleResponse
+from itercc.pyscf_interface import from_rhf, dipole_integrals
+
+mol = gto.M(atom="O 0 0 0.117; H 0 0.757 -0.469; H 0 -0.757 -0.469",   # Angstrom
+            basis="cc-pvdz", symmetry=True, verbose=0)
+mf = scf.RHF(mol).run(conv_tol=1e-12)
+model = from_rhf(mf, frozen=1)            # frozen core: number of lowest MOs to freeze (O 1s here)
+
+cc = RestrictedCC(model.h, model.eri, model.nocc, model.constant,
+                  orbital_irreps=model.orbital_irreps, symmetry_tolerance=1e-8)
+ground = cc.solve(energy_tol=1e-12, residual_tol=1e-10, max_iter=200)
+assert ground.converged
+print(ground.energy)                      # total CCSDT energy, Eh  (-76.2411862596 here)
+
+# Singlet excitation energies, one symmetry sector per solve
+eom = EOMSinglet(cc, ground.amplitudes, orbital_irreps=model.orbital_irreps, irrep=2)
+states = eom.solve(nroots=3, residual_tol=1e-6)
+print(states.excitation_energies)         # Eh; multiply by 27.211386 for eV
+
+# Dipole polarizability
+dipoles, dipole_irreps = dipole_integrals(model, mol)
+response = DipoleResponse(cc, ground.amplitudes, dipoles,
+                          orbital_irreps=model.orbital_irreps, dipole_irreps=dipole_irreps)
+alpha = response.polarizability(float("inf")).tensor_au.real      # static 3x3 tensor, au
+alpha_532 = response.polarizability(532.0).tensor_au.real         # at 532 nm
+```
+
+CCSDTQ (start from CCSDT amplitudes; much more expensive):
+
+```python
+from itercc import RestrictedCCSDTQ
+solver = RestrictedCCSDTQ(model.h, model.eri, model.nocc, model.constant,
+                          orbital_irreps=model.orbital_irreps, backend="cpu")  # default backend is "cuda"!
+t1, t2, t3 = ground.amplitudes
+result = solver.solve(initial=(t1, t2, solver.expand_triples(t3)),
+                      energy_tol=1e-10, residual_tol=1e-7, diis_size=8, damping=0.2)
+print(result.energy, result.converged)
+```
+
+CCSD instead of CCSDT: `RestrictedCC(..., rank=2)`; for EOM-CCSD/CCSD response
+also pass `method="ccsd"` to `EOMSinglet` / `DipoleResponse`.
+
+## Rules that prevent wrong results or errors
+
+1. Always check `.converged` before using an energy; unconverged results are not results.
+2. EOM and response require the ground state solved to `residual_tol=1e-10` or
+   tighter (they raise `ValueError: Ground-state residual ... exceeds 1e-10` otherwise).
+   Use `energy_tol=1e-12, residual_tol=1e-10, max_iter=200` for any ground
+   state that feeds EOM or response.
+3. `RestrictedCCSDTQ` defaults to `backend="cuda"`. Pass `backend="cpu"` unless a GPU and CuPy are present.
+4. Build the PySCF molecule with `symmetry=True` and pass
+   `orbital_irreps=model.orbital_irreps` plus `symmetry_tolerance=1e-8` to
+   `RestrictedCC`: symmetry makes every step several times faster and
+   changes nothing else. Without symmetry, `model.orbital_irreps` is None and
+   everything still works (dense, slower); EOM then only supports `irrep=0`.
+5. EOM `irrep` uses PySCF's Abelian irrep ids (D2h and subgroups). C2v: A1=0,
+   A2=1, B1=2, B2=3. D2h: Ag=0, B1g=1, B2g=2, B3g=3, Au=4, B1u=5, B2u=6, B3u=7.
+   To find the lowest excited states of a molecule, solve each irrep (a few
+   roots each) and sort. `pyscf.symm.irrep_name2id(mol.groupname, "B2")` converts names.
+   Linear molecules: from_rhf labels them in D2h (or C2v for C-inf-v), so a
+   Pi state appears as a pair of degenerate B2/B3 (or B1/B2) roots.
+6. Only closed-shell RHF references. No UHF/ROHF, no density fitting, no
+   Kohn-Sham orbitals. `from_rhf` raises `ValueError` for these.
+7. `eom.solve` needs `max_space >= 2 * nroots + 1` (default 20).
+8. Excitation energies are relative to the CC ground state; `states.total_energies` are absolute.
+9. Frozen core: freeze the chemical core (1 per first-row atom, 5 per second-row atom) unless core correlation is wanted.
+10. Do not pass Kohn-Sham, ROHF or fractional-occupation mean fields; do not reorder the orbitals from `from_rhf`.
+
+## API reference
+
+### itercc.pyscf_interface.from_rhf(mf, *, frozen=0) -> SpatialIntegrals
+Converged PySCF `scf.RHF` (or scalar-X2C `scf.RHF(mol).x2c()`) -> fields
+`h` (one-electron MO matrix), `eri` (chemists' (pq|rs), dense 4-index), `nocc`
+(correlated occupied orbitals), `constant` (nuclear repulsion + frozen-core
+energy), `mo_coeff` (correlated MOs), `orbital_irreps` (int array or None).
+
+### itercc.pyscf_interface.dipole_integrals(model, mol, *, origin=None) -> (dipoles, dipole_irreps)
+Electronic dipole matrices -r, shape (3, n, n), in the frame of `model`;
+origin at the centre of nuclear charge by default. `dipole_irreps` is a tuple
+of three ints (None without labels).
+
+### RestrictedCC(h, eri, nocc, constant=0.0, *, orbital_irreps=None, symmetry_tolerance=0.0, rank=3, cpu_threads=None, residual_backend="cpu", ...)
+CCSDT (rank=3) or CCSD (rank=2). Any real orthonormal MO Hamiltonian works:
+occupied orbitals first, `eri[p,q,r,s] = (pq|rs)`.
+- `.solve(*, initial=None, energy_tol=1e-11, residual_tol=1e-9, max_iter=100, diis_size=6, diis_triples=False, level_shift=0.0, damping=0.0, callback=None, checkpoint_callback=None) -> Result`
+- `Result`: `energy` (total), `correlation_energy`, `amplitudes` = (t1[i,a], t2[i,j,a,b], t3[slot,a,b,c]), `converged`, `iterations` (records with `energy`, `delta_energy`, `residual_max`), `residual_max`.
+- Convergence trouble: increase `max_iter`, use `diis_size=8`, `damping=0.2`, or `diis_triples=True`.
+
+### RestrictedCCSDTQ(h, eri, nocc, constant=0.0, *, orbital_irreps=None, symmetry_tolerance=1e-9, backend="cuda", precision="double", block_size=None, host_r4=False)
+- `.solve(*, initial=None, max_iter=100, energy_tol=1e-11, residual_tol=1e-9, damping=0.0, diis_size=6, diis_quadruples=False, callback=None, checkpoint=None, resume=None) -> Result` with amplitudes (t1, t2, t3, t4).
+- `initial=(t1, t2, solver.expand_triples(t3))` starts from CCSDT (T4 = 0); None starts from zero.
+- Diffuse basis sets (aug-cc-pVXZ) can have a T4 residual that grows while the energy settles: use `diis_quadruples="host"`, `diis_size=8` to 10, `damping=0.2`.
+- Checkpoints: `solve(checkpoint=lambda state: solver.save_state("ccsdtq_state", state))` writes a
+  directory after every iteration; to continue (same Hamiltonian and settings, any process):
+  `state, _ = solver.load_state("ccsdtq_state")`, then `solver.solve(resume=state, ...)`.
+- GPU memory estimate: `solver.device_bytes(diis_size=..., diis_quadruples=...)`; if R4 does not fit, `host_r4=True, block_size=2`.
+
+### EOMSinglet(solver, amplitudes, *, orbital_irreps=None, irrep=0, backend="cpu", method="ccsdt")
+Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
+`RestrictedCC` that produced `amplitudes`.
+- `.solve(nroots=3, *, residual_tol=1e-8, max_iter=100, max_space=20, guesses=None) -> EOMResult`
+- `EOMResult`: `converged`, `excitation_energies` (Eh, ascending), `total_energies`, `vectors`, `residual_norms`, `irrep`, `matvecs`.
+- `residual_tol=1e-6` puts excitation energies within about 3e-8 Eh (1 micro-eV) of tightly
+  converged roots and needs about 30% fewer Jacobian actions than 1e-9 (measured on water).
+
+### DipoleResponse(solver, amplitudes, dipoles, *, orbital_irreps=None, dipole_irreps=None, backend="cpu", method="ccsdt")
+- `.polarizability(wavelength_nm, *, damping_Eh=0.0, tol=1e-8) -> Polarizability`
+- `float("inf")` = static. `damping_Eh > 0` gives the complex damped tensor (absorption in the imaginary part).
+- `Polarizability`: `tensor_au` (complex 3x3), `wavelength_nm`, `frequency_Eh`, `damping_Eh`.
+- Reuse one `DipoleResponse` for many wavelengths: later wavelengths start from earlier solutions and get cheaper.
+- `tol=1e-6` reproduces tightly converged tensors to about 2e-8 relative (measured on water).
+
+### spin_orbit_state_interaction(singlet_energies, triplet_energies, pauli, singlet_triplet, triplet_singlet, triplet_triplet, *, backend="cpu") -> SpinOrbitResult
+First-order SOC state interaction from caller-supplied transition spin
+densities; `itercc.pyscf_interface.x2c_spin_orbit(mf, mo_coeff=model.mo_coeff)`
+builds the one-electron X2C SOC operator. See docs/guide.md#spin-orbit-coupling.
+
+### Others
+`TensorCC(Hamiltonian.restricted(h, eri, nocc, constant), rank=3)`: slow
+independent spin-orbital reference for small checks. `TripletEOMCCSDTQ`:
+experimental, small systems only.
+
+## GPU
+
+```python
+cc = RestrictedCC(model.h, model.eri, model.nocc, model.constant, residual_backend="cuda",
+                  cuda_pair_fusion=True, cuda_layout_fusion=True, cuda_crossed_fusion=True,
+                  cuda_pool_cache=True)
+eom = EOMSinglet(cc, ground.amplitudes, backend="cuda", orbital_irreps=model.orbital_irreps, irrep=2)
+solver = RestrictedCCSDTQ(..., backend="cuda")
+```
+Use data-centre GPUs (A100/H100). Consumer GPUs have slow double precision:
+the CPU path is usually faster there.
+
+## Performance and limits
+
+- Threads: one per physical core by default; set `ITERCC_CPU_THREADS=<cores>`
+  on clusters. `OMP_NUM_THREADS` is ignored by the kernels. On multi-socket
+  nodes run one calculation per socket: `numactl --cpunodebind=0 --membind=0 python run.py`.
+- Cost grows as n_occ^3 n_vir^5 per CCSDT iteration and n_occ^4 n_vir^6 per CCSDTQ iteration (less with symmetry).
+- Memory: CCSDT holds a few copies of T3 (8 * n_occ^3/6 * n_vir^3 bytes each);
+  CCSDTQ a few copies of T4 (about 8 * n_occ^4/24 * n_vir^4 / n_irreps bytes each).
+- Measured (12-core desktop, water): CCSDT aug-cc-pVTZ (4 occ, 87 vir) 1.2 s per
+  iteration, 19 s total. 56-core Sapphire Rapids socket: CCSDT 13 occ / 131 vir 9.2 s
+  per iteration; CCSDTQ 13 occ / 47 vir (C2v) 85 s per iteration.
+
+## Errors
+
+- `RuntimeWarning: IterCC: no compiled CPU kernels (...)` -> no working C++/OpenMP compiler;
+  install g++ (or point `ITERCC_CXX` at one). Results stay correct, only slower.
+- `ValueError: Ground-state residual ... exceeds` -> re-solve the ground state with `residual_tol=1e-10`.
+- `ValueError: Expected converged RHF` -> run `mf.run()` to convergence; RHF only.
+- `ValueError: Near-zero orbital denominator` -> pass `level_shift=0.1` (or larger) to `solve`.
+- `converged=False` -> raise `max_iter`; for CCSDTQ add `damping=0.2, diis_quadruples="host"`.
+- `ModuleNotFoundError: cupy` -> pass `backend="cpu"` (CCSDTQ) or install CuPy.
+
+## More
+
+- docs/guide.md: full user guide (all options, checkpoints, tuning switches).
+- docs/benchmarks.md: comparisons with PySCF, ccpy and NWChem.
+- examples/: runnable scripts (minimal.py needs only NumPy).

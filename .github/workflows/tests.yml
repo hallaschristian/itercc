@@ -16,8 +16,8 @@ jobs:
       # The compiled core is built on first use with the runner's g++ (OpenMP).
       ITERCC_KERNEL_CACHE: ${{ github.workspace }}/.kernel-cache
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
@@ -31,4 +31,5 @@ jobs:
       - name: Examples
         run: |
           python examples/minimal.py
+          python examples/water_ccsdt.py 6-31g
           python examples/ccsdtq.py

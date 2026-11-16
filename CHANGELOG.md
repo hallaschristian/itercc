@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0
+
+- `from_rhf` returns the Abelian `orbital_irreps` of the correlated orbitals
+  (linear molecules: their D2h or C2v subgroup), and
+  `pyscf_interface.dipole_integrals(model, mol)` gives the dipole matrices and
+  their irreps, so a PySCF calculation feeds every solver without helper code.
+- Documentation rewritten: a short README, one user guide, a design page, and
+  `llms.txt`, a complete usage guide for AI assistants.
+- `benchmarks/compare.py`: timings against PySCF, ccpy and NWChem on the same
+  machine, with the figures and tables of `docs/benchmarks.md`.
+
 ## 0.7.0
 
 First standalone release of the IterCC package.

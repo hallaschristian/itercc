@@ -27,20 +27,16 @@ def main():
     args = parser.parse_args()
 
     from pyscf import gto, scf
-    from pyscf.scf import hf_symm
 
     from itercc import RestrictedCC
     from itercc.pyscf_interface import from_rhf
 
-    symmetry = not args.no_symmetry
-    mol = gto.M(atom=args.atom, basis=args.basis, symmetry=symmetry, verbose=0)
-    if symmetry and mol.groupname in ("Dooh", "Coov"):
-        mol = gto.M(atom=args.atom, basis=args.basis, verbose=0,
-                    symmetry="D2h" if mol.groupname == "Dooh" else "C2v")
+    mol = gto.M(atom=args.atom, basis=args.basis, symmetry=not args.no_symmetry, verbose=0)
     mf = scf.RHF(mol).run(conv_tol=1e-12)
     model = from_rhf(mf, frozen=args.frozen)
-    labels = (np.asarray(hf_symm.get_orbsym(mol, mf.mo_coeff), dtype=np.int64)[args.frozen:]
-              if symmetry else np.zeros(model.mo_coeff.shape[1], dtype=np.int64))
+    labels = model.orbital_irreps
+    if labels is None:
+        labels = np.zeros(len(model.h), dtype=np.int64)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(args.output, h=model.h, eri=model.eri, nocc=model.nocc, constant=model.constant,
              orbital_irreps=labels)

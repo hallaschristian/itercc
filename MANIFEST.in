@@ -1,7 +1,7 @@
-include README.md CHANGELOG.md LICENSE LICENSE.pdaggerq LICENSE.pyscf NOTICE.pyscf THIRD_PARTY.md
-recursive-include docs *.md
+include README.md llms.txt CHANGELOG.md LICENSE LICENSE.pdaggerq LICENSE.pyscf NOTICE.pyscf THIRD_PARTY.md
+recursive-include docs *.md *.svg
 recursive-include examples *.py
-recursive-include benchmarks *.py
+recursive-include benchmarks *.py *.sh
 include core/CMakeLists.txt core/build_levels.sh
 recursive-include core/include *.h
 recursive-include core/src *.cpp *.cu *.h

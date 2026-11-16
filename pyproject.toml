@@ -27,7 +27,13 @@ classifiers = [
 [project.optional-dependencies]
 pyscf = ["pyscf>=2.6"]
 test = ["pytest>=8", "pyscf==2.14.0"]
-benchmarks = ["pyscf>=2.6", "threadpoolctl>=3"]
+benchmarks = ["pyscf>=2.6", "threadpoolctl>=3", "psutil>=5", "matplotlib>=3.7"]
+
+[project.urls]
+Homepage = "https://github.com/hallaschristian/itercc"
+Documentation = "https://github.com/hallaschristian/itercc/blob/main/docs/guide.md"
+Changelog = "https://github.com/hallaschristian/itercc/blob/main/CHANGELOG.md"
+Issues = "https://github.com/hallaschristian/itercc/issues"
 
 [tool.setuptools]
 packages = ["itercc"]

@@ -1,7 +1,7 @@
 """Iterative closed-shell coupled cluster through CCSDTQ, EOM-CCSDT excitation
 energies and CCSDT dipole response, on compiled CPU kernels or CUDA."""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 from .hamiltonian import Hamiltonian
 from .restricted import RestrictedCC
