@@ -1,0 +1,116 @@
+"""Canonical spin-orbital quadruples indexed by occupied tuple and virtual irrep."""
+from functools import lru_cache
+from itertools import combinations, permutations, product
+
+import numpy as np
+
+
+def alpha_count(indices):
+    return sum(i % 2 == 0 for i in indices)
+
+
+def parity(indices):
+    return (-1) ** sum(i > j for i, j in combinations(indices, 2))
+
+
+@lru_cache(maxsize=None)
+def signed_permutations(rank):
+    return tuple((order, parity(order)) for order in permutations(range(rank)))
+
+
+def orbital_irrep(indices, labels):
+    value = 0
+    for index in indices:
+        value ^= int(labels[index // 2])
+    return value
+
+
+class PackedSpinQuadruples:
+    """Rank-four amplitudes with independently antisymmetric spin-orbital legs.
+
+    Store only ordered particle and hole lists in one spin and spatial sector.
+    Each hole slot owns a contiguous segment from a shared virtual table.
+    """
+
+    def __init__(self, occupied, virtual, irrep, spin_change):
+        self.occupied, self.virtual = np.asarray(occupied), np.asarray(virtual)
+        self.no, self.nv = len(occupied), len(virtual)
+        self.irrep, self.spin_change = irrep, spin_change
+        groups = {}
+        for particles in combinations(range(2 * self.nv), 4):
+            key = alpha_count(particles), orbital_irrep(particles, virtual)
+            groups.setdefault(key, []).append(particles)
+        self.groups = {key: np.array(rows, dtype=np.int32) for key, rows in groups.items()}
+        self.slots = {}
+        self.size = 0
+        self._virtual_maps = {}
+        for holes in combinations(range(2 * self.no), 4):
+            key = alpha_count(holes) + spin_change, orbital_irrep(holes, occupied) ^ irrep
+            if key in self.groups:
+                size = len(self.groups[key])
+                self.slots[holes] = (key, slice(self.size, self.size + size))
+                self.size += size
+
+    def _virtual_map(self, signature, key, xp):
+        cache_key = signature, key, xp
+        if cache_key in self._virtual_maps:
+            return self._virtual_maps[cache_key]
+        canonical = self.groups[key]
+        # Build all placements that match this spin order. There are at most
+        # 24, even though the tensor has nv**4 entries.
+        expected = np.array(signature, dtype=np.int32)
+        indices = []
+        for order, sign in signed_permutations(4):
+            permuted = canonical[:, order]
+            selected = np.flatnonzero(np.all(permuted % 2 == expected, axis=1))
+            if selected.size:
+                position = np.ravel_multi_index((permuted[selected] // 2).T, (self.nv,) * 4)
+                indices.append((xp.asarray(selected, dtype=np.int32),
+                                xp.asarray(position, dtype=np.int32), sign))
+        self._virtual_maps[cache_key] = tuple(indices)
+        return self._virtual_maps[cache_key]
+
+    def expand(self, vector, signature, cuts, xp):
+        """Expand only the occupied tile requested by one contraction."""
+        lengths = tuple(len(range(*cut.indices(self.no))) for cut in cuts)
+        output = xp.zeros(lengths + (self.nv**4,), dtype=vector.dtype)
+        occupied = (range(*cut.indices(self.no)) for cut in cuts)
+        for row, labels in enumerate(product(*occupied)):
+            holes = tuple(2 * i + spin for i, spin in zip(labels, signature[4:]))
+            if len(set(holes)) != 4:
+                continue
+            sorted_holes = tuple(sorted(holes))
+            item = self.slots.get(sorted_holes)
+            if item is None:
+                continue
+            key, window = item
+            values = vector[window]
+            target = output.reshape(-1, self.nv**4)[row]
+            phase = parity(holes)
+            for source, target_positions, sign in self._virtual_map(signature[:4], key, xp):
+                target[target_positions] = (sign * phase) * values[source]
+        axes = tuple(range(4, 8)) + tuple(range(4))
+        return output.reshape(lengths + (self.nv,) * 4).transpose(axes)
+
+    def from_restricted(self, solver, amplitudes, xp):
+        """Convert a restricted checkpoint directly into canonical spin slots."""
+        if amplitudes.shape == solver.layout.dense_shape:
+            packed = amplitudes
+        elif not solver.layout.symmetric:
+            packed = amplitudes.reshape(solver.layout.dense_shape)
+        else:
+            packed = solver.quadruples_to_dense(amplitudes)
+        spatial_slots = {slot: row for row, slot in enumerate(solver.layout.indices)}
+        result = xp.empty(self.size, dtype=np.float64)
+        for holes, (key, window) in self.slots.items():
+            tile = packed[spatial_slots[tuple(i // 2 for i in holes)]]
+            if hasattr(tile, "get"):
+                tile = tile.get()
+            flat = tile.reshape(-1)
+            spins = tuple(h % 2 for h in holes)
+            values = np.zeros(len(self.groups[key]))
+            # The expansion map is also the spin-lift gather map.
+            for source, positions, sign in self._virtual_map(spins, key, np):
+                values[source] += sign * flat[positions]
+            result[window] = xp.asarray(values)
+        return result

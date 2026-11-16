@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itercc"
+dynamic = ["version"]
+description = "Iterative closed-shell coupled cluster through CCSDTQ, EOM-CCSDT and CCSDT linear response, on compiled CPU kernels or CUDA"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSE.pdaggerq", "LICENSE.pyscf", "NOTICE.pyscf"]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "scipy>=1.11"]
+keywords = ["quantum chemistry", "coupled cluster", "CCSDT", "CCSDTQ", "EOM-CC",
+            "linear response", "polarizability", "GPU", "OpenMP", "HPC"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+pyscf = ["pyscf>=2.6"]
+test = ["pytest>=8", "pyscf==2.14.0"]
+benchmarks = ["pyscf>=2.6", "threadpoolctl>=3"]
+
+[tool.setuptools]
+packages = ["itercc"]
+
+[tool.setuptools.dynamic]
+version = { attr = "itercc.__version__" }
+
+[tool.setuptools.package-data]
+# Core libraries installed into itercc/ by CMake (see README, core/build_levels.sh).
+itercc = ["libitercc_*.so"]
+
+[tool.setuptools.exclude-package-data]
+# Machine-specific builds run from core/build or an explicit ITERCC_CORE_DIR.
+itercc = ["libitercc_core.native.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,1133 @@
+"""CPU assembly of the restricted CCSD and CCSDT residual terms.
+
+The generic loop in `RestrictedCC._triples` builds one (j, k) seed at a time
+with small GEMMs and tile-sized NumPy operations; on the CPU that is
+memory-bound and uses a few cores. Here:
+
+* the seeds of a whole k plane come from five large GEMMs, and the one-body
+  virtual term is folded into the ladder matrix;
+* the T3 feedback uses two GEMMs per occupied plane;
+* with the compiled core (`_cpu_kernels`) every GEMM runs on its GEMM
+  executor (`product_into`, `matmul`: all threads, no BLAS), one fused pass
+  per plane builds the GEMM operands and one assembles the seeds, and each
+  thread owns whole rows of R3 in the scatter. `CompiledContract` puts the
+  CCSD and lower-rank products on the same executor;
+* without it, the GEMMs run in NumPy and copies, spin sums and transposed
+  sums on a Python thread pool, overlapping the GEMMs of the neighbouring
+  planes.
+
+Thread counts come from `cpu_threads` (a solver's `thread_scope`,
+ITERCC_CPU_THREADS, or one per core of the affinity mask). Each task writes its own part of the
+output in a fixed order, so the result does not depend on the thread count.
+"""
+
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from functools import lru_cache, partial
+import os
+from pathlib import Path
+import threading
+
+import numpy as np
+
+from . import _cpu_kernels as _kernels
+from ._pair_symmetry import PairSectors
+
+_ORIENTATIONS = ((0, 1, 2), (0, 2, 1), (1, 2, 0))
+_SLOT_BATCH = 8         # slots per ladder or purification operation
+
+
+def _cpu_set():
+    try:
+        return set(os.sched_getaffinity(0))
+    except AttributeError:
+        return set(range(os.cpu_count() or 1))
+
+
+def _process_cpus():
+    return len(_cpu_set())
+
+
+# The CPUs of the process, read at import (with OMP_PROC_BIND set, the OpenMP
+# runtime later binds the calling thread to a single core, and an affinity
+# read then would see one CPU).
+_PROCESS_CPU_SET = _cpu_set()
+_PROCESS_CPUS = len(_PROCESS_CPU_SET)
+
+
+def _available_cpus():
+    return max(_process_cpus(), _PROCESS_CPUS)
+
+
+def _id_list(text):
+    """The integers of a Linux list such as "0-3,8,10-11"."""
+    values = set()
+    for part in text.strip().split(","):
+        if part:
+            first, _, last = part.partition("-")
+            values.update(range(int(first), int(last or first) + 1))
+    return values
+
+
+@lru_cache(maxsize=8)
+def _cores(cpus):
+    """Physical cores among the CPUs `cpus` (SMT siblings count once), or
+    len(cpus) where the topology is not exposed."""
+    cores = set()
+    for cpu in cpus:
+        try:
+            siblings = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text()
+            cores.add(min(_id_list(siblings)))
+        except (OSError, ValueError):
+            return len(cpus)
+    return max(1, len(cores))
+
+
+_PROCESS_CORES = _cores(frozenset(_PROCESS_CPU_SET))
+
+
+def _available_cores():
+    # Fewer CPUs than at import: bound to one by the OpenMP runtime.
+    current = _cpu_set()
+    return _PROCESS_CORES if len(current) <= _PROCESS_CPUS else _cores(frozenset(current))
+
+
+def _cgroup_memory_limit():
+    """The smallest memory limit of this process's cgroup and its ancestors
+    (cgroup v2 memory.max or v1 memory.limit_in_bytes), or None."""
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return None
+    limits = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        if parts[1] == "":
+            base, name = Path("/sys/fs/cgroup"), "memory.max"
+        elif "memory" in parts[1].split(","):
+            base, name = Path("/sys/fs/cgroup/memory"), "memory.limit_in_bytes"
+        else:
+            continue
+        group = Path(parts[2])
+        while True:
+            try:
+                text = (base / group.relative_to("/") / name).read_text().strip()
+            except (OSError, ValueError):
+                text = ""
+            if text.isdigit() and int(text) < 2**60:
+                limits.append(int(text))
+            if group == group.parent:
+                break
+            group = group.parent
+    return min(limits, default=None)
+
+
+def _numa_memory():
+    """Memory of the NUMA nodes this process allocates on, or None: the nodes
+    of Mems_allowed_list whose CPUs it may run on. numactl --cpunodebind
+    narrows the affinity (read at import), while --membind leaves
+    Mems_allowed_list (the cpuset) unchanged, so the CPUs decide."""
+    try:
+        status = Path("/proc/self/status").read_text()
+        allowed = _id_list(next(line.split(":", 1)[1] for line in status.splitlines()
+                                if line.startswith("Mems_allowed_list")))
+        nodes = {node for node in allowed
+                 if _id_list(Path(f"/sys/devices/system/node/node{node}/cpulist").read_text())
+                 & _PROCESS_CPU_SET} or allowed
+        total = 0
+        for node in nodes:
+            text = Path(f"/sys/devices/system/node/node{node}/meminfo").read_text()
+            total += next(int(line.split()[-2]) for line in text.splitlines() if "MemTotal" in line) * 1024
+        return total or None
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+def host_memory_limit():
+    """Bytes of host memory this process may use: the least of physical
+    memory, the cgroup limit, the Slurm allocation (SLURM_MEM_PER_NODE, or
+    SLURM_MEM_PER_CPU per allowed CPU; 0 means the whole node) and the memory
+    of the NUMA nodes it runs on (a point per socket)."""
+    limits = []
+    try:
+        physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        pass
+    else:
+        if physical > 0:
+            limits.append(physical)
+    for value in (_cgroup_memory_limit(), _numa_memory()):
+        if value is not None:
+            limits.append(value)
+    per_node, per_cpu = os.environ.get("SLURM_MEM_PER_NODE"), os.environ.get("SLURM_MEM_PER_CPU")
+    if per_node and per_node.isdigit() and int(per_node) > 0:
+        limits.append(int(per_node) * 2**20)
+    elif per_cpu and per_cpu.isdigit() and int(per_cpu) > 0:
+        limits.append(int(per_cpu) * 2**20 * _PROCESS_CPUS)
+    return min(limits, default=None)
+
+
+def resident_bytes():
+    """Resident host memory of this process in bytes (0 where unknown)."""
+    try:
+        return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return 0
+
+
+_SCOPE = threading.local()
+
+
+@contextmanager
+def thread_scope(threads):
+    """Inside the block, `cpu_threads()` without an explicit count returns
+    `threads` (None: no change) in this Python thread: a solver's thread
+    option reaches every kernel it calls."""
+    previous = getattr(_SCOPE, "threads", None)
+    if threads is not None:
+        _SCOPE.threads = int(threads)
+    try:
+        yield
+    finally:
+        _SCOPE.threads = previous
+
+
+def cpu_threads(requested=None):
+    """Threads of the compiled kernels: `requested`, the enclosing
+    `thread_scope`, ITERCC_CPU_THREADS, or one per physical core of the
+    affinity mask (the hot paths call no BLAS, so NumPy's OpenBLAS count,
+    capped at 64, does not bound them). SMT siblings add no arithmetic, and a
+    team on every logical CPU of a shared machine waits at each barrier for
+    CPUs the host is using: in a 24-CPU WSL VM on 12 cores, 24 threads made a
+    CCSDT Jacobian action 4.6x slower than 12. The NumPy fallback is limited
+    by GIL hand-offs between Python threads and overlaps BLAS, so it defaults
+    to 2 workers.
+    """
+    if requested is None:
+        requested = getattr(_SCOPE, "threads", None)
+    if requested is None:
+        requested = os.environ.get("ITERCC_CPU_THREADS") or None     # empty: unset
+    if requested is None:
+        requested = (_available_cores() if _kernels.library() is not None
+                     else min(2, _available_cpus()))
+    return max(1, int(requested))
+
+
+# Products on the core's GEMM executor -------------------------------------
+#
+# The restricted CCSD and CCSDT products run on the contraction engine of the
+# CPU CCSDTQ solver (`itercc_sym_contract`, core/src/cpu/symmetry_blocks.cpp):
+# it reads operands in place through offset tables, adds register tiles
+# straight into the output, uses every OpenMP thread (NumPy's OpenBLAS stops
+# at 64 threads and keeps a second thread pool spinning between calls) and
+# gives the same results for any thread count. Without the compiled core the
+# NumPy expressions run instead.
+
+_ENGINES = {}
+
+
+def _engine(threads=None):
+    """The dense product engine for a thread count (cached), or None without the core."""
+    if _kernels.library() is None:
+        return None
+    count = cpu_threads(threads)
+    engine = _ENGINES.get(count)
+    if engine is None:
+        from ._cpu_quadruples import _DenseProducts
+
+        engine = _ENGINES[count] = _DenseProducts(threads=count)
+    return engine
+
+
+def _float64(*arrays):
+    return all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in arrays)
+
+
+def product_into(spec, a, b, out, alpha=1.0, beta=0.0, threads=None):
+    """out = beta * out + alpha * einsum(spec, a, b) on the core executor.
+
+    Returns False, with `out` untouched, without the compiled core, for other
+    dtypes, or when `out` overlaps an operand.
+    """
+    engine = _engine(threads)
+    if (engine is None or not _float64(out, a, b) or not out.flags.writeable
+            or np.may_share_memory(out, a) or np.may_share_memory(out, b)):
+        return False
+    engine(spec, a, b, out, float(alpha), float(beta))
+    return True
+
+
+def matmul(a, b, out, *, alpha=1.0, beta=0.0, threads=None):
+    """out = beta * out + alpha * (a @ b) for a matrix `a` and a matrix or a stack of
+    matrices `b`, on the core executor when compiled; returns out."""
+    if a.ndim == 2 and b.ndim in (2, 3):
+        spec = "ik,kj->ij" if b.ndim == 2 else "mk,ikn->imn"
+        if product_into(spec, a, b, out, alpha, beta, threads):
+            return out
+    if alpha == 1.0 and beta == 0.0:
+        return np.matmul(a, b, out=out)
+    value = np.matmul(a, b)
+    if beta == 0.0:
+        np.multiply(value, alpha, out=out)
+    else:
+        out *= beta
+        out += alpha * value
+    return out
+
+
+def _output_shape(spec, operands):
+    inputs, output = spec.replace(" ", "").split("->")
+    extent = {}
+    for letters, x in zip(inputs.split(","), operands):
+        extent.update(zip(letters, x.shape))
+    return tuple(extent[c] for c in output)
+
+
+class CompiledContract:
+    """The `contract` of `_restricted_equations` for NumPy arrays on the CPU, with
+    the products on the core executor (see `_restricted_equations.add_product`):
+    `into` adds a product to an existing array without a temporary, `copy` and
+    `combine` are whole-array operations on all threads."""
+
+    LARGE = 1 << 16             # elements below which NumPy's copy is as fast
+
+    def __init__(self, threads=None):
+        self.threads = threads
+
+    def __call__(self, spec, *operands):
+        if len(operands) == 2 and _float64(*operands) and "->" in spec:
+            out = np.empty(_output_shape(spec, operands))
+            if product_into(spec, *operands, out, 1.0, 0.0, self.threads):
+                return out
+        return np.einsum(spec, *operands, optimize=True)
+
+    def into(self, spec, a, b, out, alpha=1.0):
+        return product_into(spec, a, b, out, alpha, 1.0, self.threads)
+
+    def copy(self, x):
+        if _float64(x) and x.size >= self.LARGE and _kernels.library() is not None:
+            from . import _cpu_quadruples
+
+            return _cpu_quadruples.copy(x)
+        return np.array(x, order="C", copy=True)
+
+    def combine(self, a, b, wa, wb):
+        """wa * a + wb * b as a new C-ordered array (same arithmetic as NumPy), or None."""
+        if not (_float64(a, b) and a.size >= self.LARGE and _kernels.library() is not None):
+            return None
+        from ._cpu_quadruples import permuted_add
+
+        out = permuted_add(np.empty(a.shape), None, a, 0.0, wa)
+        return permuted_add(out, out, b, 1.0, wb)
+
+
+class ThreadPool:
+    """Worker threads for index ranges, and two coordinators for overlapped stages.
+
+    The executors start on first use, so a pool that only carries the thread
+    count for the compiled kernels costs nothing.
+    """
+
+    def __init__(self, workers):
+        self.workers = max(1, int(workers))
+        self._executor = self._stages = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        for executor in (self._stages, self._executor):
+            if executor is not None:
+                executor.shutdown()
+        self._executor = self._stages = None
+
+    def _start(self):
+        if self.workers > 1 and self._executor is None:
+            self._executor = ThreadPoolExecutor(self.workers)
+            self._stages = ThreadPoolExecutor(2)
+
+    def run(self, task, count):
+        """Call task(start, stop) on contiguous chunks that cover range(count)."""
+        self._start()
+        chunks = 1 if self._executor is None else min(count, 2 * self.workers)
+        if chunks <= 1:
+            if count > 0:
+                task(0, count)
+            return
+        bounds = [count * c // chunks for c in range(chunks + 1)]
+        futures = [self._executor.submit(task, a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
+        wait(futures)
+        for future in futures:
+            future.result()
+
+    def stage(self, *steps):
+        """Run `steps` in order, in the background when there are workers."""
+        self._start()
+        if self._stages is None:
+            for step in steps:
+                step()
+            return None
+        return self._stages.submit(lambda: [step() for step in steps])
+
+    @staticmethod
+    def join(*handles):
+        for handle in handles:
+            if handle is not None:
+                handle.result()
+
+
+class _Rows:
+    """Order (occupied, virtual) rows by particle-hole irrep for block GEMMs.
+
+    `rows[i]` selects the grouped rows of occupied index i: a slice when no
+    labels are given (natural order), else an index array.
+    """
+
+    def __init__(self, labels, no, nv):
+        sectors = None if labels is None else PairSectors(labels)
+        if sectors is None or len(sectors.bands) <= 1:
+            self.sectors = None
+            self.rows = [slice(i * nv, (i + 1) * nv) for i in range(no)]
+        else:
+            self.sectors = sectors
+            self.rows = [sectors.inverse[i * nv:(i + 1) * nv] for i in range(no)]
+
+    def blocks(self, matrix):
+        """`_sector_blocks` of `matrix` in the grouped order, or the whole matrix."""
+        if self.sectors is None:
+            return [(slice(None), slice(None), matrix)]
+        order = self.sectors.order
+        grouped = np.ascontiguousarray(matrix[np.ix_(order, order)])
+        blocks = _sector_blocks(self.sectors, grouped)
+        return [(slice(None), slice(None), grouped)] if blocks is None else blocks
+
+
+def _sector_blocks(sectors, grouped):
+    """[(row band, column band, block)] of a matrix in sector order whose every
+    nonzero entry couples a row of sector s to a column of sector s ^ G, for
+    one G (G = 0: block-diagonal, a ground-state operator; G != 0: the
+    derivative operator of a direction of irrep G), or None. The check is
+    exact; rows whose partner sector is absent have no block (zero)."""
+    labels, bands = [int(x) for x in sectors.labels], sectors.bands
+    if len(bands) <= 1:
+        return None
+    # The band pairs are scanned on threads (NumPy releases the GIL in the
+    # reduction): a pair matrix is about 0.6 GB at 131 virtuals.
+    pairs = [(i, j) for i in range(len(bands)) for j in range(len(bands))]
+    with ThreadPoolExecutor(max(1, min(len(pairs), cpu_threads(None)))) as pool:
+        nonzero = list(pool.map(lambda ij: bool(np.any(grouped[bands[ij[0]], bands[ij[1]]])), pairs))
+    shift = None
+    for (i, j), found in zip(pairs, nonzero):
+        if found:
+            if shift is None:
+                shift = labels[i] ^ labels[j]
+            elif labels[i] ^ labels[j] != shift:
+                return None
+    shift = shift or 0
+    where = {label: band for label, band in zip(labels, bands)}
+    library = _kernels.library()
+
+    def block(rows, cols):
+        view = grouped[rows, cols]
+        if library is not None and view.dtype == np.float64 and view.size:
+            from ._cpu_quadruples import copy
+
+            return copy(view)                   # all threads
+        return np.ascontiguousarray(view)
+    return [(rows, where[label ^ shift], block(rows, where[label ^ shift]))
+            for label, rows in zip(labels, bands) if label ^ shift in where]
+
+
+def _product(blocks, rhs, out, threads=None):
+    """out[rows] = block @ rhs[columns] for each (row band, column band, block)
+    of `_sector_blocks`; rows that no block reaches are zero."""
+    covered = 0
+    for rows, cols, block in blocks:
+        matmul(block, rhs[cols], out[rows], threads=threads)
+        covered += len(range(*rows.indices(len(out))))
+    if covered < len(out):
+        mask = np.ones(len(out), dtype=bool)
+        for rows, _, _ in blocks:
+            mask[rows] = False
+        out[mask] = 0.0
+    return out
+
+
+def _gather_plane(pool, layout, t3, out, fixed, axis):
+    """out[x, y] = T(fixed, x, y) (axis 0) or T(x, y, fixed) (axis 2), tile by tile."""
+    no = layout.no
+
+    def plane_tiles(start, stop):
+        for index in range(start, stop):
+            x, y = divmod(index, no)
+            indices = (fixed, x, y) if axis == 0 else (x, y, fixed)
+            slot = layout.slots[indices]
+            if slot < 0:
+                out[x, y] = 0.0
+            else:
+                out[x, y] = t3[slot].transpose(layout.from_sorted[indices])
+
+    pool.run(plane_tiles, no * no)
+
+
+# Doubles of gathered ladder buffers per chunk of the compiled paths (2 GiB).
+# The gather and scatter give each thread whole slots, so chunks must hold a
+# socket's worth of slots (the former 2**25 gave 10 slots at 131 virtuals).
+# The chunk shapes the GEMMs, so it depends on the sizes only, never on the
+# thread count or memory (the same results for any thread count).
+LADDER_BUDGET = 2**28
+
+
+def triples(layout, t2, t3, have_t3, im, vooo, vvvo, g, o, v, pool, *,
+            ph_irreps=None, virtual_irreps=None, ladder_budget=LADDER_BUDGET, wvvvv=None):
+    """Packed R3 from T2 and T3, as `RestrictedCC._triples` on the CPU.
+
+    For each k, the seed S(i,j,k)[a,b,c] collects the T2-driven terms and the
+    particle-hole and occupied-ladder products of the plane T(x,y,k), and is
+    added to the canonical slot of (i,j,k) with its paired permutations.
+    `wvvvv` replaces the ladder matrix built from (g, t2, im.vv); Jacobian
+    actions pass the ground or tangent matrix, and then g is not used.
+    """
+    library = _kernels.library()
+    if library is not None:
+        return _triples_compiled(library, layout, t2, t3, have_t3, im, vooo, vvvo, g, o, v,
+                                 pool.workers, ph_irreps, virtual_irreps, ladder_budget, wvvvv)
+    no, nv = layout.no, layout.nv
+    plane_shape = (no, no, nv, nv, nv)
+    residual = np.zeros(layout.shape)
+    rows = _Rows(ph_irreps, no, nv)
+    grouped = rows.sectors is not None
+    vvvo_rows, vooo_rows = _seed_sources(vooo, vvvo, no, nv)
+    # Two buffer sets: GEMMs of plane k overlap the operands of k + 1 and
+    # the seed assembly and scatter of k - 1.
+    rhs_shape = (no * nv, no, nv, nv)
+    outputs = [dict(a=np.empty((no, nv, nv, no, nv)), b=np.empty(plane_shape),
+                    seeds=np.empty(plane_shape)) for _ in range(2)]
+    if have_t3:
+        occupied, direct_blocks, crossed_blocks = _plane_matrices(im, rows, no, nv)
+        # Operands: the plane, and rows (l, d) in particle-hole order with
+        # columns (j, b, c) for the crossed and direct products.
+        inputs = [dict(plane=np.empty(plane_shape), crossed=np.empty(rhs_shape),
+                       direct=np.empty(rhs_shape)) for _ in range(2)]
+        for out in outputs:
+            out.update(direct=np.empty(rhs_shape), crossed=np.empty(rhs_shape))
+
+    def operands(buffers):
+        plane, crossed_rhs, direct_rhs = buffers["plane"], buffers["crossed"], buffers["direct"]
+
+        def plane_rows(start, stop):
+            scratch = np.empty((no, nv, nv, nv)) if grouped else None
+            for l in range(start, stop):
+                # crossed: row (l, d) holds P[j, l, d, b, c]
+                crossed_rhs[rows.rows[l]] = plane[:, l].transpose(1, 0, 2, 3)
+                # direct: row (l, d) holds spin_sum(P[l, j])[d, b, c]
+                source = plane[l]
+                target = scratch if grouped else direct_rhs[rows.rows[l]].transpose(1, 0, 2, 3)
+                np.multiply(source, 2, out=target)
+                target -= source.swapaxes(1, 2)
+                target -= source.swapaxes(1, 3)
+                if grouped:
+                    direct_rhs[rows.rows[l]] = scratch.transpose(1, 0, 2, 3)
+
+        return plane_rows
+
+    def gemms(k, buffers, out):
+        _t2_seeds(vvvo_rows, vooo_rows, t2, k, out["a"], out["b"])
+        if have_t3:
+            # The occupied ladder is written straight into the seeds.
+            np.matmul(occupied, buffers["plane"].reshape(no * no, nv**3),
+                      out=out["seeds"].reshape(no * no, nv**3))
+            _product(direct_blocks, buffers["direct"].reshape(no * nv, -1),
+                     out["direct"].reshape(no * nv, -1))
+            _product(crossed_blocks, buffers["crossed"].reshape(no * nv, -1),
+                     out["crossed"].reshape(no * nv, -1))
+
+    def combine(out):
+        seeds, a_seed, b_seed = out["seeds"], out["a"], out["b"]
+
+        def seed_rows(start, stop):
+            tile = np.empty((nv, no, nv, nv)) if grouped and have_t3 else None
+            for i in range(start, stop):
+                seed = seeds[i]                               # (j, a, b, c)
+                if have_t3:
+                    seed += a_seed[:, :, :, i]
+                    direct = (np.take(out["direct"], rows.rows[i], axis=0, out=tile) if grouped
+                              else out["direct"][rows.rows[i]])          # (a, j, b, c)
+                    seed += direct.transpose(1, 0, 2, 3)
+                    # crossed (x, j, y, c): -T(i,b,j,a,c) - 0.5 T(i,a,j,b,c);
+                    # each block is read once, so it may be scaled in place.
+                    cross = (np.take(out["crossed"], rows.rows[i], axis=0, out=tile) if grouped
+                             else out["crossed"][rows.rows[i]])
+                    seed -= cross.transpose(1, 2, 0, 3)
+                    cross *= 0.5
+                    seed -= cross.transpose(1, 0, 2, 3)
+                else:
+                    np.copyto(seed, a_seed[:, :, :, i])
+                seed -= b_seed[i]
+
+        return seed_rows
+
+    pairs = [(x, y) for x in range(no) for y in range(x, no)]
+
+    def scatter(k, out):
+        seeds = out["seeds"]
+
+        def seed_tiles(start, stop):
+            for x, y in pairs[start:stop]:
+                for i, j in ((x, y),) if x == y else ((x, y), (y, x)):
+                    slot = layout.slots[i, j, k]
+                    if slot < 0:
+                        continue
+                    seed = seeds[i, j].transpose(layout.to_sorted[i, j, k])
+                    target = residual[slot]
+                    target += seed
+                    # Equal occupied labels: the second virtual permutation.
+                    first, second, third = layout.indices[slot]
+                    if first == second:
+                        target += seed.swapaxes(0, 1)
+                    elif second == third:
+                        target += seed.swapaxes(1, 2)
+
+        return seed_tiles
+
+    def stage_in(k):
+        buffers = inputs[k % 2]
+        return (partial(_gather_plane, pool, layout, t3, buffers["plane"], k, 2),
+                partial(pool.run, operands(buffers), no))
+
+    def stage_out(k):
+        # A slot receives (i, j) and (j, i) of one unordered pair, so pairs
+        # partition the writes of one plane; planes are scattered in order.
+        out = outputs[k % 2]
+        return (partial(pool.run, combine(out), no), partial(pool.run, scatter(k, out), len(pairs)))
+
+    if have_t3:
+        pool.join(pool.stage(*stage_in(0)))
+    for k in range(no):
+        handles = []
+        if have_t3 and k + 1 < no:
+            handles.append(pool.stage(*stage_in(k + 1)))
+        if k:
+            handles.append(pool.stage(*stage_out(k - 1)))
+        try:
+            gemms(k, inputs[k % 2] if have_t3 else None, outputs[k % 2])
+        finally:
+            pool.join(*handles)
+    pool.join(pool.stage(*stage_out(no - 1)))
+    del outputs
+    if have_t3:
+        del inputs
+        if wvvvv is None:
+            wvvvv = _ladder_matrix(g, o, v, t2, im, nv)
+        pair_ladder(residual, t3, wvvvv, pool, virtual_irreps=virtual_irreps, budget=ladder_budget)
+    purify(residual, pool)
+    return residual
+
+
+def _seed_sources(vooo, vvvo, no, nv):
+    """GEMM operands of the T2-driven seeds: rows (j,a,b) by d, and (i,j,a) by l."""
+    vvvo_rows = _transposed_copy(vvvo, (3, 0, 1, 2)).reshape(no * nv * nv, nv)
+    vooo_rows = _transposed_copy(vooo, (2, 3, 0, 1)).reshape(no * no * nv, no)
+    return vvvo_rows, vooo_rows
+
+
+def _transposed_copy(x, axes):
+    """np.ascontiguousarray(x.transpose(axes)), on all threads when compiled."""
+    from . import _cpu_quadruples
+
+    view = x.transpose(axes)
+    if x.dtype == np.float64 and _cpu_quadruples.available():
+        return _cpu_quadruples.permuted_add(np.empty(view.shape), None, view, 0.0, 1.0)
+    return np.ascontiguousarray(view)
+
+
+def _t2_seeds(vvvo_rows, vooo_rows, t2, k, a_seed, b_seed, threads=None):
+    """A[j,a,b,i,c] = sum_d W(abdj) t2(ikdc) and B[i,j,a,b,c] = sum_l W(alij) t2(lkbc)."""
+    no, nv = t2.shape[0], t2.shape[2]
+    t2k = t2[:, k]
+    # The executor reads t2(i, k, d, c) in place (no transposed copy).
+    if not product_into("rd,idc->ric", vvvo_rows, t2k, a_seed.reshape(no * nv * nv, no, nv),
+                        threads=threads):
+        np.matmul(vvvo_rows, t2k.transpose(1, 0, 2).reshape(nv, no * nv),
+                  out=a_seed.reshape(no * nv * nv, no * nv))
+    if not product_into("rl,lbc->rbc", vooo_rows, t2k, b_seed.reshape(no * no * nv, nv, nv),
+                        threads=threads):
+        np.matmul(vooo_rows, t2k.reshape(no, nv * nv), out=b_seed.reshape(no * no * nv, nv * nv))
+
+
+def _plane_matrices(im, rows, no, nv):
+    """Occupied-ladder matrix and the blocked direct and crossed particle-hole matrices."""
+    # The one-body occupied term is folded into the occupied ladder.
+    woooo = im.oooo * 0.5
+    for j in range(no):
+        woooo[:, j, :, j] -= 0.5 * im.oo
+    occupied = np.ascontiguousarray(woooo.transpose(2, 3, 0, 1)).reshape(no**2, no**2)
+    direct = np.ascontiguousarray(im.ovvo.transpose(3, 1, 0, 2)).reshape(no * nv, no * nv)
+    direct *= 0.25
+    crossed = np.ascontiguousarray(im.ovov.transpose(2, 1, 0, 3)).reshape(no * nv, no * nv)
+    return occupied, rows.blocks(direct), rows.blocks(crossed)
+
+
+def _ladder_matrix(g, o, v, t2, im, nv, threads=None):
+    """W(ab,de) of the virtual ladder, with the one-body virtual term folded in.
+
+    Summed over the six occupied permutations, the seed term
+    0.5 vv(ad) T(i,j,k; d,b,c) acts once on each virtual index. Over the
+    three ladder pairs that is 0.5 (vv x 1 + 1 x vv) on every pair.
+    """
+    wvvvv = _ladder_base(g, o, v, t2, nv, threads)
+    add_one_body(wvvvv, im.vv)
+    return wvvvv
+
+
+def _ladder_base(g, o, v, t2, nv, threads=None):
+    """g(vvvv) + sum_lm g(lm,de) t2(lm,ab): the ladder matrix without its one-body term."""
+    wvvvv = None
+    if _engine(threads) is not None and _float64(g, t2):
+        wvvvv = CompiledContract(threads).copy(g[v, v, v, v])
+        if not product_into("lmde,lmab->abde", g[o, o, v, v], t2, wvvvv, 1.0, 1.0, threads):
+            wvvvv = None
+    if wvvvv is None:
+        wvvvv = np.einsum("lmde,lmab->abde", g[o, o, v, v], t2, optimize=True)
+        wvvvv += g[v, v, v, v]
+    return wvvvv
+
+
+def add_one_body(w, vv):
+    """w(ab,de) += 0.5 (vv(a,d) delta(b,e) + delta(a,d) vv(b,e)), along the diagonals
+    (no nv^4 temporaries)."""
+    half = 0.5 * vv
+    for b in range(w.shape[1]):
+        w[:, b, :, b] += half
+    for a in range(w.shape[0]):
+        w[a, :, a, :] += half
+
+
+def _ladder_sectors(wvvvv, virtual_irreps):
+    """Pair lists in sector order and the blocked symmetric/antisymmetric matrices."""
+    nv = wvvvv.shape[0]
+    p, q = np.triu_indices(nv)
+    r, s = np.triu_indices(nv, 1)
+    even_sectors = odd_sectors = None
+    if virtual_irreps is not None:
+        even_sectors = PairSectors(virtual_irreps[p] ^ virtual_irreps[q])
+        odd_sectors = PairSectors(virtual_irreps[r] ^ virtual_irreps[s])
+        p, q = p[even_sectors.order], q[even_sectors.order]
+        r, s = r[odd_sectors.order], s[odd_sectors.order]
+    library = _kernels.library()
+    if library is not None and wvvvv.dtype == np.float64 and wvvvv.shape == (nv,) * 4:
+        # The same entries and arithmetic on all threads (four-index fancy
+        # indexing reads W at random on one thread: about 0.5 s per call at
+        # 88 virtuals).
+        if wvvvv.flags.c_contiguous:
+            w = wvvvv
+        else:                   # g(vvvv) of the dressed integrals: copied on all threads
+            from ._cpu_quadruples import copy
+
+            w = copy(wvvvv)
+        p, q, r, s = (np.ascontiguousarray(x, dtype=np.int64) for x in (p, q, r, s))
+        even, odd = np.empty((len(p), len(p))), np.empty((len(r), len(r)))
+        library.pair_matrices(w.ctypes.data, nv, len(p), p.ctypes.data, q.ctypes.data, len(r),
+                              r.ctypes.data, s.ctypes.data, even.ctypes.data, odd.ctypes.data,
+                              cpu_threads(None))
+    else:
+        even = wvvvv[p[:, None], q[:, None], p, q]
+        even += wvvvv[p[:, None], q[:, None], q, p] * (p != q)
+        odd = wvvvv[r[:, None], s[:, None], r, s]
+        odd -= wvvvv[r[:, None], s[:, None], s, r]
+
+    def blocks(sectors, matrix):
+        found = None if sectors is None else _sector_blocks(sectors, matrix)
+        return [(slice(None), slice(None), matrix)] if found is None else found
+
+    return (p, q, r, s), blocks(even_sectors, even), blocks(odd_sectors, odd)
+
+
+def doubles_ladder(gvvvv, t2, *, virtual_irreps=None):
+    """0.5 sum_cd g(ab,cd) t2(ij,cd) through the pair sectors of the T3 ladder.
+
+    g commutes with pair interchange, so t2(ij) splits into its symmetric and
+    antisymmetric (c,d) parts, each multiplied by a half-size matrix that is
+    block-diagonal in pair irreps when `virtual_irreps` are given. Only i <= j
+    is computed: the product L(ij,ab) satisfies L(ji,ba) = L(ij,ab). Exact for
+    any t2; about 16x fewer operations than the dense contraction with C2v.
+    """
+    no, nv = t2.shape[0], t2.shape[2]
+    (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(gvvvv, virtual_irreps)
+    i, j = np.triu_indices(no)
+    pairs = t2[i, j]                                          # (pairs, c, d)
+    sym_in = np.ascontiguousarray((pairs[:, p, q] + pairs[:, q, p]).T) * 0.5
+    anti_in = np.ascontiguousarray((pairs[:, r, s] - pairs[:, s, r]).T) * 0.5
+    sym_out = _product(even_blocks, sym_in, np.empty_like(sym_in))
+    anti_out = _product(odd_blocks, anti_in, np.empty_like(anti_in))
+    upper = np.empty((len(i), nv, nv))
+    upper[:, p, q] = sym_out.T
+    upper[:, q, p] = sym_out.T
+    upper[:, r, s] += anti_out.T
+    upper[:, s, r] -= anti_out.T
+    ladder = np.empty_like(t2)
+    ladder[i, j] = upper
+    ladder[j, i] = upper.transpose(0, 2, 1)
+    ladder *= 0.5
+    return ladder
+
+
+def _ladder_chunk(nv, count, pairs, budget):
+    per_slot = 2 * 3 * nv * pairs
+    return max(1, min(count, budget // max(1, per_slot)))
+
+
+def purify(residual, pool):
+    """Remove the null fully symmetric virtual component, as TriplesLayout.purify."""
+    if not len(residual):
+        return
+    diag = np.arange(residual.shape[-1])
+
+    def purify_slots(start, stop):
+        for s0 in range(start, stop, _SLOT_BATCH):
+            tiles = residual[s0:min(stop, s0 + _SLOT_BATCH)]
+            symmetric = tiles + tiles.swapaxes(-3, -2)
+            symmetric += tiles.swapaxes(-3, -1)
+            symmetric += symmetric.swapaxes(-2, -1)
+            tiles -= symmetric / 6
+            tiles[:, diag, diag, diag] = 0.0
+
+    pool.run(purify_slots, len(residual))
+
+
+def pair_ladder(residual, t3, wvvvv, pool, *, virtual_irreps=None, budget=2**25):
+    """Add sum_de W(ab,de) T(..de..) for the three virtual pairs of every slot.
+
+    W commutes with pair interchange, so each orientation splits into the
+    symmetric and antisymmetric pair sectors. Each slot chunk is one GEMM per
+    sector over all three orientations; `budget` bounds its buffers (doubles).
+    """
+    nv = t3.shape[-1]
+    (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(wvvvv, virtual_irreps)
+    ne, nodd = len(p), len(r)
+    orient = [(0, *(a + 1 for a in perm)) for perm in _ORIENTATIONS]
+    back = [(0, *(perm.index(a) + 1 for a in range(3))) for perm in _ORIENTATIONS]
+    chunk = _ladder_chunk(nv, len(t3), ne + nodd, budget)
+    for c0 in range(0, len(t3), chunk):
+        n = min(chunk, len(t3) - c0)
+        sym_in, anti_in = np.empty((ne, 3, n, nv)), np.empty((nodd, 3, n, nv))
+
+        def gather(start, stop):
+            for s0 in range(start, stop, _SLOT_BATCH):
+                s1 = min(stop, s0 + _SLOT_BATCH)
+                tiles = t3[c0 + s0:c0 + s1]
+                for o in range(3):
+                    oriented = tiles.transpose(orient[o])
+                    column = sym_in[:, o, s0:s1].transpose(1, 0, 2)
+                    np.add(oriented[:, p, q], oriented[:, q, p], out=column)
+                    column *= 0.5
+                    column = anti_in[:, o, s0:s1].transpose(1, 0, 2)
+                    np.subtract(oriented[:, r, s], oriented[:, s, r], out=column)
+                    column *= 0.5
+
+        pool.run(gather, n)
+        sym_out = _product(even_blocks, sym_in.reshape(ne, -1), np.empty((ne, 3 * n * nv)))
+        anti_out = _product(odd_blocks, anti_in.reshape(nodd, -1), np.empty((nodd, 3 * n * nv)))
+        del sym_in, anti_in
+        sym_out = sym_out.reshape(ne, 3, n, nv)
+        anti_out = anti_out.reshape(nodd, 3, n, nv)
+
+        def scatter(start, stop):
+            tiles = np.empty((_SLOT_BATCH, nv, nv, nv))
+            for s0 in range(start, stop, _SLOT_BATCH):
+                s1 = min(stop, s0 + _SLOT_BATCH)
+                block = tiles[:s1 - s0]
+                target = residual[c0 + s0:c0 + s1]
+                for o in range(3):
+                    symmetric = sym_out[:, o, s0:s1].transpose(1, 0, 2)
+                    antisymmetric = anti_out[:, o, s0:s1].transpose(1, 0, 2)
+                    block[:, p, q] = symmetric
+                    block[:, q, p] = symmetric
+                    block[:, r, s] += antisymmetric
+                    block[:, s, r] -= antisymmetric
+                    target += block.transpose(back[o])
+
+        pool.run(scatter, n)
+
+
+def feedback(r1, r2, vooo, vvvo, f, g, layout, t3, o, v, pool):
+    """Add all T3 terms to R1/R2 and the triples sources, as `triples_feedback`.
+
+    For each first occupied index m, q is the spin-summed plane T(m,i,j)
+    and X[i,j,a,x,y] = q[i,j,x,a,y]. Two GEMMs per plane give every term;
+    the next plane is gathered while they run.
+    """
+    library = _kernels.library()
+    if library is not None:
+        _feedback_compiled(library, r1, r2, vooo, vvvo, f, g, layout, t3, o, v, pool.workers)
+        return
+    no, nv = layout.no, layout.nv
+    shape = (no, no, nv, nv, nv)
+    buffers = [dict(plane=np.empty(shape), q=np.empty(shape), x=np.empty(shape)) for _ in range(2)]
+
+    def spin(buffer):
+        plane, q, x_plane = buffer["plane"], buffer["q"], buffer["x"]
+
+        def spin_rows(start, stop):
+            for i in range(start, stop):
+                source, target = plane[i], q[i]                   # (j, x, y, z)
+                np.multiply(source, 2, out=target)
+                target -= source.swapaxes(1, 2)
+                target -= source.swapaxes(1, 3)
+                x_plane[i] = target.transpose(0, 2, 1, 3)
+
+        return spin_rows
+
+    def stage(m):
+        buffer = buffers[m % 2]
+        return (partial(_gather_plane, pool, layout, t3, buffer["plane"], m, 0),
+                partial(pool.run, spin(buffer), no))
+
+    pool.join(pool.stage(*stage(0)))
+    for m in range(no):
+        handle = pool.stage(*stage(m + 1)) if m + 1 < no else None
+        try:
+            _feedback_terms(m, buffers[m % 2]["q"], buffers[m % 2]["x"], r1, r2, vooo, vvvo,
+                            f, g, o, v)
+        finally:
+            pool.join(handle)
+
+
+def _feedback_terms(m, q, x_plane, r1, r2, vooo, vvvo, f, g, o, v):
+    """The two GEMMs of plane m: q[i,j,x,y,z] spin-summed T(m,i,j), X[i,j,a,x,y] = q[i,j,x,a,y]."""
+    no, nv = q.shape[0], q.shape[-1]
+    oovv = g[o, m, v, v]            # (l, d, e); also g(j, b, c) of the R1 term
+    g3 = g[v, m, v, v]              # (b, c, d)
+    g4 = g[o, m, o, v]              # (k, j, c)
+    # X @ [G3 | G5]: R2 sum_cd g(bcd) q(ijdac) and vooo sum_de g(lde) q(ijead).
+    # The G5 columns also give R1's 2 q(ijcab) term on their (j, j) diagonal.
+    right = np.concatenate([g3.transpose(2, 1, 0).reshape(nv * nv, nv),
+                            oovv.transpose(2, 1, 0).reshape(nv * nv, no)], axis=1)
+    x_rows = x_plane.reshape(no * no * nv, nv * nv)
+    direct = r2.flags.c_contiguous and _engine() is not None and _float64(r2, x_rows)
+    if direct:
+        # The executor adds the G3 columns straight into R2 (C-ordered rows (i,j,a)).
+        matmul(x_rows, right[:, :nv], r2.reshape(no * no * nv, nv), beta=1.0)
+        z5 = matmul(x_rows, right[:, nv:], np.empty((no * no * nv, no))).reshape(no, no, nv, no)
+    else:
+        z = matmul(x_rows, right, np.empty((no * no * nv, nv + no))).reshape(no, no, nv, nv + no)
+        r2 += z[..., :nv]
+        z5 = z[..., nv:]
+    vooo += z5.transpose(2, 3, 0, 1)
+    r1 += np.einsum("ijaj->ia", z5)
+    subtract_vecmat(r1, oovv.transpose(0, 2, 1).reshape(-1), q.reshape(no, no * nv * nv, nv), 0.5)
+    # [G4'; G6] @ q[i]: R2 -sum_kc g(kjc) q(ikcab) + 0.5 sum_c f(mc) q(ijcab),
+    # and vvvo -sum_le g(lde) q(jleba).
+    left = np.empty((no + nv, no * nv))
+    left[:no] = -g4.transpose(1, 0, 2).reshape(no, no * nv)
+    for j in range(no):
+        left[j, j * nv:(j + 1) * nv] += 0.5 * f[m, v]
+    left[no:] = oovv.transpose(1, 0, 2).reshape(nv, no * nv)
+    q_rows = q.reshape(no, no * nv, nv * nv)
+    if direct:
+        matmul(left[:no], q_rows, r2.reshape(no, no, nv * nv), beta=1.0)
+        y6 = matmul(left[no:], q_rows, np.empty((no, nv, nv * nv)))
+    else:
+        y = matmul(left, q_rows, np.empty((no, no + nv, nv * nv)))
+        r2 += y[:, :no].reshape(no, no, nv, nv)
+        y6 = y[:, no:]
+    subtract_reversed(vvvo, y6.reshape(no, nv, nv, nv))
+
+
+def dressed_integrals(g0, t1, threads=None):
+    """A C-ordered copy of the integrals g0 dressed with T1 along all four axes
+    (`solver._dress_axis` in turn: axes 0 and 1 add -t1.T times the occupied
+    rows to the virtual ones, axes 2 and 3 t1 times the virtual rows to the
+    occupied ones), copied and dressed on all threads; None without the
+    compiled kernels. NumPy's copy and tensordot moved the whole tensor several
+    times on one thread (about 1.4 s per evaluation at 88 virtuals) for 9 GF of
+    arithmetic."""
+    library = _kernels.library()
+    if (library is None or not all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in (g0, t1))
+            or g0.ndim != 4 or t1.ndim != 2):
+        return None
+    from . import _cpu_quadruples
+
+    no, nv = t1.shape
+    n = g0.shape[0]
+    if g0.shape != (n,) * 4 or n != no + nv:
+        return None
+    threads = cpu_threads(threads)
+    g = _cpu_quadruples.copy(g0)
+    down = np.ascontiguousarray(-t1.T, dtype=np.float64)       # (nv, no)
+    up = np.ascontiguousarray(t1, dtype=np.float64)            # (no, nv)
+    for axis in (0, 1):
+        library.dress_axis(g.ctypes.data, n, axis, no, nv, 0, no, down.ctypes.data, threads)
+    for axis in (2, 3):
+        library.dress_axis(g.ctypes.data, n, axis, 0, no, no, nv, up.ctypes.data, threads)
+    return g
+
+
+def subtract_vecmat(out, w, q, alpha):
+    """out -= alpha * (w @ q[i] for each matrix q[i]) on all threads when
+    compiled (NumPy's matmul of a vector with a stack runs on one thread: about
+    1 s per evaluation at 88 virtuals for the feedback's R1 term)."""
+    library = _kernels.library()
+    if (library is not None and out.flags.c_contiguous and q.flags.c_contiguous
+            and all(x.dtype == np.float64 for x in (out, w, q)) and q.ndim == 3
+            and out.shape == (q.shape[0], q.shape[2]) and w.shape == (q.shape[1],)):
+        w = np.ascontiguousarray(w)
+        library.stacked_vecmat(q.shape[0], q.shape[1], q.shape[2], w.ctypes.data, q.ctypes.data,
+                               -float(alpha), out.ctypes.data, cpu_threads(None))
+    else:
+        out -= alpha * np.matmul(w, q)
+
+
+def subtract_reversed(vvvo, y):
+    """vvvo -= y.transpose(3, 2, 1, 0): on all threads when compiled (a
+    plane's y is tens of MB, and a single thread misses the cache on nearly
+    every element of the reversed order)."""
+    from . import _cpu_quadruples
+
+    view = y.transpose(3, 2, 1, 0)
+    if vvvo.flags.c_contiguous and _cpu_quadruples.available():
+        _cpu_quadruples.permuted_add(vvvo, vvvo, view, 1.0, -1.0)
+    else:
+        vvvo -= view
+
+
+# Compiled path ------------------------------------------------------------
+
+
+def _tables(layout):
+    """Per-plane kernel tables, cached on the layout.
+
+    For plane k (third index) and plane m (first index): the packed slot of
+    each (x, y) tile and its source strides. For the scatter of plane k: the
+    R3 slots it reaches, each with its (seed tile, q0, q1, q2) contributions.
+    """
+    cached = getattr(layout, "_cpu_kernel_tables", None)
+    if cached is not None:
+        return cached
+    no, nv = layout.no, layout.nv
+    unit = np.array([nv * nv, nv, 1], dtype=np.int64)
+    slots = layout.slots.astype(np.int64)
+    strides = unit[layout.from_sorted]                     # (no, no, no, 3)
+    third = [(np.ascontiguousarray(slots[:, :, k]).reshape(-1),
+              np.ascontiguousarray(strides[:, :, k]).reshape(-1)) for k in range(no)]
+    first = [(np.ascontiguousarray(slots[m]).reshape(-1),
+              np.ascontiguousarray(strides[m]).reshape(-1)) for m in range(no)]
+    scatter = []
+    for k in range(no):
+        contributions = {}
+        for i in range(no):
+            for j in range(no):
+                slot = int(layout.slots[i, j, k])
+                if slot < 0:
+                    continue
+                # R[slot] += S[i,j].transpose(to_sorted): R[u] += S[sum_m u_m q_m]
+                q = unit[layout.to_sorted[i, j, k]]
+                found = contributions.setdefault(slot, [])
+                found.append((i * no + j, *q))
+                a, b, c = layout.indices[slot]
+                if a == b:                  # second virtual permutation
+                    found.append((i * no + j, q[1], q[0], q[2]))
+                elif b == c:
+                    found.append((i * no + j, q[0], q[2], q[1]))
+        targets = np.array(sorted(contributions), dtype=np.int64)
+        lists = [contributions[t] for t in targets]
+        start = np.cumsum([0] + [len(x) for x in lists]).astype(np.int64)
+        flat = np.array([e for x in lists for e in x], dtype=np.int64).reshape(-1)
+        scatter.append((targets, start, flat))
+    layout._cpu_kernel_tables = (third, first, scatter)
+    return layout._cpu_kernel_tables
+
+
+def _triples_compiled(lib, layout, t2, t3, have_t3, im, vooo, vvvo, g, o, v, threads,
+                      ph_irreps, virtual_irreps, ladder_budget, wvvvv=None):
+    """`triples` with the element-wise passes in the OpenMP kernels."""
+    ptr = _kernels.pointer
+    no, nv = layout.no, layout.nv
+    plane_shape = (no, no, nv, nv, nv)
+    residual = np.zeros(layout.shape)
+    rows = _Rows(ph_irreps, no, nv)
+    position = (np.arange(no * nv, dtype=np.int64) if rows.sectors is None
+                else rows.sectors.inverse.astype(np.int64))
+    third, _, scatter = _tables(layout)
+    vvvo_rows, vooo_rows = _seed_sources(vooo, vvvo, no, nv)
+    a_seed, b_seed = np.empty((no, nv, nv, no, nv)), np.empty(plane_shape)
+    seeds = np.empty(plane_shape)       # holds the occupied ladder before the seed pass
+    direct_out = crossed_out = seeds    # placeholders when there is no T3
+    if have_t3:
+        t3 = np.ascontiguousarray(t3, dtype=np.float64)
+        occupied, direct_blocks, crossed_blocks = _plane_matrices(im, rows, no, nv)
+        rhs_shape = (no * nv, no, nv, nv)
+        plane = np.empty(plane_shape)
+        crossed_rhs, direct_rhs = np.empty(rhs_shape), np.empty(rhs_shape)
+        direct_out, crossed_out = np.empty(rhs_shape), np.empty(rhs_shape)
+    for k in range(no):
+        _t2_seeds(vvvo_rows, vooo_rows, t2, k, a_seed, b_seed, threads)
+        if have_t3:
+            slot, stride = third[k]
+            lib.triples_plane(ptr(t3), no, nv, ptr(slot), ptr(stride), ptr(position),
+                              ptr(plane), ptr(crossed_rhs), ptr(direct_rhs), threads)
+            matmul(occupied, plane.reshape(no * no, nv**3), seeds.reshape(no * no, nv**3),
+                   threads=threads)
+            _product(direct_blocks, direct_rhs.reshape(no * nv, -1), direct_out.reshape(no * nv, -1),
+                     threads)
+            _product(crossed_blocks, crossed_rhs.reshape(no * nv, -1),
+                     crossed_out.reshape(no * nv, -1), threads)
+        lib.triples_seeds(no, nv, ptr(position), int(have_t3), ptr(a_seed), ptr(b_seed),
+                          ptr(direct_out), ptr(crossed_out), ptr(seeds), threads)
+        targets, start, contributions = scatter[k]
+        lib.triples_scatter(nv, len(targets), ptr(targets), ptr(start), ptr(contributions),
+                            ptr(seeds), ptr(residual), threads)
+    del a_seed, b_seed, seeds, direct_out, crossed_out
+    if have_t3:
+        del plane, crossed_rhs, direct_rhs
+        if wvvvv is None:
+            wvvvv = _ladder_matrix(g, o, v, t2, im, nv, threads)
+        _ladder_compiled(lib, residual, t3, wvvvv, threads, virtual_irreps, ladder_budget)
+    if len(residual):
+        lib.purify(ptr(residual), len(residual), nv, threads)
+    return residual
+
+
+def _ladder_compiled(lib, residual, t3, wvvvv, threads, virtual_irreps, budget):
+    """`pair_ladder` with the gather and scatter in the OpenMP kernels."""
+    ptr = _kernels.pointer
+    nv = t3.shape[-1]
+    (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(wvvvv, virtual_irreps)
+    p, q, r, s = (np.ascontiguousarray(x, dtype=np.int64) for x in (p, q, r, s))
+    ne, nodd = len(p), len(r)
+    even_row = np.zeros((nv, nv), dtype=np.int64)
+    even_row[p, q] = even_row[q, p] = np.arange(ne)
+    odd_row = np.zeros((nv, nv), dtype=np.int64)
+    odd_row[r, s] = odd_row[s, r] = np.arange(nodd)
+    odd_sign = np.zeros((nv, nv))
+    odd_sign[r, s], odd_sign[s, r] = 1.0, -1.0
+    unit = (nv * nv, nv, 1)
+    orient = np.array([[unit[a] for a in perm] for perm in _ORIENTATIONS], dtype=np.int64)
+    perms = np.array(_ORIENTATIONS, dtype=np.int64)
+    chunk = _ladder_chunk(nv, len(t3), ne + nodd, budget)
+    for c0 in range(0, len(t3), chunk):
+        n = min(chunk, len(t3) - c0)
+        sym_in, anti_in = np.empty((ne, 3, n, nv)), np.empty((nodd, 3, n, nv))
+        lib.ladder_gather(ptr(t3[c0:c0 + n]), n, nv, ne, ptr(p), ptr(q), nodd, ptr(r), ptr(s),
+                          ptr(orient), ptr(sym_in), ptr(anti_in), threads)
+        sym_out = _product(even_blocks, sym_in.reshape(ne, -1), np.empty((ne, 3 * n * nv)), threads)
+        anti_out = _product(odd_blocks, anti_in.reshape(nodd, -1), np.empty((nodd, 3 * n * nv)),
+                            threads)
+        del sym_in, anti_in
+        lib.ladder_scatter(n, nv, ptr(even_row), ptr(odd_row), ptr(odd_sign), ptr(perms),
+                           ptr(sym_out), ptr(anti_out), ptr(residual[c0:c0 + n]), threads)
+
+
+def _feedback_compiled(lib, r1, r2, vooo, vvvo, f, g, layout, t3, o, v, threads):
+    """`feedback` with the spin-summed planes built by an OpenMP kernel."""
+    ptr = _kernels.pointer
+    no, nv = layout.no, layout.nv
+    _, first, _ = _tables(layout)
+    t3 = np.ascontiguousarray(t3, dtype=np.float64)
+    q, x_plane = np.empty((no, no, nv, nv, nv)), np.empty((no, no, nv, nv, nv))
+    for m in range(no):
+        slot, stride = first[m]
+        lib.feedback_plane(ptr(t3), no, nv, ptr(slot), ptr(stride), ptr(q), ptr(x_plane), threads)
+        _feedback_terms(m, q, x_plane, r1, r2, vooo, vvvo, f, g, o, v)

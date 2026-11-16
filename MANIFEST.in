@@ -1,0 +1,11 @@
+include README.md CHANGELOG.md LICENSE LICENSE.pdaggerq LICENSE.pyscf NOTICE.pyscf THIRD_PARTY.md
+recursive-include docs *.md
+recursive-include examples *.py
+recursive-include benchmarks *.py
+include core/CMakeLists.txt core/build_levels.sh
+recursive-include core/include *.h
+recursive-include core/src *.cpp *.cu *.h
+prune core/build
+recursive-include tests *.py
+recursive-include tools *.py
+global-exclude *.py[cod]
