@@ -243,9 +243,11 @@ class PlaneTables:
 
 
 def triples(blocked, tables, t2, t3, have_t3, im, vooo, vvvo, g, o, v, threads, *,
-            ladder_budget=LADDER_BUDGET, wvvvv=None):
+            ladder_budget=LADDER_BUDGET, wvvvv=None, ladder_g=None):
     """Blocked R3 from T2 and blocked T3, as `_cpu_triples.triples` (`wvvvv`
-    replaces the ladder matrix built from g, t2 and im, as there).
+    replaces the ladder matrix built from g, t2 and im, as there; `ladder_g` =
+    (LadderSectors, even, odd), the sector blocks of g(vvvv), builds the ladder
+    matrix in sector form instead).
 
     Raises NotBlockable when an intermediate is not symmetry-blocked; the
     caller then uses the dense-slot path.
@@ -298,9 +300,15 @@ def triples(blocked, tables, t2, t3, have_t3, im, vooo, vvvo, g, o, v, threads, 
                             targets.ctypes.data, start.ctypes.data, contributions.ctypes.data,
                             seeds.ctypes.data, residual.ctypes.data, threads)
     if have_t3:
-        if wvvvv is None:
-            wvvvv = _ladder_matrix(g, o, v, t2, im, nv, threads)
-        ladder(blocked, residual, t3, wvvvv, threads, budget=ladder_budget)
+        if wvvvv is None and ladder_g is not None:
+            structure, g_even, g_odd = ladder_g
+            packed = (structure, *structure.ladder_matrix((g_even, g_odd), im.vv, t2, g[o, o, v, v],
+                                                          threads))
+            ladder(blocked, residual, t3, None, threads, budget=ladder_budget, packed=packed)
+        else:
+            if wvvvv is None:
+                wvvvv = _ladder_matrix(g, o, v, t2, im, nv, threads)
+            ladder(blocked, residual, t3, wvvvv, threads, budget=ladder_budget)
     purify(blocked, residual, threads)
     return residual
 
@@ -437,30 +445,39 @@ def _sector_matrices(matrix, start, groups):
     return (np.concatenate(blocks) if blocks else np.empty(0)), offsets
 
 
-def ladder(blocked, residual, t3, wvvvv, threads, *, budget=LADDER_BUDGET):
+def ladder(blocked, residual, t3, wvvvv, threads, *, budget=LADDER_BUDGET, packed=None):
     """R3 += sum over the three virtual pairs of W(ab,de) T(..de..), blocked.
 
     `wvvvv` must be block-diagonal in pair irreps (the symmetric Hamiltonian);
-    `residual` and `t3` are blocked arrays of `blocked`.
+    `residual` and `t3` are blocked arrays of `blocked`. `packed` =
+    (LadderSectors, even, odd) gives W's sector blocks instead (`wvvvv` unused).
     """
     library = _cpu_kernels.library()
     groups, nv = blocked.groups, blocked.nv
     irrep = blocked.virtual_irreps
-    (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(wvvvv, irrep)
-    # One block for pairs of several sectors (the matrix couples sectors), or
-    # blocks between different sectors: not block-diagonal.
-    for (x, y), found in (((p, q), even_blocks), ((r, s), odd_blocks)):
-        if (any(rows != cols for rows, cols, _ in found)
-                or (len(found) == 1 and len(np.unique(irrep[x] ^ irrep[y])) > 1)):
-            raise NotBlockable("The ladder matrix is not block-diagonal in pair irreps")
-    p, q, r, s = (np.ascontiguousarray(x, dtype=np.int64) for x in (p, q, r, s))
-    even_label, odd_label = irrep[p] ^ irrep[q], irrep[r] ^ irrep[s]
-    even_start = np.searchsorted(even_label, np.arange(groups + 1)).astype(np.int64)
-    odd_start = np.searchsorted(odd_label, np.arange(groups + 1)).astype(np.int64)
-    even = _dense_sector_matrix(even_blocks, len(p))
-    odd = _dense_sector_matrix(odd_blocks, len(r))
-    even_mats, even_off = _sector_matrices(even, even_start, groups)
-    odd_mats, odd_off = _sector_matrices(odd, odd_start, groups)
+    if packed is not None:
+        structure, even_mats, odd_mats = packed
+        if structure.groups != groups or structure.nv != nv:
+            raise ValueError("The ladder sectors belong to another layout")
+        p, q, r, s = structure.pairs
+        (_, _, even_start, even_off, _), (_, _, odd_start, odd_off, _) = structure.even, structure.odd
+        even_label, odd_label = irrep[p] ^ irrep[q], irrep[r] ^ irrep[s]
+    else:
+        (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(wvvvv, irrep)
+        # One block for pairs of several sectors (the matrix couples sectors), or
+        # blocks between different sectors: not block-diagonal.
+        for (x, y), found in (((p, q), even_blocks), ((r, s), odd_blocks)):
+            if (any(rows != cols for rows, cols, _ in found)
+                    or (len(found) == 1 and len(np.unique(irrep[x] ^ irrep[y])) > 1)):
+                raise NotBlockable("The ladder matrix is not block-diagonal in pair irreps")
+        p, q, r, s = (np.ascontiguousarray(x, dtype=np.int64) for x in (p, q, r, s))
+        even_label, odd_label = irrep[p] ^ irrep[q], irrep[r] ^ irrep[s]
+        even_start = np.searchsorted(even_label, np.arange(groups + 1)).astype(np.int64)
+        odd_start = np.searchsorted(odd_label, np.arange(groups + 1)).astype(np.int64)
+        even = _dense_sector_matrix(even_blocks, len(p))
+        odd = _dense_sector_matrix(odd_blocks, len(r))
+        even_mats, even_off = _sector_matrices(even, even_start, groups)
+        odd_mats, odd_off = _sector_matrices(odd, odd_start, groups)
     even_row = np.zeros((nv, nv), dtype=np.int64)
     even_row[p, q] = even_row[q, p] = np.arange(len(p)) - even_start[even_label]
     odd_row = np.zeros((nv, nv), dtype=np.int64)

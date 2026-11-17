@@ -439,6 +439,7 @@ class RestrictedCC:
         # (_blocked_residual) whenever the amplitudes are exactly symmetric.
         self._labels = labels if orbital_irreps is not None else None
         self._blocked_plan = None
+        self._integrals_symmetric = self._ladder_structure = None
         self._cpu_blocked = os.environ.get("ITERCC_BLOCKED", "1") != "0"
         self._contract = partial(eq.contract, xp=self._xp)
         if self._xp is np and _cpu._kernels.library() is not None:
@@ -594,7 +595,8 @@ class RestrictedCC:
         t1, t2, t3 = amplitudes
         o, v = self.o, self.v
         f, g = self._dressed(t1)
-        ladder = (partial(_cpu.doubles_ladder, virtual_irreps=self._virtual_irreps)
+        ladder_g = self._ladder_g(g, t1) if xp is np and self._cpu_fast else None
+        ladder = (partial(_cpu.doubles_ladder, virtual_irreps=self._virtual_irreps, sectors=ladder_g)
                   if xp is np and self._cpu_fast else None)
         r1, r2, intermediates, spin_g, c2 = eq.lower_residuals(f, g, t2, o, v, contract,
                                                                vvvv_ladder=ladder)
@@ -628,7 +630,7 @@ class RestrictedCC:
                 layout, tables, t3b = blocked
                 try:
                     r3 = _blocked.triples(layout, tables, t2, t3b, have_t3, intermediates, vooo,
-                                          vvvo, g, o, v, pool.workers)
+                                          vvvo, g, o, v, pool.workers, ladder_g=ladder_g)
                     return r1, r2, layout.unpack(r3, threads=pool.workers)
                 except _blocked.NotBlockable:
                     self._cpu_blocked = False       # an operator couples irreps: stay dense
@@ -673,6 +675,36 @@ class RestrictedCC:
             if not success or not self._cuda_pool_cache:
                 pool.free_all_blocks()
 
+    def _symmetric_integrals(self, threads=None):
+        """Whether the integrals have no symmetry-forbidden entry (checked once)."""
+        if self._integrals_symmetric is None:
+            from .spatial_symmetry import has_integral_leakage
+
+            self._integrals_symmetric = bool(self.symmetry_projected or not has_integral_leakage(
+                self.h, self.g.transpose(0, 2, 1, 3), self._labels,
+                threads=_cpu.cpu_threads(threads if threads is not None else self._cpu_threads)))
+        return self._integrals_symmetric
+
+    def _ladder_g(self, g, t1):
+        """(LadderSectors, even, odd): the sector blocks of the dressed g(vvvv), for
+        the doubles and triples ladders, or None. With symmetric integrals and a
+        T1 that is zero in every forbidden entry the dressed Hamiltonian is
+        exactly block-diagonal in pair irreps, so its blocks are all of it."""
+        if (self._labels is None or not self._cpu_blocked or self._virtual_irreps is None
+                or _cpu._kernels.library() is None or not isinstance(g, np.ndarray)
+                or g.dtype != np.float64):
+            return None
+        no = self.layout.no
+        occupied, virtual = self._labels[:no], self._labels[no:]
+        if np.any(t1[occupied[:, None] != virtual]) or not self._symmetric_integrals():
+            return None
+        if self._ladder_structure is None:
+            from ._blocked import irrep_groups
+
+            self._ladder_structure = _cpu.LadderSectors(virtual, irrep_groups(self._labels))
+        v = self.v
+        return (self._ladder_structure, *self._ladder_structure.build(g[v, v, v, v]))
+
     def _blocked_t3(self, t1, t2, t3, threads):
         """(layout, plane tables, blocked T3) when the blocked CPU path applies, else None.
 
@@ -689,11 +721,8 @@ class RestrictedCC:
         if self._blocked_plan is None:
             from ._blocked import BlockedTriples
             from ._blocked_residual import PlaneTables
-            from .spatial_symmetry import has_integral_leakage
 
-            eri = self.g.transpose(0, 2, 1, 3)
-            if not self.symmetry_projected and has_integral_leakage(
-                    self.h, eri, self._labels, threads=threads):
+            if not self._symmetric_integrals(threads):
                 self._cpu_blocked = False
                 return None
 

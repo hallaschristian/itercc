@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 15
+#define ITERCC_CORE_ABI 16
 
 /* Library identity. */
 int itercc_core_abi(void);
@@ -307,6 +307,25 @@ void itercc_stacked_vecmat(int64_t m, int64_t kn, int64_t n, const double *w, co
 void itercc_pair_matrices(const double *w, int64_t nv, int64_t ne, const int64_t *p, const int64_t *q,
                           int64_t no, const int64_t *r, const int64_t *s, double *even, double *odd,
                           int threads);
+/* dst (n^4, C order) = src (read through element strides ss[0..3]) dressed
+ * with t1 (no x nv) along all four axes: the occupied rows of axes 2 and 3
+ * gain t1 times the virtual rows, the virtual rows of axes 0 and 1 gain
+ * -t1^T times the occupied rows. Two passes over the tensor. */
+void itercc_dress_integrals(double *dst, const double *src, const int64_t *ss, int64_t n, int64_t no,
+                            const double *t1, int threads);
+/* The symmetry-sector blocks of the even and odd pair matrices above, packed
+ * one sector after another: for each sector g (rows and columns
+ * start[g]..start[g+1] of the sector-ordered pairs) a square block at off[g].
+ * w is read through element strides ws[0..3] (may be NULL: no integral
+ * part); vv (nv x nv, may be NULL) adds the one-body ladder term
+ * 0.5 (vv x 1 + 1 x vv) to each pair ordering. accumulate != 0 adds into
+ * the blocks. Only the diagonal sector blocks are formed: exact for an
+ * operator that is block-diagonal in pair irreps. */
+void itercc_ladder_sectors(const double *w, const int64_t *ws, const double *vv, int64_t nv, int64_t groups,
+                           const int64_t *p, const int64_t *q, const int64_t *even_start,
+                           const int64_t *even_off, const int64_t *r, const int64_t *s,
+                           const int64_t *odd_start, const int64_t *odd_off, double *even, double *odd,
+                           int accumulate, int threads);
 /* r3[i,j,k,a,b,c] /= (eia[i,a] + eia[j,b]) + eia[k,c] (dense no^3 nv^3). */
 void itercc_t3_divide(double *r3, int64_t no, int64_t nv, const double *eia, int threads);
 

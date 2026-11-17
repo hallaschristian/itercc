@@ -394,6 +394,84 @@ extern "C" void itercc_dress_axis_from(double *x, const double *source, int64_t 
     dress_axis(x, source, n, axis, t0, nt, s0, ns, rotation, threads);
 }
 
+extern "C" void itercc_dress_integrals(double *dst, const double *src, const int64_t *ss, int64_t n, int64_t no,
+                                       const double *t1, int threads)
+{
+    // dst = src dressed with T1 (no x nv) along all four axes: the occupied
+    // rows of axes 2 and 3 gain t1 times the virtual rows, the virtual rows of
+    // axes 0 and 1 gain -t1^T times the occupied rows (`dressed_integrals`).
+    // src is read through its element strides ss[0..3] (a transposed view of
+    // the ERIs needs no copy); dst is C-ordered. The four maps act on
+    // different axes and commute, so two passes do it: slab by slab of axis 0,
+    // each (p, q) plane is read once and dressed along axes 2 and 3 in cache,
+    // then the slab (still cached) along axis 1; a final streaming pass dresses
+    // axis 0. Every sum runs in order of its occupied or virtual index and is
+    // then added, so an entry's value does not depend on the thread count.
+    const i64 nv = n - no;
+    if (n <= 0) return;
+    const i64 n2 = n * n, n3 = n2 * n;
+    constexpr i64 kPiece = 256;
+#pragma omp parallel num_threads(threads)
+    {
+        std::vector<double> sum(size_t(std::max<i64>(n, kPiece)));
+#pragma omp for schedule(dynamic, 1)
+        for (i64 p = 0; p < n; ++p) {
+            double *slab = dst + p * n3;
+            for (i64 q = 0; q < n; ++q) {
+                const double *in = src + p * ss[0] + q * ss[1];
+                double *out = slab + q * n2;
+                for (i64 r = 0; r < n; ++r) {
+                    const double *from = in + r * ss[2];
+                    double *to = out + r * n;
+                    if (ss[3] == 1)
+                        std::copy(from, from + n, to);
+                    else
+                        for (i64 s = 0; s < n; ++s) to[s] = from[s * ss[3]];
+                }
+                for (i64 i = 0; i < no; ++i) {             // axis 2: rows
+                    const double *t = t1 + i * nv;
+                    for (i64 s = 0; s < n; ++s) sum[s] = 0.0;
+                    for (i64 c = 0; c < nv; ++c) {
+                        const double w = t[c];
+                        const double *row = out + (no + c) * n;
+                        for (i64 s = 0; s < n; ++s) sum[s] += w * row[s];
+                    }
+                    double *row = out + i * n;
+                    for (i64 s = 0; s < n; ++s) row[s] += sum[s];
+                }
+                for (i64 r = 0; r < n; ++r) {              // axis 3: columns
+                    double *row = out + r * n;
+                    for (i64 i = 0; i < no; ++i) {
+                        const double *t = t1 + i * nv;
+                        double total = 0.0;
+                        for (i64 c = 0; c < nv; ++c) total += t[c] * row[no + c];
+                        sum[i] = total;
+                    }
+                    for (i64 i = 0; i < no; ++i) row[i] += sum[i];
+                }
+            }
+            for (i64 lo = 0; lo < n2; lo += kPiece) {     // axis 1 within the slab
+                const i64 len = std::min(kPiece, n2 - lo);
+                for (i64 a = 0; a < nv; ++a) {
+                    for (i64 m = 0; m < len; ++m) sum[m] = 0.0;
+                    for (i64 k = 0; k < no; ++k) {
+                        const double w = -t1[k * nv + a];
+                        const double *from = slab + k * n2 + lo;
+                        for (i64 m = 0; m < len; ++m) sum[m] += w * from[m];
+                    }
+                    double *to = slab + (no + a) * n2 + lo;
+                    for (i64 m = 0; m < len; ++m) to[m] += sum[m];
+                }
+            }
+        }
+    }
+    if (no <= 0 || nv <= 0) return;
+    std::vector<double> down(size_t(nv * no));             // (nv, no) = -t1^T
+    for (i64 a = 0; a < nv; ++a)
+        for (i64 k = 0; k < no; ++k) down[size_t(a * no + k)] = -t1[k * nv + a];
+    dress_axis(dst, dst, n, 0, no, nv, 0, no, down.data(), threads);
+}
+
 extern "C" void itercc_stacked_vecmat(int64_t m, int64_t kn, int64_t n, const double *w, const double *q,
                                       double alpha, double *out, int threads)
 {
@@ -422,6 +500,52 @@ extern "C" void itercc_stacked_vecmat(int64_t m, int64_t kn, int64_t n, const do
             for (i64 b = 0; b < blocks; ++b) total += partial[size_t((i * blocks + b) * n + z)];
             out[i * n + z] += alpha * total;
         }
+}
+
+extern "C" void itercc_ladder_sectors(const double *w, const int64_t *ws, const double *vv, int64_t nv,
+                                      int64_t groups, const int64_t *p, const int64_t *q,
+                                      const int64_t *even_start, const int64_t *even_off, const int64_t *r,
+                                      const int64_t *s, const int64_t *odd_start, const int64_t *odd_off,
+                                      double *even, double *odd, int accumulate, int threads)
+{
+    // One row of one sector block per task: a row (x_i, y_i) reads the plane
+    // w[x_i, y_i, :, :] through the strides (a view of the dressed integrals
+    // needs no copy) and writes only its sector's columns, so a block-diagonal
+    // operator costs its blocks, not the full pair matrix. Entry arithmetic as
+    // itercc_pair_matrices, then the one-body term 0.5 (vv x 1 + 1 x vv) of
+    // the virtual ladder (`_cpu_triples.add_one_body`) for each ordering.
+    const i64 ne = even_start[groups], nodd = odd_start[groups];
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 8)
+    for (i64 i = 0; i < ne + nodd; ++i) {
+        const bool is_even = i < ne;
+        const i64 row = is_even ? i : i - ne;
+        const int64_t *start = is_even ? even_start : odd_start;
+        const int64_t *off = is_even ? even_off : odd_off;
+        const int64_t *x = is_even ? p : r, *y = is_even ? q : s;
+        i64 g = 0;
+        while (start[g + 1] <= row) ++g;
+        const i64 first = start[g], n = start[g + 1] - first;
+        double *out = (is_even ? even : odd) + off[g] + (row - first) * n;
+        const i64 xi = x[row], yi = y[row];
+        const double *plane = w ? w + xi * ws[0] + yi * ws[1] : nullptr;
+        for (i64 c = 0; c < n; ++c) {
+            const i64 xj = x[first + c], yj = y[first + c];
+            double value = 0.0;
+            if (plane) {
+                const double direct = plane[xj * ws[2] + yj * ws[3]];
+                const double swapped = plane[yj * ws[2] + xj * ws[3]];
+                value = is_even ? direct + swapped * double(xj != yj) : direct - swapped;
+            }
+            if (vv) {
+                const double direct = 0.5 * ((yi == yj ? vv[xi * nv + xj] : 0.0)
+                                             + (xi == xj ? vv[yi * nv + yj] : 0.0));
+                const double swapped = 0.5 * ((yi == xj ? vv[xi * nv + yj] : 0.0)
+                                              + (xi == yj ? vv[yi * nv + xj] : 0.0));
+                value += is_even ? direct + swapped * double(xj != yj) : direct - swapped;
+            }
+            out[c] = accumulate ? out[c] + value : value;
+        }
+    }
 }
 
 extern "C" void itercc_pair_matrices(const double *w, int64_t nv, int64_t ne, const int64_t *p,

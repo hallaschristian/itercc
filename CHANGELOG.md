@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- CCSDT a third to three quarters faster per iteration on many cores (water,
+  12 cores: 0.71 instead of 1.17 s in aug-cc-pVTZ, 0.12 instead of 0.18 s in
+  cc-pVTZ, 5 instead of 19 ms in 6-31G, where symmetry no longer costs). The
+  doubles and triples ladders build their symmetry-sector blocks straight from
+  the dressed integrals in one compiled pass (`itercc_ladder_sectors`), with
+  the T2 term as small per-sector GEMMs: no copies of g(vvvv), no dense pair
+  matrices. The T1 dressing takes two passes over the integrals instead of
+  five (`itercc_dress_integrals`). Core ABI 16.
+- CCSDTQ on the CPU puts T4 into DIIS by default (`diis_quadruples="auto"`):
+  diffuse basis sets converge without settings (water aug-cc-pVDZ: 15
+  iterations; before, damped Jacobi on T4 had not converged after 200).
+  `diis_quadruples=False` restores the previous behaviour.
+- The host T4 DIIS, the Davidson and the GMRES vector products use the core's
+  fixed-order sums instead of NumPy's BLAS: OpenBLAS threads left spinning
+  slowed the following kernels (small CCSDTQ iterations 2.6x on 12 threads,
+  a response sweep about 15%).
 - Benchmarks: a one-core comparison that adds ORCA 6.1.1 (AUTOCI CCSDT and
   CCSDTQ; `compare.py --code orca`, `benchmarks/compare_single_core.sh`).
 

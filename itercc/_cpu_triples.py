@@ -745,7 +745,95 @@ def _ladder_sectors(wvvvv, virtual_irreps):
     return (p, q, r, s), blocks(even_sectors, even), blocks(odd_sectors, odd)
 
 
-def doubles_ladder(gvvvv, t2, *, virtual_irreps=None):
+class LadderSectors:
+    """The pair sectors of the virtual ladders, for operators that are
+    block-diagonal in pair irreps (exactly symmetric integrals and T1).
+
+    Pairs are ordered by sector as in `_ladder_sectors`; `build` forms only the
+    diagonal sector blocks of the even and odd pair matrices, packed one sector
+    after another in the layout the GEMM executor reads, straight from a
+    strided view of g(vvvv): no copy of the integrals, no dense pair matrix.
+    """
+
+    def __init__(self, virtual_irreps, groups):
+        virtual_irreps = np.asarray(virtual_irreps, dtype=np.int64)
+        nv = len(virtual_irreps)
+        self.nv, self.groups = nv, int(groups)
+        pairs = []
+        for x, y in (np.triu_indices(nv), np.triu_indices(nv, 1)):
+            label = virtual_irreps[x] ^ virtual_irreps[y]
+            order = np.argsort(label, kind="stable")
+            x, y, label = (np.ascontiguousarray(a[order], dtype=np.int64) for a in (x, y, label))
+            start = np.searchsorted(label, np.arange(self.groups + 1)).astype(np.int64)
+            size = np.diff(start) ** 2
+            offset = (np.cumsum(size) - size).astype(np.int64)
+            pairs.append((x, y, start, offset, int(size.sum())))
+        self.even, self.odd = pairs
+
+    @property
+    def pairs(self):
+        return self.even[0], self.even[1], self.odd[0], self.odd[1]
+
+    def empty(self):
+        return np.empty(self.even[4]), np.empty(self.odd[4])
+
+    def build(self, w=None, *, vv=None, out=None, accumulate=False, threads=None):
+        """(even, odd) sector blocks of w (a 4-index float64 view, or None) plus
+        the one-body term of `vv`, into `out` (added when `accumulate`)."""
+        even, odd = self.empty() if out is None else out
+        strides = None
+        if w is not None:
+            if w.dtype != np.float64 or w.shape != (self.nv,) * 4 or any(x % 8 for x in w.strides):
+                raise ValueError("expected a float64 nv^4 view of the integrals")
+            strides = np.asarray([x // 8 for x in w.strides], dtype=np.int64)
+        vv = None if vv is None else np.ascontiguousarray(vv, dtype=np.float64)
+        (p, q, es, eo, _), (r, s, os_, oo, _) = self.even, self.odd
+        _kernels.library().ladder_sectors(
+            None if w is None else w.ctypes.data, None if strides is None else strides.ctypes.data,
+            None if vv is None else vv.ctypes.data, self.nv, self.groups, p.ctypes.data,
+            q.ctypes.data, es.ctypes.data, eo.ctypes.data, r.ctypes.data, s.ctypes.data,
+            os_.ctypes.data, oo.ctypes.data, even.ctypes.data, odd.ctypes.data, int(accumulate),
+            cpu_threads(threads))
+        return even, odd
+
+    def blocks(self, matrices, which):
+        """[(rows, rows, block)] views of packed blocks, for `_product`."""
+        _, _, start, offset, _ = self.even if which == "even" else self.odd
+        found = []
+        for g in range(self.groups):
+            a, b = int(start[g]), int(start[g + 1])
+            if b > a:
+                n = b - a
+                found.append((slice(a, b), slice(a, b),
+                              matrices[offset[g]:offset[g] + n * n].reshape(n, n)))
+        return found
+
+    def ladder_matrix(self, g_sectors, vv, t2, g_oovv, threads=None):
+        """Sector blocks of W(ab,de) = g(ab,de) + sum_lm g(lm,de) t2(lm,ab)
+        + 0.5 (vv x 1 + 1 x vv) (`_ladder_matrix`) from the blocks of g: the
+        t2 term as one small GEMM per sector, ranked by the occupied pairs."""
+        from ._cpu_quadruples import copy
+
+        even, odd = (copy(x) for x in g_sectors)
+        self.build(None, vv=vv, out=(even, odd), accumulate=True, threads=threads)
+        no = t2.shape[0]
+        for (x, y, start, offset, _), matrices, sign in ((self.even, even, 1.0), (self.odd, odd, -1.0)):
+            for g in range(self.groups):
+                a, b = int(start[g]), int(start[g + 1])
+                if b == a:
+                    continue
+                xs, ys, n = x[a:b], y[a:b], b - a
+                left = np.ascontiguousarray(t2[:, :, xs, ys].reshape(no * no, n).T)
+                swapped = g_oovv[:, :, ys, xs]
+                if sign > 0:
+                    swapped = swapped * (xs != ys)
+                right = np.ascontiguousarray((g_oovv[:, :, xs, ys] + sign * swapped).reshape(no * no, n))
+                matmul(left, right, matrices[offset[g]:offset[g] + n * n].reshape(n, n), beta=1.0,
+                       threads=threads)
+        return even, odd
+
+
+def doubles_ladder(gvvvv, t2, *, virtual_irreps=None, sectors=None):
     """0.5 sum_cd g(ab,cd) t2(ij,cd) through the pair sectors of the T3 ladder.
 
     g commutes with pair interchange, so t2(ij) splits into its symmetric and
@@ -753,9 +841,16 @@ def doubles_ladder(gvvvv, t2, *, virtual_irreps=None):
     block-diagonal in pair irreps when `virtual_irreps` are given. Only i <= j
     is computed: the product L(ij,ab) satisfies L(ji,ba) = L(ij,ab). Exact for
     any t2; about 16x fewer operations than the dense contraction with C2v.
+    `sectors` = (LadderSectors, even, odd) supplies the sector blocks of g
+    already built (`gvvvv` is then not read).
     """
     no, nv = t2.shape[0], t2.shape[2]
-    (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(gvvvv, virtual_irreps)
+    if sectors is not None:
+        structure, even, odd = sectors
+        p, q, r, s = structure.pairs
+        even_blocks, odd_blocks = structure.blocks(even, "even"), structure.blocks(odd, "odd")
+    else:
+        (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(gvvvv, virtual_irreps)
     i, j = np.triu_indices(no)
     pairs = t2[i, j]                                          # (pairs, c, d)
     sym_in = np.ascontiguousarray((pairs[:, p, q] + pairs[:, q, p]).T) * 0.5
@@ -955,9 +1050,17 @@ def dressed_integrals(g0, t1, threads=None):
     if g0.shape != (n,) * 4 or n != no + nv:
         return None
     threads = cpu_threads(threads)
+    up = np.ascontiguousarray(t1, dtype=np.float64)            # (no, nv)
+    if all(stride % 8 == 0 for stride in g0.strides):
+        # Fused: two passes over the tensor instead of a copy and four (the
+        # dressing is memory bound; the four axis maps commute).
+        g = np.empty((n,) * 4)
+        strides = np.asarray([stride // 8 for stride in g0.strides], dtype=np.int64)
+        library.dress_integrals(g.ctypes.data, g0.ctypes.data, strides.ctypes.data, n, no,
+                                up.ctypes.data, threads)
+        return g
     g = _cpu_quadruples.copy(g0)
     down = np.ascontiguousarray(-t1.T, dtype=np.float64)       # (nv, no)
-    up = np.ascontiguousarray(t1, dtype=np.float64)            # (no, nv)
     for axis in (0, 1):
         library.dress_axis(g.ctypes.data, n, axis, no, nv, 0, no, down.ctypes.data, threads)
     for axis in (2, 3):

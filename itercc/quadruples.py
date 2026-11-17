@@ -361,8 +361,15 @@ class _CompactHostDIIS(_HostQuadruplesDIIS):
         cp = self.xp
         vector = (self._lower.pack(*(a + s for a, s in zip(lower, lower_steps))), delta_new)
         error = (self._lower.pack(*lower_steps), error_new)
-        lower_dots = [float(cp.dot(previous[0], error[0])) for _, previous in self.history]
-        lower_dots.append(float(cp.dot(error[0], error[0])))
+        if cp is np and _cpu_quadruples.available():
+            # The core's dots, not NumPy's BLAS: OpenBLAS threads left spinning
+            # after a call stole the cores of every following kernel (about
+            # 50 ms per iteration on 12 threads), and these sums do not depend
+            # on the thread count.
+            lower_dots = list(_cpu_quadruples.dots(error[0], [previous[0] for _, previous in self.history]))
+        else:
+            lower_dots = [float(cp.dot(previous[0], error[0])) for _, previous in self.history]
+            lower_dots.append(float(cp.dot(error[0], error[0])))
         dots = iter(lower_dots[i] + t4_dots[i] for i in range(len(lower_dots)))
         weights = self._append(vector, error, lambda previous, current: next(dots))
         w = None if weights is None else np.ascontiguousarray(weights, dtype=np.float64)
@@ -866,7 +873,7 @@ class RestrictedCCSDTQ:
 
     def solve(self, *, initial=None, max_iter=100, energy_tol=1e-11,
               residual_tol=1e-9, level_shift=0.0, damping=0.0, diis_size=6,
-              diis_quadruples=False, callback=None, checkpoint=None, resume=None,
+              diis_quadruples="auto", callback=None, checkpoint=None, resume=None,
               copy_initial=True):
         """Iterate T1–T4 with damped Jacobi updates and DIIS.
 
@@ -880,8 +887,12 @@ class RestrictedCCSDTQ:
         read by `load_state` as `resume` continues the iteration exactly,
         including the DIIS history (on CUDA, in a new process too: the state
         carries the autotuned GEMM routes, reused on the same GPU model). The last residual and energy both refer
-        to the returned amplitudes. DIIS defaults to T1–T3, with T4 on damped
-        Jacobi steps. `diis_quadruples=True` includes T4 with the history on
+        to the returned amplitudes. DIIS always includes T1–T3; whether it
+        includes T4 is `diis_quadruples`. The default "auto" is "host" on the
+        CPU backend (diffuse basis sets have a stiff T4 mode that damped Jacobi
+        steps on T4 do not converge; the compact host history costs about
+        (diis_size + 1) / 2 T4 of memory) and False on CUDA, where T4 then
+        takes damped Jacobi steps. `diis_quadruples=True` includes T4 with the history on
         the device (a substantially larger pool); `diis_quadruples="host"`
         includes T4 with its history in host memory (2 * diis_size packed T4; the
         compact float32 history of the compiled CPU backend: diis_size + 1),
@@ -895,6 +906,8 @@ class RestrictedCCSDTQ:
         caller must not use them afterwards.
         """
         xp = self.xp
+        if isinstance(diis_quadruples, str) and diis_quadruples == "auto":
+            diis_quadruples = "host" if self.backend == "cpu" else False
         if (not isinstance(max_iter, Integral) or max_iter < 1
                 or not isinstance(diis_size, Integral) or diis_size < 0
                 or not np.isfinite((energy_tol, residual_tol, level_shift, damping)).all()

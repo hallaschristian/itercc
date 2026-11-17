@@ -42,6 +42,38 @@ def _product(xp, a, b):
     return a @ b
 
 
+def _core_vectors(xp, *arrays):
+    """Real contiguous float64 NumPy vectors of one size, with the compiled core."""
+    if xp is not np or not all(isinstance(a, np.ndarray) and a.dtype == np.float64
+                               and a.flags.c_contiguous and a.size for a in arrays):
+        return False
+    if len({a.size for a in arrays}) != 1:
+        return False
+    from . import _cpu_quadruples
+
+    return _cpu_quadruples.available()
+
+
+def _dot(xp, a, b):
+    """float(a . b). Real float64 NumPy vectors use the CPU core's fixed-order
+    sums on all threads: NumPy's BLAS would leave an OpenBLAS thread pool
+    spinning on the cores of the next Jacobian action."""
+    if _core_vectors(xp, a, b):
+        from . import _cpu_quadruples
+
+        return float(_cpu_quadruples.dots(a.reshape(-1), [b.reshape(-1)])[0])
+    return float(xp.dot(a, b))
+
+
+def _norm(xp, a):
+    """float(||a||), on the CPU core as `_dot`."""
+    if _core_vectors(xp, a):
+        from . import _cpu_quadruples
+
+        return float(np.sqrt(_cpu_quadruples.dots(a.reshape(-1), [])[0]))
+    return float(xp.linalg.norm(a))
+
+
 class Columns:
     """A preallocated block of equal-length vectors stored as contiguous rows."""
 
@@ -156,14 +188,14 @@ class RecycledImages:
         if self.z.count >= self.z.capacity:
             self.skipped += 1
             return False
-        scale = float(xp.linalg.norm(z))
+        scale = _norm(xp, z)
         if not scale > 0 or not np.isfinite(scale):
             return False
         z, w = z.astype(np.float64, copy=True), w.astype(np.float64, copy=True)
         coefficients = self.z.orthogonalize(z)
         if len(coefficients):
             w -= self.w.combine(coefficients)
-        length = float(xp.linalg.norm(z))
+        length = _norm(xp, z)
         if length <= drop * scale:
             return False
         z /= length
@@ -172,8 +204,8 @@ class RecycledImages:
         self.ww[:k, k] = self.ww[k, :k] = self.w.overlaps(w)
         self.zw[:k, k] = self.z.overlaps(w)
         self.zw[k, :k] = self.w.overlaps(z)
-        self.ww[k, k] = float(xp.dot(w, w))
-        self.zw[k, k] = float(xp.dot(z, w))
+        self.ww[k, k] = _dot(xp, w, w)
+        self.zw[k, k] = _dot(xp, z, w)
         self.z.append(z)
         self.w.append(w)
         return True
@@ -182,7 +214,7 @@ class RecycledImages:
         """(x, estimated residual norm) of min ||rhs - (A - shift) x|| over
         x in span(Z), or (None, ||rhs||) for an empty store."""
         xp, k = self.xp, self.z.count
-        norm = float(xp.linalg.norm(rhs))
+        norm = _norm(xp, rhs)
         if not k or norm == 0:
             return None, norm
         s = complex(shift)
@@ -273,8 +305,8 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
         for _ in range(2):
             candidate -= basis.combine(basis.overlaps(candidate))
             for other in others:
-                candidate -= float(xp.dot(other, candidate)) * other
-        length = float(xp.linalg.norm(candidate))
+                candidate -= _dot(xp, other, candidate) * other
+        length = _norm(xp, candidate)
         if length < 1e-13:
             return None
         candidate /= length
@@ -341,7 +373,7 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
             column = column / float(np.linalg.norm(column))
             columns.append(column)
             vector, residual = ritz_pair(column, energy)
-            lengths.append(float(xp.linalg.norm(residual)))
+            lengths.append(_norm(xp, residual))
             if keep:
                 ritz_vectors.append(vector)
             if lengths[-1] > residual_tol:
@@ -355,7 +387,7 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
                     if olsen and not xp.iscomplexobj(residual):
                         # Olsen: t = (theta - D)^-1 (r - eps x) with x . t = 0.
                         scaled = vector / denominator
-                        ratio = float(xp.dot(vector, residual)) / float(xp.dot(vector, scaled))
+                        ratio = _dot(xp, vector, residual) / _dot(xp, vector, scaled)
                         residual -= ratio * scaled
                         del scaled
                     del denominator
@@ -478,7 +510,7 @@ def gmres(action, rhs, diagonal, xp, *, tol, restart, maxiter, initial=None, def
     residual check (a drifted implicit residual continues the iteration).
     Returns (x, relative true residual, Arnoldi steps).
     """
-    norm_rhs = float(xp.linalg.norm(rhs))
+    norm_rhs = _norm(xp, rhs)
     if norm_rhs == 0:
         return xp.zeros_like(rhs), 0., 0
     inverse = diagonal if callable(diagonal) else (lambda vector: vector / diagonal)
@@ -487,11 +519,11 @@ def gmres(action, rhs, diagonal, xp, *, tol, restart, maxiter, initial=None, def
     residual = rhs.copy()
     if initial is not None:
         trial = rhs - action(initial)
-        if float(xp.linalg.norm(trial)) < norm_rhs:
+        if _norm(xp, trial) < norm_rhs:
             x, residual = initial.astype(dtype, copy=True), trial
         del trial
-    if float(xp.linalg.norm(residual)) <= tol * norm_rhs:
-        return x, float(xp.linalg.norm(residual)) / norm_rhs, 0
+    if _norm(xp, residual) <= tol * norm_rhs:
+        return x, _norm(xp, residual) / norm_rhs, 0
     width = int(min(restart, rhs.size))
     k = default_deflation(width) if deflation is None else max(0, min(int(deflation), (width - 2) // 2))
     capacity = width + 1
@@ -509,7 +541,7 @@ def gmres(action, rhs, diagonal, xp, *, tol, restart, maxiter, initial=None, def
         else:
             space.count, state["nq"], state["j"] = 0, 0, 0
             hessenberg[:] = 0
-        beta = float(xp.linalg.norm(vector))
+        beta = _norm(xp, vector)
         if beta > 1e-300:
             vector /= beta
             space.append(vector)
@@ -553,7 +585,7 @@ def gmres(action, rhs, diagonal, xp, *, tol, restart, maxiter, initial=None, def
             w = action(inverse(space.data[j]))
             steps += 1
             hessenberg[:nq, j] = space.orthogonalize(w, nq)
-            length = float(xp.linalg.norm(w))
+            length = _norm(xp, w)
             hessenberg[nq, j] = length
             state["j"] = j + 1
             if length > 1e-14:
@@ -572,7 +604,7 @@ def gmres(action, rhs, diagonal, xp, *, tol, restart, maxiter, initial=None, def
         finished = estimate <= .8 * tol * norm_rhs or breakdown or steps >= maxiter or not j
         if finished:
             true = rhs - action(x)
-            relative = float(xp.linalg.norm(true)) / norm_rhs
+            relative = _norm(xp, true) / norm_rhs
             # No step since the last check: the deflation space already
             # holds the true residual and another check cannot improve x.
             if relative <= tol or steps >= maxiter or not j or steps == checked:

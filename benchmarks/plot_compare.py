@@ -146,18 +146,22 @@ def _end_labels(fig, ax, ends, colors, gap=13):
     spread out and tied to their points with hairline leaders."""
     fig.canvas.draw()                                   # fix the transforms before measuring
     scale = 72 / fig.dpi
-    placed = sorted(((x, y, text, ax.transData.transform((x, y))[1] * scale) for x, y, text in ends),
-                    key=lambda item: item[3])
-    targets = [item[3] for item in placed]
-    for _ in range(50):                                 # push neighbours apart until they clear
-        moved = False
-        for i in range(1, len(targets)):
-            if targets[i] - targets[i - 1] < gap:
-                middle = (targets[i] + targets[i - 1]) / 2
-                targets[i - 1], targets[i] = middle - gap / 2, middle + gap / 2
-                moved = True
-        if not moved:
-            break
+    placed, targets = [], []
+    for column in sorted({x for x, _, _ in ends}):      # only labels at one x can collide
+        group = sorted(((x, y, text, ax.transData.transform((x, y))[1] * scale)
+                        for x, y, text in ends if x == column), key=lambda item: item[3])
+        heights = [item[3] for item in group]
+        for _ in range(50):                             # push neighbours apart until they clear
+            moved = False
+            for i in range(1, len(heights)):
+                if heights[i] - heights[i - 1] < gap:
+                    middle = (heights[i] + heights[i - 1]) / 2
+                    heights[i - 1], heights[i] = middle - gap / 2, middle + gap / 2
+                    moved = True
+            if not moved:
+                break
+        placed += group
+        targets += heights
     for (x, y, text, height), target in zip(placed, targets):
         shift = target - height
         leader = dict(arrowstyle="-", color=colors["muted"], linewidth=0.8, shrinkA=0, shrinkB=4) \

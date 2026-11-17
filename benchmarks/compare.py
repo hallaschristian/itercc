@@ -77,10 +77,8 @@ def run_itercc(mf, frozen, method, symmetry, roots, irrep, basis):
     labels = _labels(mf, frozen) if symmetry else None
     if method == "ccsdtq":
         cc = RestrictedCCSDTQ(m.h, m.eri, m.nocc, m.constant, orbital_irreps=labels, backend="cpu")
-        # Diffuse sets have a stiff T4 mode: the documented settings put T4 into DIIS.
-        diffuse = dict(diis_quadruples="host", diis_size=8, damping=0.2) if basis.startswith("aug-") else {}
         result = cc.solve(energy_tol=ENERGY_TOL, residual_tol=RESIDUAL_TOL, max_iter=LIMIT,
-                          callback=lambda n, record: stamps.append(time.perf_counter()), **diffuse)
+                          callback=lambda n, record: stamps.append(time.perf_counter()))
     else:
         cc = RestrictedCC(m.h, m.eri, m.nocc, m.constant, orbital_irreps=labels,
                           symmetry_tolerance=1e-8 if symmetry else 0.0)
