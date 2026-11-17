@@ -138,6 +138,23 @@ profiles, numerical comparisons and raw logs are archived under
 latest-source suite passed 27 focused tests; the public-width dense-Jacobian
 check passed all three cases. GPU performance was not measured.
 
+The exact deployment snapshot `dcc1950` was then checked with the public
+`--occupied-slab 2` flag against the live job's frozen `ef5a57b` source, again
+using paired fresh workers on the same 56-core allocation. Profiling was off.
+
+| Output | Live-source seconds | Deployment seconds | Speedup | Peak RSS, live → deployment (GiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Quadruples, general input, 4 complete occupied slots | 161.92 | 22.10 | 7.33x | 71.89 → 71.97 |
+| Complete triples output, general input | 142.28 | 134.85 | 1.055x | 72.45 → 72.55 |
+
+Both outputs were bitwise identical. These are component timings; the
+quadruples sample is not the full 14,235-slot action. Jobs 61594003/61594005
+preserve the final comparisons, and `summary.json` / `benchmark-acceptance.json`
+in the same archive record every paired result, including the rejected wider
+slabs. Worker wall times including setup were 355.58 → 101.36 s for the
+quadruples pair and 227.81 → 220.99 s for triples. Setup variability means
+the entire worker-wall reduction cannot be attributed to the action kernels.
+
 ### Native packed-tile gathers (November 17)
 
 Profiling a general rank-1–4 direction on the full 26-electron/29-virtual CuF
