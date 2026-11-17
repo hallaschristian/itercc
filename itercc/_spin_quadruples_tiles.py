@@ -214,10 +214,13 @@ def _packed_cuts(holes, free, no, nv, budget, occupied_slab):
 
 def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                   labels=None, engine=None, occupied_slab=None, diagrams=None, intermediates=None,
-                  compiled_products=False):
-    """Raw virtual tile for one external spin pattern and occupied tuple."""
+                  compiled_products=False, out=None):
+    """Raw virtual tile for one external spin pattern and occupied tuple
+    (added into `out` when given: a zeroed array of the tile's shape)."""
     output_shape = (nv,) * rank + tuple(value.stop - value.start for value in fixed)
-    result = xp.zeros(output_shape)
+    if out is not None and out.shape != output_shape:
+        raise ValueError("The output tile has the wrong shape")
+    result = xp.zeros(output_shape) if out is None else out
     # T4 enters each diagram at most once. Expanding a given spin slab
     # repeatedly across diagrams is more expensive than the contractions.
     cache = {}

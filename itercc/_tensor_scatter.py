@@ -51,16 +51,24 @@ class SignedRows:
     `lengths + entry_shape`; `shape` and `strides` describe that array with its
     axes permuted by `axes`, as if it existed. The CPU symmetry-blocked engine
     reads the rows in place (`itercc_sym_contract_packed`); `dense()` gathers
-    them. Maps are layout-owned int32 arrays (see `signed_gather_rows`).
+    them. Maps are layout-owned int32 arrays (see `signed_gather_rows`), given
+    as a list or, with `pointers`, as their addresses (int64 per row, zero for
+    a zero row) with `maps` any object that keeps them alive.
     """
     dtype = np.dtype(np.float64)
 
-    def __init__(self, vector, bases, maps, width, lengths, entry_shape, axes):
+    def __init__(self, vector, bases, maps, width, lengths, entry_shape, axes, *, pointers=None):
         self.vector = vector
         self.bases = np.ascontiguousarray(bases, dtype=np.int64)
         self.maps = maps
         self.width = int(width)
-        self.pointers = np.asarray([0 if m is None else m.ctypes.data for m in maps], dtype=np.int64)
+        if pointers is None:
+            for base, mapping in zip(self.bases, maps):
+                if base and not (isinstance(mapping, np.ndarray) and mapping.dtype == np.int32
+                                 and mapping.shape == (self.width,) and mapping.flags.c_contiguous):
+                    raise ValueError("Nonzero rows need contiguous int32 maps of the row width")
+            pointers = [0 if m is None else m.ctypes.data for m in maps]
+        self.pointers = np.ascontiguousarray(pointers, dtype=np.int64)
         layout = tuple(lengths) + tuple(entry_shape)
         if prod(entry_shape) != self.width or prod(lengths) != len(self.bases):
             raise ValueError("Signed rows do not match their dense shape")
@@ -75,9 +83,12 @@ class SignedRows:
 
     def dense(self):
         """The tensor itself (gathered on the compiled core)."""
-        rows = signed_gather_rows(self.vector, self.bases, self.maps, self.width)
-        if rows is None:
+        kernel = _cpu_kernels.library()
+        if kernel is None:
             raise RuntimeError("Signed rows need the compiled core")
+        rows = np.empty((len(self.bases), self.width), dtype=np.float64)
+        kernel.signed_gather_rows(len(self.bases), self.width, self.bases.ctypes.data, self.pointers.ctypes.data,
+                                  self.vector.ctypes.data, rows.ctypes.data, cpu_threads(None))
         return rows.reshape(self._layout).transpose(self._axes)
 
 

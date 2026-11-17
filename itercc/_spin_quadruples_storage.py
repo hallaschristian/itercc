@@ -38,6 +38,8 @@ class PackedSpinQuadruples:
         self.size = 0
         self._virtual_maps = {}
         self._cpu_signed_maps = {}
+        self._holes = None
+        self._map_pointers = {}
         self.native_expansion = True
         for holes in combinations(range(2 * self.no), 4):
             key = alpha_count(holes) + spin_change, orbital_irrep(holes, occupied) ^ irrep
@@ -72,9 +74,40 @@ class PackedSpinQuadruples:
         self._virtual_maps[cache_key] = tuple(indices)
         return self._virtual_maps[cache_key]
 
+    def _hole_tables(self):
+        """(signed one-based slot bases, sector numbers, sectors) of every
+        spin-orbital hole tuple in any order: the base is the permutation sign
+        times (window start + 1), zero for repeated holes or a missing slot."""
+        if getattr(self, "_holes", None) is None:
+            n = 2 * self.no
+            sectors = sorted(self.groups)
+            number = {key: i for i, key in enumerate(sectors)}
+            bases = np.zeros(n**4, dtype=np.int64)
+            keys = np.zeros(n**4, dtype=np.int32)
+            holes = np.asarray(list(self.slots), dtype=np.int64).reshape(-1, 4)
+            starts = np.asarray([window.start + 1 for _, window in self.slots.values()], dtype=np.int64)
+            owners = np.asarray([number[key] for key, _ in self.slots.values()], dtype=np.int32)
+            for order, sign in signed_permutations(4):
+                positions = np.ravel_multi_index(holes[:, order].T, (n,) * 4)
+                bases[positions] = sign * starts
+                keys[positions] = owners
+            self._holes = bases, keys, sectors
+        return self._holes
+
+    def _signed_map(self, particle_spins, key):
+        cache_key = particle_spins, key
+        if cache_key not in self._cpu_signed_maps:
+            mapping = np.zeros(self.nv**4, dtype=np.int32)
+            for source, positions, sign in self._virtual_map(particle_spins, key, np):
+                mapping[positions] = sign * (source + 1)
+            self._cpu_signed_maps[cache_key] = mapping
+        return self._cpu_signed_maps[cache_key]
+
     def signed_rows(self, vector, signature, cuts, xp):
         """The occupied tile of `expand` as `SignedRows` (rows not gathered),
-        or None without the compiled core or for a non-NumPy vector."""
+        or None without the compiled core or for a non-NumPy vector. Rows run
+        over the occupied cuts in `product` order; bases and map addresses come
+        from the hole tables, so building one costs a few array operations."""
         if not (self.native_expansion and xp is np and isinstance(vector, np.ndarray)
                 and vector.dtype == np.float64 and vector.ndim == 1 and vector.flags.c_contiguous):
             return None
@@ -82,25 +115,23 @@ class PackedSpinQuadruples:
         if library() is None:
             return None
         from ._tensor_scatter import SignedRows
-        lengths = tuple(len(range(*cut.indices(self.no))) for cut in cuts)
-        bases, maps = [], []
-        for labels in product(*(range(*cut.indices(self.no)) for cut in cuts)):
-            holes = tuple(2 * i + spin for i, spin in zip(labels, signature[4:]))
-            item = self.slots.get(tuple(sorted(holes))) if len(set(holes)) == 4 else None
-            if item is None:
-                bases.append(0)
-                maps.append(None)
-                continue
-            key, window = item
-            cache_key = signature[:4], key
-            if cache_key not in self._cpu_signed_maps:
-                mapping = np.zeros(self.nv**4, dtype=np.int32)
-                for source, positions, sign in self._virtual_map(signature[:4], key, np):
-                    mapping[positions] = sign * (source + 1)
-                self._cpu_signed_maps[cache_key] = mapping
-            bases.append(parity(holes) * (window.start + 1))
-            maps.append(self._cpu_signed_maps[cache_key])
-        return SignedRows(vector, bases, maps, self.nv**4, lengths, (self.nv,) * 4, (4, 5, 6, 7, 0, 1, 2, 3))
+        hole_bases, hole_keys, sectors = self._hole_tables()
+        n = 2 * self.no
+        axes = [2 * np.arange(self.no, dtype=np.int64)[cut] + spin for cut, spin in zip(cuts, signature[4:])]
+        lengths = tuple(len(axis) for axis in axes)
+        index = (((axes[0][:, None, None, None] * n + axes[1][None, :, None, None]) * n
+                  + axes[2][None, None, :, None]) * n + axes[3][None, None, None, :]).reshape(-1)
+        bases = hole_bases[index]
+        owners = hole_keys[index]
+        table = self._map_pointers.get(signature[:4])
+        if table is None:
+            table = self._map_pointers[signature[:4]] = np.zeros(len(sectors), dtype=np.int64)
+        live = bases != 0
+        for owner in np.unique(owners[live][table[owners[live]] == 0]):
+            table[owner] = self._signed_map(signature[:4], sectors[owner]).ctypes.data
+        pointers = np.where(live, table[owners], 0)
+        return SignedRows(vector, bases, self._cpu_signed_maps, self.nv**4, lengths, (self.nv,) * 4,
+                          (4, 5, 6, 7, 0, 1, 2, 3), pointers=pointers)
 
     def expand(self, vector, signature, cuts, xp):
         """Expand only the occupied tile requested by one contraction."""

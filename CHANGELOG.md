@@ -22,7 +22,11 @@
   works in fixed column chunks, and the rows of a repeated hole are a plain
   zero fill. The blocked engine keeps each plan's kernel addresses and keys
   per-tile labels by identity. An action also resolves its thread count once
-  instead of on every kernel call.
+  instead of on every kernel call. Packed-row descriptors come from hole
+  lookup tables in a few array operations and are reused within an action
+  (3.8 s of Python in a 35 s CuF sample). The direct packed terms of
+  consecutive slots run in one call, and each slot reuses one raw tile
+  buffer. Results are unchanged bit for bit.
   What remains is about 16 s of small GEMMs, most of them shallow ones
   (summing over one occupied index) that are limited by writing their output
   tile, plus about 10 s of Python scheduling the tiles.

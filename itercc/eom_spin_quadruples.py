@@ -309,10 +309,19 @@ class TripletEOMCCSDTQ:
                 tensors["t4"] = None
                 continue
             def view(signature, layout=layout, vector=vector):
+                described = {}                  # signed rows of this action, by occupied cuts
+
                 def fetch(selector, packed=False):
                     # packed: the tile as signed rows for the CPU blocked engine
                     if packed and all(s == slice(None) for s in selector[:4]):
-                        rows = layout.signed_rows(vector, signature, selector[4:], xp)
+                        key = tuple((s.start, s.stop, s.step) for s in selector[4:])
+                        rows = described.get(key)
+                        if rows is None:
+                            rows = layout.signed_rows(vector, signature, selector[4:], xp)
+                            if rows is not None:
+                                if len(described) >= 4096:
+                                    described.clear()
+                                described[key] = rows
                         if rows is not None:
                             return rows
                     return layout.expand(vector, signature, selector[4:], xp)[selector[:4]]
@@ -321,6 +330,16 @@ class TripletEOMCCSDTQ:
         space = self.space
         if rank == 4 and self._packed_direction:
             result = xp.zeros(self._direction_t4.size)
+            pending = []
+
+            def flush():
+                if pending:
+                    start, stop = pending[0][0], pending[-1][1]
+                    coordinates = (pending[0][2] if len(pending) == 1 else
+                                   np.concatenate([c for _, _, c in pending]))
+                    pending.clear()
+                    packed_action.add(rank, coordinates, result[start:stop])
+
             spin_groups = {}
             started = perf_counter() if slot_finished is not None else 0.
             total = len(self._direction_t4.slots)
@@ -338,15 +357,23 @@ class TripletEOMCCSDTQ:
                     spin_groups[key] = groups
                 self._project_packed_tile(result[rows], holes, spin_groups[key], primal, tangent, intermediates)
                 if packed_action is not None:
+                    # Direct packed terms of consecutive slots go in one call:
+                    # each output row gets the same terms in the same order.
+                    if pending and pending[-1][1] != rows.start:
+                        flush()
                     particles = self._direction_t4.groups[key]
                     coordinates = np.empty((len(particles), 8), dtype=np.int32)
                     coordinates[:, :4], coordinates[:, 4:] = particles, holes
-                    packed_action.add(rank, coordinates, result[rows])
+                    pending.append((rows.start, rows.stop, coordinates))
+                    if rows.stop - pending[0][0] >= 1 << 18:
+                        flush()
                 done = index + 1
                 if slot_finished is not None and (done in (1, 4, 16, total) or done % 64 == 0):
+                    flush()
                     if xp is not np:
                         xp.cuda.get_current_stream().synchronize()
                     slot_finished(done, total, perf_counter() - started)
+            flush()
             yield None, result
             return
         indices = space.indices[rank - 1]
@@ -426,10 +453,24 @@ class TripletEOMCCSDTQ:
                                      engine=self._symmetry_engine, diagrams=diagrams,
                                      occupied_slab=self.occupied_slab,
                                      intermediates=intermediates,
-                                     compiled_products=self.packed_contractions).reshape((self.nvir,) * rank)
+                                     compiled_products=self.packed_contractions,
+                                     out=self._zeroed_tile()).reshape((self.nvir,) * rank)
                 for rows, particles, permutations in by_group.values():
                     self._accumulate_projection(result, rows, particles, permutations, tile, multiplicity)
         result /= len(_permutations(rank))**2
+
+    def _zeroed_tile(self):
+        """A zeroed rank-four raw tile for one occupied tuple, reused: each tile
+        is projected before the next one is formed (None on the GPU). Cleared
+        on the calling thread, which runs the tile's small products: a team
+        would leave the tile in the other cores' caches."""
+        if self.xp is not np:
+            return None
+        tile = getattr(self, "_raw_tile", None)
+        if tile is None:
+            tile = self._raw_tile = np.empty((self.nvir,) * 4 + (1,) * 4)
+        tile.fill(0.0)
+        return tile
 
     def _accumulate_projection(self, destination, rows, particles, permutations, tile, multiplicity):
         if self.xp is np and self.packed_contractions and self.native_projection:
