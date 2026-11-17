@@ -172,3 +172,19 @@ def integrals_from_pyscf(mol):
     so_basis = list(zip(mol.irrep_id, mol.symm_orb)) if mol.symmetry else None
     return (hcore, mol.intor_symmetric("int1e_ovlp"), mol.intor("int2e", aosym="s8"), mol.nelectron,
             mol.energy_nuc(), so_basis)
+
+
+def run(molecule, *, threads=None, screen=1e-14, **options):
+    """Native RHF of a `molecule.Molecule`: the package's own AO integrals
+    (`itercc.integrals`), symmetry-adapted basis and `rhf`. Returns
+    (RHFResult, hcore, 8-fold packed ERIs) for `from_scf`."""
+    from . import integrals
+
+    b = molecule.basis
+    hcore = integrals.kinetic(b, threads) + integrals.nuclear(b, threads)
+    overlap = integrals.overlap(b, threads)
+    eri = integrals.eri_s8(b, screen=screen, threads=threads)
+    so = molecule.symmetry.so_basis if molecule.symmetry is not None else None
+    result = rhf(hcore, overlap, eri, molecule.nelectron, molecule.energy_nuc(), so_basis=so, threads=threads,
+                 **options)
+    return result, hcore, eri

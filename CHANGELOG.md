@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A calculation can now run without PySCF: `itercc.molecule.Molecule`
+  (geometry, NWChem-format basis sets from `ITERCC_BASIS_PATH` or an
+  installed PySCF's data files, Abelian point group and symmetry-adapted
+  basis from `itercc.symmetry`), the package's own Gaussian integrals
+  (`itercc.integrals`: overlap, kinetic, nuclear attraction, dipole and
+  8-fold packed ERIs by McMurchie-Davidson in the core, libcint's
+  conventions, equal to libcint to 1e-13 through g functions), native
+  closed-shell RHF (`itercc.scf.rhf` and `run`: J/K from the core, DIIS, one
+  eigenproblem per irrep) and `from_scf` for the solvers. Water RHF agrees
+  with PySCF to 1e-12 Eh and CCSD/CCSDT to their convergence. The integrals
+  are still 4-5x slower than libcint (cc-pVQZ: 0.39 instead of 0.09 s).
 - IterCC transforms the integrals itself: `itercc.integrals.mo_eri` turns
   AO two-electron integrals (8-fold or 4-fold packed, or full) into the
   (pq|rs) the solvers take, as two half transformations of large GEMMs on
