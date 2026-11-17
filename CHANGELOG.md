@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
+  whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
+  instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of
+  8.3 s, and aug-cc-pVQZ CCSD from RHF 2.6 s and 15 GiB instead of 4.3 s
+  and 21 GiB (faster AO-to-MO transform); times per iteration are unchanged
+  within noise. docs/benchmarks.md no longer quotes 112-thread runs.
 - Faster triplet EOM-CCSDTQ actions on the CPU (packed spin, occupied
   tiles): water cc-pVDZ on 12 threads takes 26.5 s per action instead of
   47 s, with the same action bit for bit. A 16-slot CuF quadruples sample
