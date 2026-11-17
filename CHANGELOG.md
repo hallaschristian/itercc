@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Faster triplet EOM-CCSDTQ actions on the CPU (packed spin, occupied
+  tiles). A summed occupied axis of an expanded T4 slab is now as wide as a
+  quarter of the tile cache allows, not two slots, so one deeper product
+  replaces several that each read and write the whole output tile. Packed T4
+  rows expand in fixed column chunks with no division per entry, and the rows
+  of a repeated hole are a plain zero fill. The blocked engine keeps each
+  plan's kernel addresses and keys per-tile labels by identity, and an action
+  resolves its thread count once instead of on every kernel call. Water
+  cc-pVDZ on 12 threads: 37 s per action instead of 47 s, with the same
+  results to 13 digits. What remains is mostly memory traffic: one action
+  expands about 112 GiB of dense T4 rows, half of them zero, from 15 GiB of
+  distinct rows.
 - A calculation can now run without PySCF: `itercc.molecule.Molecule`
   (geometry; NWChem-format basis sets from `ITERCC_BASIS_PATH`, the bundled
   `itercc/basis_sets` (STO-3G, Pople 3-21G to 6-311G**, cc-pVXZ and

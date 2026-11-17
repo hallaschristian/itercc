@@ -1,25 +1,41 @@
 // Shared deterministic tensor expansion; each destination has one owner.
 #include "itercc/core.h"
 
+#include <algorithm>
+
 extern "C" void itercc_signed_gather_rows(int64_t rows, int64_t width,
     const int64_t *bases, const int64_t *maps, const double *source,
     double *target, int threads)
 {
-    #pragma omp parallel for schedule(static) num_threads(threads)
-    for (int64_t i = 0; i < rows * width; ++i) {
-        const int64_t row = i / width, base = bases[row];
-        double value = 0.;
-        if (base) {
-            const int32_t *map = reinterpret_cast<const int32_t *>(static_cast<intptr_t>(maps[row]));
-            const int32_t index = map[i % width];
-            if (index) {
-                const int64_t offset = (base < 0 ? -base : base) - 1
-                                     + (index < 0 ? -int64_t(index) : index) - 1;
-                value = source[offset];
-                if ((base < 0) != (index < 0)) value = -value;
-            }
+    // Tasks are fixed column chunks of one row: no division per entry, and a
+    // row without a base (a repeated hole) is a plain zero fill. The chunking
+    // does not depend on the thread count, and each entry has one writer.
+    constexpr int64_t chunk = 8192;
+    const int64_t per_row = (width + chunk - 1) / chunk, tasks = rows * per_row;
+    auto run = [&](int64_t task) {
+        const int64_t row = task / per_row, c0 = task % per_row * chunk;
+        const int64_t c1 = std::min(width, c0 + chunk);
+        double *out = target + row * width;
+        const int64_t base = bases[row];
+        if (!base) {
+            std::fill(out + c0, out + c1, 0.);
+            return;
         }
-        target[i] = value;
+        const int32_t *map = reinterpret_cast<const int32_t *>(static_cast<intptr_t>(maps[row]));
+        // source[(|base| - 1) + (|index| - 1)], negated when exactly one is negative
+        const double *from = source + ((base < 0 ? -base : base) - 1);
+        const double sign = base < 0 ? -1. : 1.;
+        for (int64_t c = c0; c < c1; ++c) {
+            const int32_t index = map[c];
+            out[c] = index > 0 ? sign * from[index - 1] : index < 0 ? -sign * from[-int64_t(index) - 1] : 0.;
+        }
+    };
+    // Small gathers stay on the caller (see itercc_permuted_gather_add on team sizes).
+    if (rows * width < 32768) {
+        for (int64_t task = 0; task < tasks; ++task) run(task);
+    } else {
+        #pragma omp parallel for schedule(static) num_threads(threads)
+        for (int64_t task = 0; task < tasks; ++task) run(task);
     }
 }
 

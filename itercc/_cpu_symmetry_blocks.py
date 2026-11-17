@@ -16,6 +16,7 @@ from functools import reduce
 import numpy as np
 
 from . import _cpu_kernels
+from ._cpu_triples import cpu_threads
 from .symmetry_blocks import SymmetryBlocks, _offsets
 
 _COLUMNS = ("a_rows", "a_sum", "b_sum", "b_cols", "rpos", "cpos")
@@ -41,8 +42,10 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         super().__init__(labels, combinations, nirrep, fallback=fallback)
         self.threads = threads
         self._library = _cpu_kernels.library()
-        # Labels key of the last per-call labels dict (kept alive, so `is` is safe).
-        self._label_dict, self._label_key = None, ()
+        # Labels keys of per-call labels dicts by identity; each entry keeps
+        # its dict alive, so an id is not reused while it is in the map. One
+        # dict lookup per call keeps this safe when threads share the engine.
+        self._label_keys = {}
 
     def release_workspace(self):
         """Free the kernels' per-thread scratch buffers (they keep their pages
@@ -87,25 +90,41 @@ class CpuSymmetryBlocks(SymmetryBlocks):
                                        structure["b_outer"][i_c], structure["obase"][i_r][i_c]))
         return np.array(blocks, dtype=np.int64).reshape(-1, 9)
 
+    def _label_key_of(self, labels):
+        if not labels:
+            return ()
+        found = self._label_keys.get(id(labels))
+        if found is not None and found[0] is labels:
+            return found[1]
+        if self.nirrep == 1:                  # every label 0: the extents say it all
+            key = tuple((c, len(v)) for c, v in labels.items())
+        else:
+            key = tuple((c, np.asarray(v, dtype=np.int64).tobytes()) for c, v in labels.items())
+        if len(self._label_keys) > 4096:
+            self._label_keys = {}
+        self._label_keys[id(labels)] = (labels, key)
+        return key
+
+    def _entry(self, spec, a, b, out, labels, irreps):
+        """(structure, block table, kernel arguments) of one call signature, cached."""
+        call = (spec, a.shape, a.strides, a.dtype.char, b.shape, b.strides, b.dtype.char,
+                out.shape, out.strides, out.dtype.char, int(irreps[0]), int(irreps[1]),
+                self._label_key_of(labels))
+        hit = self._calls.get(call)
+        if hit is None:
+            structure, plan = self._resolve(spec, a, b, out, labels, irreps)
+            # The table and offset columns live as long as the cached plan, so
+            # their addresses are resolved once instead of on every call.
+            arguments = (None if not structure or not len(plan) else
+                         (len(plan), plan.ctypes.data, *(structure[name].ctypes.data for name in _COLUMNS),
+                          self.flags(structure)))
+            hit = self._calls[call] = (structure, plan, arguments)
+        return hit
+
     def plan_for(self, spec, a, b, out, labels=None, irreps=(0, 0)):
         """(structure, block table) of one call signature, cached, or (False, None)
         when the product has no blocked plan (`einsum` then uses the fallback)."""
-        if not labels:
-            label_key = ()
-        elif labels is self._label_dict:      # the same per-tile labels as the last call
-            label_key = self._label_key
-        elif self.nirrep == 1:                # every label 0: the extents say it all
-            label_key = tuple((c, len(v)) for c, v in labels.items())
-            self._label_dict, self._label_key = labels, label_key
-        else:
-            label_key = tuple((c, np.asarray(v, dtype=np.int64).tobytes()) for c, v in labels.items())
-            self._label_dict, self._label_key = labels, label_key
-        call = (spec, a.shape, a.strides, a.dtype.char, b.shape, b.strides, b.dtype.char,
-                out.shape, out.strides, out.dtype.char, int(irreps[0]), int(irreps[1]), label_key)
-        hit = self._calls.get(call)
-        if hit is None:
-            hit = self._calls[call] = self._resolve(spec, a, b, out, labels, irreps)
-        return hit
+        return self._entry(spec, a, b, out, labels, irreps)[:2]
 
     @staticmethod
     def flags(structure):
@@ -115,13 +134,11 @@ class CpuSymmetryBlocks(SymmetryBlocks):
 
     def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0)):
         """out = beta * out + alpha * einsum(spec, a, b) (see `SymmetryBlocks.einsum`)."""
-        structure, plan = self.plan_for(spec, a, b, out, labels, irreps)
+        structure, plan, arguments = self._entry(spec, a, b, out, labels, irreps)
         if not structure:
             if self.fallback is None:
                 raise ValueError(f"No symmetry-blocked plan for {spec}")
             return self.fallback(spec, a, b, out=out, alpha=alpha, beta=beta)
-        from ._cpu_triples import cpu_threads
-
         threads = cpu_threads(self.threads)
         library = self._library
         if beta != 1.0:
@@ -131,10 +148,9 @@ class CpuSymmetryBlocks(SymmetryBlocks):
                 out[...] = 0.0
             else:
                 out *= beta
-        if not len(plan) or alpha == 0.0:
+        if arguments is None or alpha == 0.0:
             return out
-        flags = self.flags(structure)
-        library.sym_contract(len(plan), plan.ctypes.data, a.ctypes.data, b.ctypes.data,
-                                    out.ctypes.data, *(structure[name].ctypes.data for name in _COLUMNS),
-                                    float(alpha), flags, threads)
+        count, table, a_rows, a_sum, b_sum, b_cols, rpos, cpos, flags = arguments
+        library.sym_contract(count, table, a.ctypes.data, b.ctypes.data, out.ctypes.data,
+                             a_rows, a_sum, b_sum, b_cols, rpos, cpos, float(alpha), flags, threads)
         return out

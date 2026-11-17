@@ -176,14 +176,32 @@ def projection_diagrams(rank):
 
 
 _PACKED_TILE_BYTES = 256 * 2**20
+_ALL = (None, None)
+_TILE_LABELS = {}
+
+
+def _tile_labels(occupied, selected):
+    """Occupied irrep labels of one tile, one dict object per tile: the blocked
+    engine keys its plans by the dict's identity instead of its contents."""
+    key = id(occupied), tuple((c, s.start, s.stop) for c, s in selected.items())
+    found = _TILE_LABELS.get(key)
+    if found is not None and found[0] is occupied:
+        return found[1]
+    labels = {c: occupied[s] for c, s in selected.items()}
+    if len(_TILE_LABELS) > 1 << 16:
+        _TILE_LABELS.clear()
+    _TILE_LABELS[key] = occupied, labels
+    return labels
 
 
 @lru_cache(maxsize=4096)
 def _packed_cuts(holes, free, no, nv, budget, occupied_slab):
-    """Tile both free and summed occupied axes before expanding packed T4."""
+    """Tile both free and summed occupied axes before expanding packed T4.
+    Summed axes are at most `occupied_slab` wide (None: as wide as the byte
+    budget allows, so a product sums over as many slots as one call can)."""
     bounds = {c: (start, stop) for c, start, stop in free}
     regions = [bounds.get(c, (0, no)) for c in holes]
-    widths = [stop - start if c in bounds else min(occupied_slab, stop - start)
+    widths = [stop - start if c in bounds or occupied_slab is None else min(occupied_slab, stop - start)
               for c, (start, stop) in zip(holes, regions)]
     max_slots = max(1, budget // (8 * nv**4))
     while prod(widths) > max_slots:
@@ -195,7 +213,7 @@ def _packed_cuts(holes, free, no, nv, budget, occupied_slab):
 
 
 def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
-                  labels=None, engine=None, occupied_slab=2, diagrams=None, intermediates=None,
+                  labels=None, engine=None, occupied_slab=None, diagrams=None, intermediates=None,
                   compiled_products=False):
     """Raw virtual tile for one external spin pattern and occupied tuple."""
     output_shape = (nv,) * rank + tuple(value.stop - value.start for value in fixed)
@@ -215,8 +233,12 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
         else:
             # Caching multi-slot expansions across diagrams is only useful
             # when the free axes are tiled as well as the contracted ones.
+            # A wide slab is one deep product instead of several shallow ones
+            # that each read and write the whole output tile; a quarter of the
+            # cache keeps several expansions reusable across diagrams.
             slabs = _packed_cuts(inputs[t4][4:], tuple((c, s.start, s.stop) for c, s in cuts.items()),
-                                 no, nv, max_cache_bytes, occupied_slab)
+                                 no, nv, max_cache_bytes if occupied_slab else max_cache_bytes // 4,
+                                 occupied_slab)
         for derivative in range(len(names)):
             if tangent[names[derivative]] is None:
                 continue
@@ -247,19 +269,20 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
 
                     operands = tuple(lambda i=i: fetch(i) for i in range(len(names)))
                     if engine is not None and len(names) == 2:
-                        current = {c: labels["o"][cut] for c, cut in selected.items()}
                         engine.einsum(spec, *[op() for op in operands], target, alpha=coefficient,
-                                      beta=1.0, labels=current,
+                                      beta=1.0, labels=_tile_labels(labels["o"], selected),
                                       irreps=tuple(irrep if i == derivative else 0 for i in range(2)))
                     else:
                         unit = tuple(c for c in cuts if selected[c].stop - selected[c].start == 1)
-                        keys = (tuple((name, i == derivative, signatures[i],
-                                       tuple((selected.get(c, slice(None)).start,
-                                              selected.get(c, slice(None)).stop) for c in inputs[i]))
-                                      for i, name in enumerate(names)) if intermediates is not None else None)
+                        keys = None
+                        if intermediates is not None:
+                            bounds = {c: (s.start, s.stop) for c, s in selected.items()}
+                            keys = tuple((name, i == derivative, signatures[i],
+                                          tuple(bounds.get(c, _ALL) for c in inputs[i]))
+                                         for i, name in enumerate(names))
                         tile_product(xp, spec, operands, target, coefficient, no, nv, unit,
                                      keys=keys, cache=intermediates,
-                                     blocked=((engine, {c: labels["o"][cut] for c, cut in selected.items()},
+                                     blocked=((engine, _tile_labels(labels["o"], selected),
                                                tuple(irrep if i == derivative else 0 for i in range(len(names))))
                                               if compiled_products and engine is not None else None))
     return result

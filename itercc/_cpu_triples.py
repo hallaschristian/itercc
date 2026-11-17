@@ -183,11 +183,12 @@ _SCOPE = threading.local()
 @contextmanager
 def thread_scope(threads):
     """Inside the block, `cpu_threads()` without an explicit count returns
-    `threads` (None: no change) in this Python thread: a solver's thread
-    option reaches every kernel it calls."""
+    `threads` in this Python thread: a solver's thread option reaches every
+    kernel it calls. None pins the count in effect when the block starts, so
+    the kernels of the block skip the environment lookup (one triplet
+    EOM-CCSDTQ action makes 300k calls of `cpu_threads`)."""
     previous = getattr(_SCOPE, "threads", None)
-    if threads is not None:
-        _SCOPE.threads = int(threads)
+    _SCOPE.threads = int(threads) if threads is not None else cpu_threads()
     try:
         yield
     finally:

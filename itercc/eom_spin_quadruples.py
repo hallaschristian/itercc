@@ -548,7 +548,10 @@ class TripletEOMCCSDTQ:
         if self.xp.iscomplexobj(vector):
             return self.sigma(vector.real) + 1j * self.sigma(vector.imag)
         start = perf_counter()
-        result = self._action(vector)
+        from ._cpu_triples import thread_scope
+
+        with thread_scope(None):                 # one thread count for the whole action
+            result = self._action(vector)
         if not bool(self.xp.isfinite(result).all()):
             raise FloatingPointError("Nonfinite spin-flip Jacobian action")
         self.matvec_count += 1
