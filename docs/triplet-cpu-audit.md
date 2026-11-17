@@ -102,6 +102,42 @@ machinery is lower priority than action and projector costs.
 
 ## Evidence
 
+### CuF slab-width validation (November 17, latest CPU kernels)
+
+The `889eef3` update is numerically valid on the full 26-electron/29-virtual
+CuF checkpoint, but its byte-budget-sized occupied slabs are slower here than
+the preceding native-gather version `461b1e5`. Fresh paired workers used the
+same 56-core Sapphire Rapids allocation, 128 GiB requested memory and 8 GiB
+intermediate cache. Each row is one paired sample, not a whole eigensolve.
+
+| Output/configuration | Reference seconds | Candidate seconds | Peak RSS, reference → candidate (GiB) | Maximum absolute error |
+| --- | ---: | ---: | ---: | ---: |
+| Quadruples, general input, 16 slots, default wider slabs | 76.31 | 91.77 | 75.82 → 75.63 | 8.67e-19 |
+| Quadruples, singles-only input, 128 slots, defaults | 108.11 | 102.58 | 48.82 → 48.81 | 0, bitwise equal |
+| Complete triples output, general input, defaults | 136.19 | 136.24 | 72.56 → 72.56 | 0, bitwise equal |
+| Quadruples, general input, 16 slots, candidate slab width 2 | 72.06 | 63.05 | 75.93 → 75.82 | 0, bitwise equal |
+
+The wider slabs reduced contraction calls but increased both expansion and
+compiled contraction time. Width 2 retains the newer kernels and metadata
+caches while recovering the faster tiling for this model. The matched narrow
+slab result is 1.143x faster than the previous native-gather version. Complete
+triples performance is unchanged. Do not multiply speedups from different
+occupied-slot samples or infer a full eigensolve speedup.
+
+`TripletEOMCCSDTQ(..., occupied_slab=2)` now forwards the same explicit width
+to every shared tiled contraction, including lower-rank feedback and both
+quadruples projection paths. `None` preserves automatic byte-budget sizing;
+no existing CPU/GPU default was changed. Both CuF drivers expose and record
+`--occupied-slab`. The initial width-2 measurement used an external wrapper
+setting that identical contraction argument; dense six-electron Jacobian
+checks also pass through the public option for widths 1, 2 and None.
+
+Benchmark jobs: 61589064, 61589068, 61589071 and 61591673. Frozen sources,
+profiles, numerical comparisons and raw logs are archived under
+`itercc_triplet_latest_20261117` in the cluster scratch area. The initial
+latest-source suite passed 27 focused tests; the public-width dense-Jacobian
+check passed all three cases. GPU performance was not measured.
+
 ### Native packed-tile gathers (November 17)
 
 Profiling a general rank-1–4 direction on the full 26-electron/29-virtual CuF

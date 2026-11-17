@@ -126,6 +126,12 @@ set `memory_budget_gib` for the full allocation. Cached direction-dependent
 products are discarded between actions. `last_intermediate_cache` reports
 hits, misses and peak cached array bytes. Ground-state effective coefficients
 and canonical address maps are reused for the lifetime of the EOM engine.
+`occupied_slab=None` (default) sizes summed occupied slabs from the tile byte
+budget. Set a positive integer, for example `occupied_slab=2`, to cap their
+width across the shared tiled contractions. Wider slabs are not universally
+faster: benchmark the intended molecule and CPU before selecting a width.
+Both CuF triplet benchmark drivers expose this as `--occupied-slab` and record
+the setting. It changes contraction tiling, not the Hamiltonian or equations.
 Canonical CPU input expansion also uses the compiled core. The packed
 engine's Davidson memory check accounts for its actual packed/tiled storage
 instead of a logical dense rank-four tensor. See the

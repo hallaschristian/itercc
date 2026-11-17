@@ -172,8 +172,13 @@ class TripletEOMCCSDTQ:
 
     def __init__(self, solver, amplitudes, orbital_irreps=None, irrep=0, *,
                  backend="cpu", memory_budget_gib=4, occupied_tiles=False, action_only=False,
-                 packed_spin=False, packed_contractions=None, intermediate_cache_gib=0):
+                 packed_spin=False, packed_contractions=None, intermediate_cache_gib=0,
+                 occupied_slab=None):
         no, nv = solver.nocc, solver.nvir
+        if occupied_slab is not None and (isinstance(occupied_slab, (bool, np.bool_)) or
+                not isinstance(occupied_slab, (int, np.integer)) or occupied_slab < 1):
+            raise ValueError("Occupied slab must be a positive integer or None")
+        self.occupied_slab = None if occupied_slab is None else int(occupied_slab)
         if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
         self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
@@ -355,6 +360,7 @@ class TripletEOMCCSDTQ:
                 yield raw, contract_tile(xp, rank, raw, cuts, primal, tangent, no, nv,
                                          irrep=space.irrep, labels=self._spatial_labels,
                                          engine=self._symmetry_engine, diagrams=diagrams,
+                                         occupied_slab=self.occupied_slab,
                                          intermediates=intermediates, compiled_products=self.packed_contractions)
             return
         groups = {}
@@ -418,6 +424,7 @@ class TripletEOMCCSDTQ:
                 tile = contract_tile(self.xp, rank, raw, cuts, primal, tangent, self.nocc, self.nvir,
                                      irrep=self.space.irrep, labels=self._spatial_labels,
                                      engine=self._symmetry_engine, diagrams=diagrams,
+                                     occupied_slab=self.occupied_slab,
                                      intermediates=intermediates,
                                      compiled_products=self.packed_contractions).reshape((self.nvir,) * rank)
                 for rows, particles, permutations in by_group.values():
@@ -450,7 +457,8 @@ class TripletEOMCCSDTQ:
                 cuts = tuple(slice(i, i + 1) for i in fixed)
                 tile = contract_tile(xp, rank, raw, cuts, primal, tangent, no, nv,
                                      irrep=self.space.irrep, labels=self._spatial_labels,
-                                     engine=self._symmetry_engine).reshape((nv,) * rank)
+                                     engine=self._symmetry_engine,
+                                     occupied_slab=self.occupied_slab).reshape((nv,) * rank)
                 for p, sign in permutations:
                     subtotal += sign * tile[tuple(particles[i] for i in p)]
         return subtotal / len(_permutations(rank))**2

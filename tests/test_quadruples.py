@@ -683,7 +683,8 @@ def test_packed_rank_four_spin_projector_matches_dense():
     np.testing.assert_allclose(packed.project(projected), projected, rtol=0, atol=1e-13)
 
 
-def test_cpu_direct_spin_quadruples_six_electrons_match_dense():
+@pytest.mark.parametrize("occupied_slab", [None, 1, 2])
+def test_cpu_direct_spin_quadruples_six_electrons_match_dense(occupied_slab):
     from itercc import TripletEOMCCSDTQ, _cpu_quadruples
     if not _cpu_quadruples.available():
         pytest.skip("compiled CPU core unavailable")
@@ -691,7 +692,7 @@ def test_cpu_direct_spin_quadruples_six_electrons_match_dense():
     solver, amplitudes = warm_amplitudes(symmetric_model(labels, no=3), evaluations=2, backend="cpu")
     dense = TripletEOMCCSDTQ(solver, amplitudes, labels, 2)
     direct = TripletEOMCCSDTQ(solver, amplitudes, labels, 2, occupied_tiles=True,
-                             action_only=True, packed_contractions=True)
+                             action_only=True, packed_contractions=True, occupied_slab=occupied_slab)
     vector = np.random.default_rng(715).normal(size=dense.space.size)
     tail = dense.space.slices[3]
     rows = {tuple(row): i for i, row in enumerate(dense.space.indices[3].T)}
@@ -702,6 +703,14 @@ def test_cpu_direct_spin_quadruples_six_electrons_match_dense():
     measured = direct._action(np.r_[vector[:tail.start], vector[tail][order]])
     np.testing.assert_allclose(measured, np.r_[expected[:tail.start], expected[tail][order]],
                                rtol=2e-11, atol=2e-11)
+
+
+@pytest.mark.parametrize("occupied_slab", [0, -1, 1.5, True])
+def test_triplet_rejects_invalid_occupied_slab(occupied_slab):
+    from types import SimpleNamespace
+    from itercc import TripletEOMCCSDTQ
+    with pytest.raises(ValueError, match="Occupied slab"):
+        TripletEOMCCSDTQ(SimpleNamespace(nocc=1, nvir=1), (), occupied_slab=occupied_slab)
 
 
 def test_cpu_finite_difference_eom_refuses_single_precision():

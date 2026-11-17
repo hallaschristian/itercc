@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--holes", type=int, default=3)
     parser.add_argument("--slots", type=int, default=1)
     parser.add_argument("--cache-gib", type=float, default=0)
+    parser.add_argument("--occupied-slab", type=int,
+                        help="Maximum summed occupied slab width; default uses the tile byte budget")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--singles-only", action="store_true")
     parser.add_argument("--numpy-projection", action="store_true")
@@ -62,6 +64,7 @@ def main():
     engine = TripletEOMCCSDTQ(solver, amplitudes, model["orbital_irreps"], 2,
                               occupied_tiles=True, action_only=True, memory_budget_gib=300,
                               packed_contractions=args.version == "packed",
+                              occupied_slab=args.occupied_slab,
                               intermediate_cache_gib=args.cache_gib if args.version == "packed" else 0)
     engine.native_projection = not args.numpy_projection
     engine._ground_t4.native_expansion = not args.numpy_tile_expansion
@@ -99,6 +102,7 @@ def main():
                           input_sha256=digest.hexdigest(), singles_only=args.singles_only,
                           numpy_unpack=args.numpy_unpack, numpy_projection=args.numpy_projection,
                           numpy_tile_expansion=args.numpy_tile_expansion,
+                          occupied_slab=engine.occupied_slab,
                           setup_seconds=perf_counter() - start)), flush=True)
     start = perf_counter()
     profiler = cProfile.Profile() if args.profile else None

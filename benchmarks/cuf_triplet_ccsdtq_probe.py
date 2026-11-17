@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--memory-gib", type=float, default=100)
     parser.add_argument("--cache-gib", type=float, default=0,
                         help="Byte budget in GiB for action-local products; 8 is a cluster starting point")
+    parser.add_argument("--occupied-slab", type=int,
+                        help="Maximum summed occupied slab width; default uses the tile byte budget")
     parser.add_argument("--irrep", type=int, choices=range(4), default=2)
     parser.add_argument("--mode", choices=("feedback", "solve"), default="feedback")
     parser.add_argument("--roots", type=int, default=1)
@@ -130,7 +132,8 @@ def main():
                                mmap_mode="r", allow_pickle=False) for rank in range(1, 5))
     engine = MonitoredTriplet(solver, amplitudes, labels, args.irrep, backend="cpu",
                               occupied_tiles=True, action_only=not solve, packed_spin=solve,
-                              memory_budget_gib=args.memory_gib, intermediate_cache_gib=args.cache_gib)
+                              memory_budget_gib=args.memory_gib, intermediate_cache_gib=args.cache_gib,
+                              occupied_slab=args.occupied_slab)
     if abs(engine.ground_energy - ground["energy_Eh"]) > 2e-10:
         raise ValueError("Ground-state energy changed on reload")
     if engine._symmetry_engine is None:
@@ -140,7 +143,8 @@ def main():
                      ground_sha256=GROUND_SHA256, irrep=args.irrep, dimensions=dimensions,
                      roots=args.roots)
     print(json.dumps(dict(event="ready", **signature, setup_seconds=perf_counter() - start,
-                          packed_contractions=engine.packed_contractions, cache_gib=args.cache_gib)),
+                          packed_contractions=engine.packed_contractions, cache_gib=args.cache_gib,
+                          occupied_slab=engine.occupied_slab)),
           flush=True)
     if solve:
         run_solve(engine, args, signature)
