@@ -10,7 +10,9 @@ count, the energy and the peak memory of the whole process tree.
 
 Codes: itercc (C2v symmetry), itercc-nosym, pyscf (pyscf.cc.rccsdt /
 rccsdtq), pyscf-highm (their high-memory variants), ccpy
-(coupled-cluster-py), nwchem (TCE, run with mpirun; set NWCHEM_BASIS_LIBRARY).
+(coupled-cluster-py), nwchem (TCE, run with mpirun; set NWCHEM_BASIS_LIBRARY),
+orca (AUTOCI; `orca` on PATH or ORCA_EXE, scratch in ORCA_SCRATCH; CCSDTQ runs on
+its UHF code, the only one AUTOCI has for quadruples).
 Methods: ccsdt, ccsdtq, eom-ccsdt (the lowest --roots singlet roots of the
 irrep holding the lowest excitation, after a tight ground state).
 `benchmarks/plot_compare.py` draws the figures in docs/images.
@@ -224,6 +226,48 @@ def run_nwchem(molecule, basis, method, ranks, memory_mb, roots, irrep_name):
     return out
 
 
+ORCA_INPUT = """! {reference}AUTOCI-{method} {basis} TightSCF
+{pal}%maxcore {memory}
+%autoci
+  STol {thresh}
+  MaxIter {limit}
+end
+* xyz 0 1
+{atoms}
+*
+"""
+
+
+def run_orca(molecule, basis, method, ranks, memory_mb):
+    """ORCA's AUTOCI. Its residual threshold (STol) is the largest residual
+    element, as in IterCC; it has no separate energy threshold."""
+    spec = MOLECULES[molecule]
+    if spec["frozen"] != 1:
+        raise SystemExit("the ORCA input relies on ORCA's default frozen core (O 1s here)")
+    atoms = "\n".join(" " + a.strip() for a in spec["atom"].split(";"))
+    executable = os.environ.get("ORCA_EXE") or shutil.which("orca")
+    work = tempfile.mkdtemp(prefix="orca-", dir=os.environ.get("ORCA_SCRATCH"))
+    try:
+        Path(work, "bench.inp").write_text(ORCA_INPUT.format(
+            reference="UHF " if method == "ccsdtq" else "", method=method.upper(), basis=basis,
+            pal=f"%pal nprocs {ranks} end\n" if ranks > 1 else "", memory=memory_mb,
+            thresh=RESIDUAL_TOL, limit=LIMIT, atoms=atoms))
+        text = subprocess.run([executable, "bench.inp"], cwd=work, capture_output=True, text=True,
+                              errors="replace").stdout
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    Path(f"orca-{method}-{basis}.out").write_text(text)          # kept next to the results
+    if "ORCA TERMINATED NORMALLY" not in text:
+        raise RuntimeError("ORCA failed:\n" + text[-3000:])
+    table = text.split("CCSDT Iterations" if method == "ccsdt" else "CCSDTQ Iterations")[1]
+    rows = re.findall(r"^\s+\d+\s+-?[\d.]+\s+-?[\d.eE+-]+\s+[\d.eE+-]+\s+([\d.]+)\s*$", table, re.M)
+    module = re.search(r"AUTOCI module\s+\.\.\.\s+([\d.]+) sec", text)
+    return dict(energy=float(re.search(r"FINAL SINGLE POINT ENERGY\s+(-?[\d.]+)", text).group(1)),
+                converged="Calculation CONVERGED" in text, iterations=len(rows),
+                iteration_seconds=[float(t) for t in rows],
+                solve_seconds=float(module.group(1)) if module else None)
+
+
 def worker(args):
     import numpy as np
 
@@ -231,7 +275,12 @@ def worker(args):
     LIMIT = args.max_iter or LIMIT
     out = dict(code=args.code, method=args.method, molecule=args.molecule, basis=args.basis,
                partial=args.max_iter is not None)
-    if args.code == "nwchem":
+    if args.code == "orca":
+        if args.method == "eom-ccsdt":
+            raise SystemExit("ORCA's AUTOCI has no EOM-CCSDT")
+        mf, frozen = _rhf(args.molecule, args.basis)
+        out.update(run_orca(args.molecule, args.basis, args.method, args.threads, args.orca_memory))
+    elif args.code == "nwchem":
         mf, frozen = _rhf(args.molecule, args.basis)
         name = (args.irrep_name or _irrep_name(mf, args.irrep)).lower()
         out.update(run_nwchem(args.molecule, args.basis, args.method, args.threads, args.nwchem_memory,
@@ -322,6 +371,8 @@ def run(args):
                 if line.startswith("model name")), platform.processor())
     record.update(status=status, wall_seconds=time.perf_counter() - started, peak_gib=peak[0] / 2**30,
                   threads=args.threads, cpu=cpu)
+    if args.code == "orca" and os.environ.get("ORCA_SCRATCH", "").startswith("/mnt/"):
+        record["peak_gib"] = None       # Windows ORCA started from WSL: its memory is not visible here
     with open(args.out, "a") as handle_out:
         handle_out.write(json.dumps(record) + "\n")
     shown = {k: record.get(k) for k in ("code", "method", "basis", "status", "energy", "iterations",
@@ -342,6 +393,7 @@ def main():
     parser.add_argument("--irrep-name", help="the same irrep as ccpy or NWChem names it (their axis "
                         "conventions can swap B1 and B2)")
     parser.add_argument("--nwchem-memory", type=int, default=1000, help="MB per MPI rank")
+    parser.add_argument("--orca-memory", type=int, default=12000, help="ORCA %%maxcore, MB per process")
     parser.add_argument("--max-iter", type=int, help="time this many iterations instead of converging")
     parser.add_argument("--memory-limit-gib", type=float, default=13.0)
     parser.add_argument("--timeout", type=float, default=3600)

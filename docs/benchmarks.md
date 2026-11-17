@@ -1,10 +1,10 @@
 # Benchmarks
 
-IterCC against the other freely available programs that solve the full
-CCSDT, CCSDTQ and EOM-CCSDT equations, run on the same molecule, basis sets,
-frozen core, thresholds and machine.
+IterCC against other programs that solve the full CCSDT, CCSDTQ and
+EOM-CCSDT equations, run on the same molecule, basis sets, frozen core,
+thresholds and machine.
 
-**In short** (water, 12 cores):
+**In short** (water; 12 cores unless noted):
 
 - **CCSDT**: IterCC is the fastest from cc-pVDZ up. In aug-cc-pVTZ an
   iteration takes 1.2 s: 4x faster than NWChem, 11x faster than PySCF and 49x
@@ -16,7 +16,12 @@ frozen core, thresholds and machine.
   needs more than 13 GiB and the others would need days.
 - **EOM-CCSDT**: three excited states take 8x to 30x less time than in NWChem
   and ccpy.
-- All converged energies agree with IterCC's to within 5e-8 Eh.
+- **ORCA** (one core, as its Windows build runs coupled cluster serially):
+  a cc-pVTZ CCSDT iteration takes 162 s in ORCA 6.1.1 and 0.46 s in IterCC on
+  the same core (350x), and the whole calculation 33 minutes against 7.8 s. A
+  6-31G CCSDTQ iteration takes 160 s in ORCA and 0.034 s in IterCC.
+- All converged energies agree with IterCC's to within 5e-8 Eh (ORCA, which
+  tests only its residual: 2e-7 Eh).
 
 ## Setup
 
@@ -25,8 +30,11 @@ frozen core, thresholds and machine.
   which the figures show because they are faster);
   [ccpy](https://github.com/piecuch-group/ccpy) 0.0.5 (`coupled-cluster-py`,
   Piecuch group); [NWChem](https://nwchemgit.github.io) 7.3.1 (TCE; the
-  conda-forge build has no CCSDTQ). Every program runs with its own default
-  algorithms. PySCF, ccpy and IterCC start from the same PySCF RHF orbitals.
+  conda-forge build has no CCSDTQ); [ORCA](https://www.faccts.de/orca/) 6.1.1
+  (AUTOCI; F. Neese, WIREs Comput. Mol. Sci. 2025, 15, e70019), compared on one
+  core in [its own section](#one-core-with-orca). Every program runs with its
+  own default algorithms. PySCF, ccpy and IterCC start from the same PySCF RHF
+  orbitals.
 - **System**: water with the O 1s orbital frozen (4 correlated occupied
   orbitals), basis sets from 6-31G (8 virtual orbitals) to aug-cc-pVTZ (87).
   IterCC uses the molecule's C2v symmetry; "IterCC, no symmetry" shows the same
@@ -129,6 +137,38 @@ ccpy follows its CIS guesses root by root; in cc-pVDZ it converged to a
 higher state (31.0 eV) in place of the 23.04 eV state that IterCC and NWChem
 find. IterCC returns the lowest roots of the symmetry sector.
 
+## One core, with ORCA
+
+ORCA's AUTOCI module solves full CCSDT (closed-shell code) and CCSDTQ (only
+in its spin-unrestricted code); it has no EOM-CCSDT. The Windows build of
+ORCA 6.1.1 used here ships no parallel AUTOCI, so this comparison gives every
+program one core (NWChem one MPI rank). ORCA ran natively under Windows on the
+same machine, the others under WSL2. ORCA's convergence test is the largest
+residual element (1e-6, as for IterCC); it has no energy threshold.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/single-core-dark.svg">
+  <img alt="One-core CCSDT seconds per iteration from 6-31G to cc-pVTZ: IterCC 0.46 s in cc-pVTZ, NWChem 2.6 s, PySCF 3.2 s, ccpy 11.9 s and ORCA 162 s" src="images/single-core-light.svg">
+</picture>
+
+Seconds per iteration on one core (time to the converged energy, iterations):
+
+| | CCSDT 6-31G | CCSDT cc-pVDZ | CCSDT aug-cc-pVDZ | CCSDT cc-pVTZ | CCSDTQ 6-31G |
+| --- | --- | --- | --- | --- | --- |
+| IterCC | 7 ms (0.32 s, 13) | 21 ms (0.51 s, 13) | 0.12 s (2.2 s, 15) | 0.46 s (7.8 s, 16) | 34 ms (1.3 s, 11) |
+| PySCF 2.14, `_highm` | 5 ms (66 ms, 12) | 0.12 s (1.4 s, 12) | 0.72 s (10.2 s, 14) | 3.2 s (39.0 s, 12) | 0.54 s (6.0 s, 11) |
+| PySCF 2.14, default | 12 ms (0.15 s, 12) | 0.36 s (4.4 s, 12) | 1.9 s (26.1 s, 14) | 7.4 s (90.1 s, 12) | 2.9 s* |
+| ccpy 0.0.5 | 20 ms (0.23 s, 11) | 0.23 s (2.4 s, 10) | 2.7 s (29.8 s, 11) | 11.9 s (131 s, 11) | 7.6 s* |
+| NWChem 7.3.1 (TCE) | 0.40 s (6.4 s, 14) | 1.0 s (15.8 s, 16) | 1.4 s (25.7 s, 17) | 2.6 s (45.2 s, 16) | |
+| ORCA 6.1.1 (AUTOCI) | 5.8 s (75.2 s, 11) | 9.2 s (116 s, 11) | 21.4 s (280 s, 12) | 162 s (1985 s, 12) | 160 s* |
+
+ORCA spends about 5.7 s on every iteration even for the smallest basis, so
+fixed costs dominate its small cases; in cc-pVTZ its iteration is 350 times
+IterCC's. Against the other programs IterCC's lead is smaller on one core
+than on twelve (in cc-pVTZ, 7x over PySCF and 6x over NWChem, against 12x and
+7x), because IterCC also gains more from extra cores; on the smallest basis
+PySCF's `_highm` is quickest.
+
 ## Larger systems
 
 On a 56-core Sapphire Rapids socket (Intel Xeon 8480CL, memory bound to the
@@ -147,11 +187,11 @@ iteration with 13 correlated occupied orbitals in C2v symmetry:
 pip install "itercc[benchmarks]" coupled-cluster-py==0.0.5
 conda install -c conda-forge nwchem=7.3.1        # optional; set NWCHEM_BASIS_LIBRARY
 bash benchmarks/compare_campaign.sh results.jsonl 12
-python benchmarks/plot_compare.py results.jsonl docs/images
+bash benchmarks/compare_single_core.sh one-core.jsonl    # needs ORCA (ORCA_EXE, ORCA_SCRATCH)
+python benchmarks/plot_compare.py results.jsonl docs/images --single one-core.jsonl
 ```
 
 `python benchmarks/compare.py run --code itercc --method ccsdt --basis cc-pvtz`
-runs one point. The records behind this page are in
-`benchmarks/results/water-ryzen9-3900x.jsonl`. Not compared: MRCC and CFOUR,
-the reference implementations of high-order coupled cluster, which need
-licenses.
+runs one point. The records behind this page are in `benchmarks/results/`.
+Not compared: MRCC and CFOUR, the reference implementations of high-order
+coupled cluster, which need licenses.

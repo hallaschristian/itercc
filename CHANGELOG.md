@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Benchmarks: a one-core comparison that adds ORCA 6.1.1 (AUTOCI CCSDT and
+  CCSDTQ; `compare.py --code orca`, `benchmarks/compare_single_core.sh`).
+
 ## 0.8.0
 
 - `from_rhf` returns the Abelian `orbital_irreps` of the correlated orbitals

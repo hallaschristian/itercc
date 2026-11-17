@@ -20,7 +20,8 @@ polarizabilities converged to tight thresholds.
   ccpy needs 57 s per iteration and more memory than the machine has. A CCSDTQ
   iteration in cc-pVDZ is 60 times faster than PySCF's and 500 times faster than
   ccpy's, and IterCC converges aug-cc-pVDZ CCSDTQ in 41 s where PySCF runs out of
-  memory. [Benchmarks](docs/benchmarks.md)
+  memory. On one core, a cc-pVTZ CCSDT iteration takes 0.46 s in IterCC and
+  162 s in ORCA 6.1.1. [Benchmarks](docs/benchmarks.md)
 - **Big calculations.** One 56-core CPU socket runs a CCSDT iteration with 13
   occupied and 131 virtual orbitals in 9.2 s (an A100 GPU: 26.6 s), and a
   CCSDTQ iteration with 13 occupied and 47 virtual orbitals in 85 s.
@@ -89,7 +90,7 @@ perturbative (T)/(Q) corrections, gradients or open shells.
 ## Documentation
 
 - [User guide](docs/guide.md): inputs, every method and option, GPUs, tuning
-- [Benchmarks](docs/benchmarks.md): IterCC against PySCF, ccpy and NWChem
+- [Benchmarks](docs/benchmarks.md): IterCC against PySCF, ccpy, NWChem and ORCA
 - [Design](docs/design.md): how it is fast and how it stays exact
 - [`llms.txt`](llms.txt): the complete usage guide for AI assistants
 

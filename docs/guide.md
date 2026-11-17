@@ -202,5 +202,5 @@ spin-orbital implementation; EOM roots and polarizabilities against
 determinant-space references and finite-field derivatives; and every compiled
 kernel against the NumPy path, bit for bit where the arithmetic is the same.
 EOM-CCSDT on LiH/STO-3G agrees with NWChem's TCE to 7e-12 Eh. The comparison
-runs in [benchmarks](benchmarks.md) agree with PySCF, ccpy and NWChem to the
+runs in [benchmarks](benchmarks.md) agree with PySCF, ccpy, NWChem and ORCA to the
 convergence thresholds used.

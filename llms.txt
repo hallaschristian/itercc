@@ -187,5 +187,5 @@ the CPU path is usually faster there.
 ## More
 
 - docs/guide.md: full user guide (all options, checkpoints, tuning switches).
-- docs/benchmarks.md: comparisons with PySCF, ccpy and NWChem.
+- docs/benchmarks.md: comparisons with PySCF, ccpy, NWChem and ORCA.
 - examples/: runnable scripts (minimal.py needs only NumPy).
