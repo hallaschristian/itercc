@@ -1,4 +1,4 @@
-"""Shared tensor expansion for EOM, response and spin-orbital methods.
+"""Shared tensor scatter/gather for EOM, response and spin-orbital methods.
 
 Canonical antisymmetric coordinates and restricted spatial coordinates have
 DIFFERENT symmetries. Use expand_antisymmetric only for the former; use
@@ -14,6 +14,75 @@ import numpy as np
 
 from . import _cpu_kernels
 from ._cpu_triples import cpu_threads
+
+
+def signed_gather_rows(vector, bases, maps, width, *, threads=None):
+    """Gather signed one-based address maps into dense rows, or return None.
+
+    Layout-owned maps must be contiguous int32 arrays of the same width and
+    addresses must be valid for vector. A zero base ignores its map entirely.
+    This primitive is independent of excitation rank, spin and spatial symmetry.
+    """
+    if not (isinstance(vector, np.ndarray) and vector.dtype == np.float64
+            and vector.ndim == 1 and vector.flags.c_contiguous and np.dtype(np.intp).itemsize == 8):
+        return None
+    kernel = _cpu_kernels.library()
+    if kernel is None:
+        return None
+    bases = np.ascontiguousarray(bases, dtype=np.int64)
+    if len(maps) != len(bases):
+        raise ValueError("Each gathered row needs a base and address map")
+    for base, mapping in zip(bases, maps):
+        if base and not (isinstance(mapping, np.ndarray) and mapping.dtype == np.int32
+                         and mapping.shape == (width,) and mapping.flags.c_contiguous):
+            raise ValueError("Nonzero rows need contiguous int32 maps of the requested width")
+    pointers = np.asarray([0 if m is None else m.ctypes.data for m in maps], dtype=np.int64)
+    output = np.empty((len(bases), width), dtype=np.float64)
+    kernel.signed_gather_rows(len(bases), width, bases.ctypes.data, pointers.ctypes.data,
+                              vector.ctypes.data, output.ctypes.data, cpu_threads(threads))
+    return output
+
+
+@lru_cache(maxsize=256)
+def _gather_steps(terms, strides):
+    offsets = np.zeros((len(terms), len(strides)), dtype=np.int64)
+    for row, (axes, _) in enumerate(terms):
+        offsets[row, list(axes)] = strides
+    return offsets, np.asarray([weight for _, weight in terms], dtype=np.float64)
+
+
+class PermutedGather:
+    """Reusable coordinates for ordered antisymmetry/sector gathers on the CPU.
+
+    Rows are distinct and coordinates are in bounds, guaranteed by the layout.
+    Negative source strides are supported. No source tensor or result is cached.
+    """
+    def __init__(self, rows, coordinates):
+        self.rows = np.ascontiguousarray(rows, dtype=np.int64)
+        self.coordinates = np.ascontiguousarray(np.asarray(coordinates).T, dtype=np.int32)
+        if self.rows.ndim != 1 or self.coordinates.ndim != 2 or len(self.coordinates) != len(self.rows):
+            raise ValueError("Gather coordinates and rows must have the same length")
+
+    def add(self, source, target, terms, *, threads=None):
+        if not (isinstance(source, np.ndarray) and isinstance(target, np.ndarray)
+                and source.dtype == target.dtype == np.float64
+                and target.ndim == 1 and target.flags.c_contiguous and target.flags.writeable):
+            return False
+        kernel = _cpu_kernels.library()
+        if kernel is None:
+            return False
+        if (source.ndim != self.coordinates.shape[1] or np.may_share_memory(source, target)
+                or any(stride % 8 for stride in source.strides)):
+            return False
+        terms = tuple((tuple(axes), float(weight)) for axes, weight in terms)
+        if any(sorted(axes) != list(range(source.ndim)) for axes, _ in terms):
+            raise ValueError("Gather terms must permute all source axes")
+        strides, weights = _gather_steps(terms, tuple(s // 8 for s in source.strides))
+        kernel.permuted_gather_add(len(self.rows), source.ndim, len(terms),
+                                  self.coordinates.ctypes.data, self.rows.ctypes.data,
+                                  strides.ctypes.data, weights.ctypes.data, source.ctypes.data,
+                                  target.ctypes.data, cpu_threads(threads))
+        return True
 
 
 def unpack_sector(vector, indices, shape, *, xp=np, threads=None):

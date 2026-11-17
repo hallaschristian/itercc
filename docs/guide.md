@@ -205,6 +205,8 @@ use the same sector-expansion dispatcher; canonical spin-orbital amplitudes use
 its antisymmetric counterpart. Spatial and spin-orbital symmetries remain
 distinct. See the [reuse and validation matrix](triplet-cpu-audit.md#shared-machinery-follow-up-november-17)
 for applicability, measured timings and remaining integration work.
+Packed spin T4/R4 tile expansion and rank-2–4 projection also use shared native
+gather kernels; see the [packed-tile measurements](triplet-cpu-audit.md#native-packed-tile-gathers-november-17).
 
 - **Threads**: one per physical core of the process's CPU affinity. Set
   `ITERCC_CPU_THREADS` to the cores you were allocated (the kernels ignore

@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--cache-gib", type=float, default=0)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--singles-only", action="store_true")
+    parser.add_argument("--numpy-projection", action="store_true")
+    parser.add_argument("--numpy-tile-expansion", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--numpy-unpack", action="store_true", help="Use the pre-optimization expansion for A/B timing")
     args = parser.parse_args()
@@ -61,6 +63,9 @@ def main():
                               occupied_tiles=True, action_only=True, memory_budget_gib=300,
                               packed_contractions=args.version == "packed",
                               intermediate_cache_gib=args.cache_gib if args.version == "packed" else 0)
+    engine.native_projection = not args.numpy_projection
+    engine._ground_t4.native_expansion = not args.numpy_tile_expansion
+    engine._direction_t4.native_expansion = not args.numpy_tile_expansion
     if not ground["converged"] or abs(engine.ground_energy - ground["energy_Eh"]) > 2e-10:
         raise ValueError("Ground checkpoint energy audit failed")
     if args.slots > len(engine._direction_t4.slots):
@@ -92,7 +97,8 @@ def main():
         action.contract_tile = selected_holes
     print(json.dumps(dict(event="ready", part=args.part, version=args.version,
                           input_sha256=digest.hexdigest(), singles_only=args.singles_only,
-                          numpy_unpack=args.numpy_unpack,
+                          numpy_unpack=args.numpy_unpack, numpy_projection=args.numpy_projection,
+                          numpy_tile_expansion=args.numpy_tile_expansion,
                           setup_seconds=perf_counter() - start)), flush=True)
     start = perf_counter()
     profiler = cProfile.Profile() if args.profile else None

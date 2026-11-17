@@ -191,6 +191,10 @@ class TripletEOMCCSDTQ:
             self.estimated_dense_bytes = 8 * (10 * (4 * no * nv)**3 +
                                               4 * no**3 * nv**4 + 6 * (2 * (no + nv))**4)
         self.estimated_dense_bytes += self.intermediate_cache_bytes
+        if occupied_tiles and backend == "cpu":
+            # Shared signed virtual maps: <=16 spin signatures x 8 irreps,
+            # each with nv**4 int32 entries. No second copy for the R4 sector.
+            self.estimated_dense_bytes += 512 * nv**4
         if self.estimated_dense_bytes > memory_budget_gib * 2**30:
             raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
         ref = solver._reference
@@ -246,8 +250,11 @@ class TripletEOMCCSDTQ:
         if occupied_tiles:
             self._ground_t4 = PackedSpinQuadruples(labels[:no], labels[no:], 0, 0)
             self._direction_t4 = PackedSpinQuadruples(labels[:no], labels[no:], irrep, 1)
+            self._direction_t4.share_virtual_maps(self._ground_t4)
         self.action_only = action_only
         self._lower_projection = {}
+        self.native_projection = True
+        self._gather_plans = {}
         self.space = SpinFlipSpace(no, nv, labels, irrep, xp,
                                    packed=self._direction_t4 if self._packed_direction else None,
                                    project_spin=not action_only)
@@ -379,11 +386,8 @@ class TripletEOMCCSDTQ:
         result = xp.zeros(indices.shape[1])
         for raw, tile in tiles:
             for rows, positions, placements in by_raw.get(raw, ()):
-                contribution = xp.zeros(rows.size)
-                for p, h, sign in placements:
-                    coordinates = tuple(positions[i] for i in p) + tuple(positions[rank + i] for i in h)
-                    contribution += sign * tile[coordinates]
-                result[rows] += contribution
+                permutations = tuple((p + tuple(rank + i for i in h), sign) for p, h, sign in placements)
+                self._accumulate_projection(result, rows, positions, permutations, tile, 1)
         return result / len(_permutations(rank))**2
 
     def _project_packed_tile(self, result, holes, groups, primal, tangent, intermediates=None):
@@ -412,11 +416,23 @@ class TripletEOMCCSDTQ:
                                      intermediates=intermediates,
                                      compiled_products=self.packed_contractions).reshape((self.nvir,) * rank)
                 for rows, particles, permutations in by_group.values():
-                    subtotal = self.xp.zeros(len(rows))
-                    for p, sign in permutations:
-                        subtotal += (multiplicity * sign) * tile[tuple(particles[i] for i in p)]
-                    result[rows] += subtotal
+                    self._accumulate_projection(result, rows, particles, permutations, tile, multiplicity)
         result /= len(_permutations(rank))**2
+
+    def _accumulate_projection(self, destination, rows, particles, permutations, tile, multiplicity):
+        if self.xp is np and self.packed_contractions and self.native_projection:
+            from ._tensor_scatter import PermutedGather
+            key = id(rows), id(particles)
+            if key not in self._gather_plans:
+                # Keep owners alive: object identities cannot be recycled during this action.
+                self._gather_plans[key] = (rows, particles, PermutedGather(rows, particles))
+            plan = self._gather_plans[key][2]
+            if plan.add(tile, destination, tuple((p, multiplicity * sign) for p, sign in permutations)):
+                return
+        subtotal = self.xp.zeros(len(rows))
+        for p, sign in permutations:
+            subtotal += (multiplicity * sign) * tile[tuple(particles[i] for i in p)]
+        destination[rows] += subtotal
 
     def _project_tile(self, rank, signature, occupied, particles, primal, tangent):
         xp, no, nv = self.xp, self.nocc, self.nvir
@@ -436,6 +452,7 @@ class TripletEOMCCSDTQ:
 
     def _action(self, vector, *, ranks=range(1, 5), slot_limit=None, rank_finished=None, slot_finished=None):
         xp = self.xp
+        self._gather_plans = {}
         no = self.proxy.hamiltonian.nocc
         nonzero = (tuple(bool(xp.any(vector[section])) for section in self.space.slices)
                    if self.occupied_tiles else None)
@@ -490,6 +507,7 @@ class TripletEOMCCSDTQ:
         self.last_intermediate_cache = (None if intermediates is None else
                                         dict(hits=intermediates.hits, misses=intermediates.misses,
                                              peak_bytes=intermediates.peak_bytes))
+        self._gather_plans = {}
         return xp.concatenate(outputs)
 
     def probe_rank_four(self, vector, slots):

@@ -102,7 +102,76 @@ machinery is lower priority than action and projector costs.
 
 ## Evidence
 
-### Shared machinery follow-up (November 17)
+### Native packed-tile gathers (November 17)
+
+Profiling a general rank-1–4 direction on the full 26-electron/29-virtual CuF
+checkpoint found that packed T4/R4 expansion consumed 112.15 s of a 131.29 s
+four-slot quadruples action. Dense virtual tiles were repeatedly zeroed and
+filled with Python/NumPy indexed assignments. This is different from the
+previous optimization of complete lower-rank canonical amplitude expansion.
+
+The shared CPU core now provides two rank-independent primitives in
+`tensor_scatter.cpp` / `_tensor_scatter.py`:
+
+- `signed_gather_rows`: expand rows through signed, one-based address maps,
+  including zero rows, with parallel first-touch and no temporary value gathers.
+  `PackedSpinQuadruples.expand` uses it for both T4 and R4 in every applicable
+  CPU storage consumer. Ground/direction layouts share immutable virtual maps;
+  the constructor's memory estimate includes their worst-case signed-map size.
+- `PermutedGather`: accumulate ordered, weighted permutations directly into
+  distinct packed result rows. The doubles, triples and quadruples projections
+  use one implementation. It supports strided sources, including reversed axes,
+  and preserves the NumPy sum order. Small gathers execute serial native loops
+  without resizing the OpenMP team used by surrounding contractions.
+
+No numerical screening or equations were changed. GPU, complex and unsupported
+array layouts retain their reference paths. Core ABI 23 prevents loading an old
+binary. Coordinate plans are action-local; address maps contain no amplitudes.
+
+The occupied-slot batching experiment was rejected: on the initial matched
+sample it increased the singles-only time from 11.87 to 29.56 s, and general
+direction peak memory from 71.86 to 79.48 GiB with little time benefit. The
+batching code was removed, not left enabled by default. An intermediate gather
+prototype also exposed expensive OpenMP team resizing; that was corrected
+before the final comparisons.
+
+Final comparisons use fresh reference/native workers on the same 56-core,
+384-GiB allocation with an 8-GiB intermediate cache. Reference switches are
+`--numpy-projection --numpy-tile-expansion`; the standard driver is
+`benchmarks/spin_quadruples_cpu.py`. This isolates the new gather kernels from
+the previously validated packed contractions. The current production spectrum
+job retains its frozen earlier code.
+
+| Measured output on full CuF checkpoint | Reference (s) | Native (s) | Speedup | Peak process RSS, reference → native (GiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Quadruples, general rank-1–4 direction, 4 occupied slots | 111.11 | 23.71 | 4.69x | 71.95 → 71.94 |
+| Quadruples, singles-only direction, 16 occupied slots | 12.43 | 10.91 | 1.14x | 45.09 → 45.10 |
+| Complete triples output, general rank-1–4 direction | 172.65 | 168.63 | 1.02x | 72.45 → 72.56 |
+
+All three outputs were bitwise identical (maximum absolute difference zero).
+The quadruples measurements cover selected complete occupied slots, not the
+entire quadruples action or eigensolve. Complete triples performance is roughly
+unchanged. These single paired samples establish the measured kernel improvement;
+they do not establish a whole-solver speedup. In the final general-vector profile,
+packed expansion took 5.68 s and compiled contractions took 9.66 s.
+
+Jobs 61563382, 61563383 and 61563385 produced the singles-only, general-vector
+and complete-triples receipts respectively. Their fresh-worker wall times,
+including setup, were 98.73 → 90.25 s, 289.84 → 100.21 s and 251.31 → 247.05 s.
+Setup varied substantially in the general-vector pair, so its worker-wall gain
+cannot all be attributed to the new kernels. The 26-electron/29-virtual input
+SHA256 is `9d0b98a2dd4bea77f52d0cde1b3fc2f5bf3692cf7c78325d4799cd7acc839bed`;
+normalized directions use seed 714. `final-summary.json`, profiles and source
+manifests preserve the raw results and exact benchmark source.
+
+Validation: 25 focused expansion/projection, FCI triplet, six-electron dense
+Jacobian and loader checks passed; 13 final kernel checks cover all supported
+spin signatures, empty/reversed occupied slices, thread reproducibility,
+alias/dtype/stride rejection, and shared virtual-map compatibility. GPU execution
+was not rebenchmarked. The full-model timing and comparison receipts are kept
+outside the repository.
+
+### Earlier shared machinery follow-up (November 17, ABI 22)
 
 The native canonical expansion now lives in `core/src/cpu/tensor_scatter.cpp`
 and is dispatched by `itercc._tensor_scatter`, not a quadruples-specific
@@ -135,7 +204,7 @@ new value, fixing double-counted bytes for a reused key. An oversized replacemen
 invalidates the old value. The current action normally inserts only cache misses;
 these semantics make broader reuse safe without enlarging its memory budget.
 
-Core ABI is now 22. CMake, source-distribution packaging and runtime compilation
+This earlier change introduced core ABI 22. CMake, source-distribution packaging and runtime compilation
 include the shared translation unit. Old binaries are rejected and rebuilt or
 use the existing reference fallback. Frozen jobs are not modified.
 
@@ -143,8 +212,8 @@ The separate frozen CCpy triplet-CCSDT adapter uses partially antisymmetric
 spin blocks, not these fully antisymmetric canonical coordinates. Its missing
 CPU triples-packing/pair-ladder integration is still separate work; this
 refactoring does not claim that those optimizations are implemented or that
-already submitted jobs inherit them. Likewise, occupied-slot batching and a
-compiled spin projector remain future work.
+already submitted jobs inherit them. The later native packed-tile gather work
+above adds compiled projection and records why occupied-slot batching was rejected.
 
 The benchmark driver is `benchmarks/tensor_scatter_cpu.py`.
 The EOM/response/quadruples/core and expansion run passed 93 tests (50 optional

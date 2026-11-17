@@ -18,7 +18,20 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 25
+#define ITERCC_CORE_ABI 26
+
+/* Each row gathers through a signed one-based int32 map. bases encode a
+ * signed one-based source base, zero means an entirely zero row. maps are
+ * intptr_t addresses carried in int64 slots (64-bit host). */
+void itercc_signed_gather_rows(int64_t rows, int64_t width, const int64_t *bases,
+    const int64_t *maps, const double *source, double *target, int threads);
+
+/* Ordered weighted gathers into distinct packed rows. coordinates: count x
+ * rank int32, strides: terms x rank int64 in elements; negative strides OK.
+ * Caller guarantees valid coordinates/rows and nonoverlapping source/target. */
+void itercc_permuted_gather_add(int64_t count, int rank, int terms,
+    const int32_t *coordinates, const int64_t *rows, const int64_t *strides,
+    const double *weights, const double *source, double *target, int threads);
 
 /* Expand a sector vector into a zeroed flat tensor. Indices must be distinct
  * and in [0,size), owned and validated by the caller's immutable layout. */
