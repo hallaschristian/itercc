@@ -174,11 +174,14 @@ the CPU path is usually faster there.
 - Memory: CCSDT holds a few copies of T3 (8 * n_occ^3/6 * n_vir^3 bytes each);
   CCSDTQ a few copies of T4 (about 8 * n_occ^4/24 * n_vir^4 / n_irreps bytes each).
 - Measured (one 56-core Sapphire Rapids socket, water): CCSD aug-cc-pVQZ (4 occ,
-  167 vir) 0.15 s per iteration, 5.0 s total; CCSDT aug-cc-pVTZ (87 vir) 0.17 s per
-  iteration, 3.3 s total; CCSDT aug-cc-pVQZ 1.4 s per iteration, 25 s total;
-  CCSDTQ aug-cc-pVDZ (36 vir) 0.49 s per iteration, 12.5 s total. Same socket:
+  167 vir) 0.058 s per iteration, 4.3 s total; CCSDT aug-cc-pVTZ (87 vir) 0.15 s per
+  iteration, 2.6 s total; CCSDT aug-cc-pVQZ 1.2 s per iteration, 23 s total;
+  CCSDTQ aug-cc-pVDZ (36 vir) 0.50 s per iteration, 11.1 s total. Same socket:
   CCSDT 13 occ / 131 vir 9.2 s per iteration; CCSDTQ 13 occ / 47 vir (C2v) 85 s.
-  CCSDT and CCSDTQ gain 15-19x from 56 threads; a second socket adds nothing.
+  CCSDT gains 22x from 56 threads, CCSD and CCSDTQ 15x; a second socket is slower.
+- Memory (Linux, glibc): IterCC fixes glibc's allocator thresholds and, during
+  CCSDT solves, takes every block from the heap so iterations reuse memory
+  instead of faulting it in again; `ITERCC_MALLOC=0` leaves the allocator alone.
 
 ## Errors
 

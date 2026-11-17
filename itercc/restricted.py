@@ -10,6 +10,7 @@ import warnings
 import numpy as np
 
 from . import _blocked_residual as _blocked
+from . import _core
 from . import _cpu_triples as _cpu
 from . import _restricted_equations as eq
 from ._pair_symmetry import PairSectors, pair_product
@@ -259,6 +260,9 @@ class RestrictedCC:
     `rank=2` gives restricted CCSD: T3 has no slots (shape (0, nv, nv, nv)).
     """
 
+    # Set on the dual-number copy of EOM and response engines: ladder(t1, g_vvvv, t2).
+    _tangent_ladder = None
+
     def __init__(self, h, eri, nocc, constant=0.0, *, ladder_batch=4, pair_ladder=True,
                  ladder_backend="cpu", residual_backend="cpu", orbital_irreps=None,
                  cuda_pair_fusion=False, cuda_layout_fusion=False,
@@ -484,7 +488,7 @@ class RestrictedCC:
         _dress_axis(h, 1, o, v, t1, xp)
         if xp is np and self._t1_dressing is None:
             g = _cpu.dressed_integrals(self.g, t1, self._cpu_threads, ccsd=ccsd,
-                                       out=self._dressing_output() if ccsd else None)
+                                       out=self._dressing_output())
             if g is not None:
                 return _fock(h, g, o, xp=xp), g
         g = xp.array(self.g, order="C", copy=True)
@@ -609,6 +613,8 @@ class RestrictedCC:
             ladder_g = self._ladder_g(g, t1) if xp is np and self._cpu_fast else None
             ladder = (partial(_cpu.doubles_ladder, virtual_irreps=self._virtual_irreps, sectors=ladder_g)
                       if xp is np and self._cpu_fast else None)
+            if ladder is None and self._tangent_ladder is not None:
+                ladder = partial(self._tangent_ladder, t1)        # EOM and response actions
         r1, r2, intermediates, spin_g, c2 = eq.lower_residuals(f, g, t2, o, v, contract,
                                                                vvvv_ladder=ladder)
         if not len(t3):
@@ -697,11 +703,12 @@ class RestrictedCC:
         return self._integrals_symmetric
 
     def _dressing_output(self):
-        """During `solve`, the n^4 array the CCSD dressing of each
-        evaluation writes into (nothing reads it after the evaluation, so one
-        array serves every iteration and its pages are faulted in once: about
-        a quarter of a water aug-cc-pVTZ iteration), released when `solve`
-        returns; None otherwise."""
+        """During `solve`, the n^4 array the dressing of each evaluation
+        writes into (nothing reads it after the evaluation, so one array
+        serves every iteration and its pages are faulted in once: for CCSD
+        about a quarter of a water aug-cc-pVTZ iteration; for CCSDT 6.8 GB
+        mapped and zero-filled per iteration in aug-cc-pVQZ), released when
+        `solve` returns; None otherwise."""
         if not self._hold_dressing:
             return None
         if self._dressing_buffer is None:
@@ -900,68 +907,73 @@ class RestrictedCC:
         d3v = np.ascontiguousarray(d3v)
         history = []
         last, converged = np.inf, False
-        self._hold_dressing = True             # `_dressing_output`
-        for iteration in range(max_iter):
-            t1, t2, t3 = amplitudes
-            correlation = self._energy(t1, t2)
-            can_update = iteration + 1 < max_iter
-            if diis_triples and can_update:
-                diis.reserve_slot()
-            change = correlation - last
-            energy_ready = abs(change) <= energy_tol
-            device_gate = jacobi is not None and (energy_ready or not can_update)
-            residuals = steps = None
-            if not device_gate:
-                residuals = self._residuals(amplitudes)
-                r3 = residuals[2]
-                if compiled is not None and r3.flags.c_contiguous and r3.dtype == np.float64:
-                    triples_max = compiled[0].max_abs(r3.ctypes.data, r3.size, compiled[1])
-                else:
-                    triples_max = np.max([np.max(np.abs(tile)) for tile in r3], initial=0.0)
-                maxima = (float(np.max(np.abs(residuals[0]))), float(np.max(np.abs(residuals[1]))),
-                          float(triples_max))
-                del r3
-            else:
-                maxima, steps = self._residuals(amplitudes, device_step=(
-                    jacobi, energy_ready, residual_tol, can_update))
-            if not np.isfinite((correlation, *maxima)).all():
-                raise FloatingPointError("Nonfinite coupled-cluster iterate")
-            info = Iteration(self.reference_energy + correlation, change, maxima)
-            history.append(info)
-            if callback is not None:
-                callback(info)
-            if checkpoint_callback is not None:
-                checkpoint_callback(iteration + 1, info, amplitudes)
-            if energy_ready and max(maxima) <= residual_tol:
-                converged = True
-                break
-            if can_update:
-                if not device_gate:
-                    r1, r2, r3 = residuals
-                    step1, step2 = (1 - damping) * r1 / d1, (1 - damping) * r2 / d2
-                    if (compiled is not None and r3.size and r3.flags.c_contiguous
-                            and r3.dtype == np.float64):
-                        compiled[0].triples_step(r3.ctypes.data, len(r3), r3[0].size,
-                                                 d3o_array.ctypes.data, d3v.ctypes.data,
-                                                 1 - damping, compiled[1])
+        # One dressing array, and for CCSDT heap blocks, serve every iteration
+        # (`_dressing_output`, `_core.heap_scope`); released when the solve ends.
+        with _core.heap_scope() if len(self.triples_indices) else nullcontext():
+            self._hold_dressing = True
+            try:
+                for iteration in range(max_iter):
+                    t1, t2, t3 = amplitudes
+                    correlation = self._energy(t1, t2)
+                    can_update = iteration + 1 < max_iter
+                    if diis_triples and can_update:
+                        diis.reserve_slot()
+                    change = correlation - last
+                    energy_ready = abs(change) <= energy_tol
+                    device_gate = jacobi is not None and (energy_ready or not can_update)
+                    residuals = steps = None
+                    if not device_gate:
+                        residuals = self._residuals(amplitudes)
+                        r3 = residuals[2]
+                        if compiled is not None and r3.flags.c_contiguous and r3.dtype == np.float64:
+                            triples_max = compiled[0].max_abs(r3.ctypes.data, r3.size, compiled[1])
+                        else:
+                            triples_max = np.max([np.max(np.abs(tile)) for tile in r3], initial=0.0)
+                        maxima = (float(np.max(np.abs(residuals[0]))), float(np.max(np.abs(residuals[1]))),
+                                  float(triples_max))
+                        del r3
                     else:
-                        for tile, e in zip(r3, d3o):
-                            tile *= 1 - damping
-                            tile /= e - d3v
-                else:
-                    step1, step2, r3 = steps
-                if diis_triples:
-                    amplitudes = diis.take_step(amplitudes, (step1, step2, r3))
-                else:
-                    t1, t2 = diis.update((t1 + step1, t2 + step2), (step1, step2))
-                    if (compiled is not None and t3.size and t3.flags.c_contiguous
-                            and r3.flags.c_contiguous and t3.dtype == r3.dtype == np.float64):
-                        compiled[0].axpy(t3.ctypes.data, r3.ctypes.data, 1.0, t3.size, compiled[1])
-                    else:
-                        t3 += r3
-                    amplitudes = t1, t2, t3
-                del r3
-            del residuals, steps
-            last = correlation
-        self._hold_dressing, self._dressing_buffer = False, None
+                        maxima, steps = self._residuals(amplitudes, device_step=(
+                            jacobi, energy_ready, residual_tol, can_update))
+                    if not np.isfinite((correlation, *maxima)).all():
+                        raise FloatingPointError("Nonfinite coupled-cluster iterate")
+                    info = Iteration(self.reference_energy + correlation, change, maxima)
+                    history.append(info)
+                    if callback is not None:
+                        callback(info)
+                    if checkpoint_callback is not None:
+                        checkpoint_callback(iteration + 1, info, amplitudes)
+                    if energy_ready and max(maxima) <= residual_tol:
+                        converged = True
+                        break
+                    if can_update:
+                        if not device_gate:
+                            r1, r2, r3 = residuals
+                            step1, step2 = (1 - damping) * r1 / d1, (1 - damping) * r2 / d2
+                            if (compiled is not None and r3.size and r3.flags.c_contiguous
+                                    and r3.dtype == np.float64):
+                                compiled[0].triples_step(r3.ctypes.data, len(r3), r3[0].size,
+                                                         d3o_array.ctypes.data, d3v.ctypes.data,
+                                                         1 - damping, compiled[1])
+                            else:
+                                for tile, e in zip(r3, d3o):
+                                    tile *= 1 - damping
+                                    tile /= e - d3v
+                        else:
+                            step1, step2, r3 = steps
+                        if diis_triples:
+                            amplitudes = diis.take_step(amplitudes, (step1, step2, r3))
+                        else:
+                            t1, t2 = diis.update((t1 + step1, t2 + step2), (step1, step2))
+                            if (compiled is not None and t3.size and t3.flags.c_contiguous
+                                    and r3.flags.c_contiguous and t3.dtype == r3.dtype == np.float64):
+                                compiled[0].axpy(t3.ctypes.data, r3.ctypes.data, 1.0, t3.size, compiled[1])
+                            else:
+                                t3 += r3
+                            amplitudes = t1, t2, t3
+                        del r3
+                    del residuals, steps
+                    last = correlation
+            finally:
+                self._hold_dressing, self._dressing_buffer = False, None
         return Result(self.reference_energy + correlation, correlation, amplitudes, converged, tuple(history))

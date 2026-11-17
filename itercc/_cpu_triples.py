@@ -259,9 +259,33 @@ def product_into(spec, a, b, out, alpha=1.0, beta=0.0, threads=None):
     return True
 
 
+_NARROW = 16          # right-hand sides up to this many columns: `itercc_gemm_narrow`
+
+
+def _narrow(a, b, out):
+    """Whether a @ b streams a large `a` (rows enough to share among threads)
+    against a few columns of `b`."""
+    if not (b.ndim == 2 and a.ndim == 2 and 0 < b.shape[1] <= _NARROW and a.shape[0] >= 256
+            and a.shape[0] * a.shape[1] >= 1 << 16
+            and all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in (a, b, out))
+            and out.shape == (a.shape[0], b.shape[1]) and a.shape[1] == b.shape[0]):
+        return False
+    return all(x.strides[1] == 8 and x.strides[0] > 0 and x.strides[0] % 8 == 0 for x in (a, b, out))
+
+
 def matmul(a, b, out, *, alpha=1.0, beta=0.0, threads=None):
     """out = beta * out + alpha * (a @ b) for a matrix `a` and a matrix or a stack of
-    matrices `b`, on the core executor when compiled; returns out."""
+    matrices `b`, on the core executor when compiled; returns out. A large `a`
+    against a few columns (the pair-sector ladders: one column per occupied
+    pair) streams through `itercc_gemm_narrow` (the executor's tiles reached a
+    fifth of the memory bandwidth there)."""
+    if _narrow(a, b, out):
+        library = _kernels.library()
+        if library is not None and hasattr(library, "gemm_narrow") and out.flags.writeable:
+            library.gemm_narrow(a.ctypes.data, a.strides[0] // 8, b.ctypes.data, b.strides[0] // 8,
+                                out.ctypes.data, out.strides[0] // 8, a.shape[0], a.shape[1], b.shape[1],
+                                float(alpha), float(beta), cpu_threads(threads))
+            return out
     if a.ndim == 2 and b.ndim in (2, 3):
         spec = "ik,kj->ij" if b.ndim == 2 else "mk,ikn->imn"
         if product_into(spec, a, b, out, alpha, beta, threads):
@@ -404,6 +428,18 @@ class _Rows:
         return [(slice(None), slice(None), grouped)] if blocks is None else blocks
 
 
+_SCAN_THREADED_BYTES = 32 << 20
+_SCAN_POOL, _SCAN_LOCK = [], threading.Lock()
+
+
+def _scan_pool():
+    with _SCAN_LOCK:
+        if not _SCAN_POOL:
+            _SCAN_POOL.append(ThreadPoolExecutor(max(1, min(16, _PROCESS_CPUS)),
+                                                 thread_name_prefix="itercc-scan"))
+    return _SCAN_POOL[0]
+
+
 def _sector_blocks(sectors, grouped):
     """[(row band, column band, block)] of a matrix in sector order whose every
     nonzero entry couples a row of sector s to a column of sector s ^ G, for
@@ -413,11 +449,18 @@ def _sector_blocks(sectors, grouped):
     labels, bands = [int(x) for x in sectors.labels], sectors.bands
     if len(bands) <= 1:
         return None
-    # The band pairs are scanned on threads (NumPy releases the GIL in the
-    # reduction): a pair matrix is about 0.6 GB at 131 virtuals.
     pairs = [(i, j) for i in range(len(bands)) for j in range(len(bands))]
-    with ThreadPoolExecutor(max(1, min(len(pairs), cpu_threads(None)))) as pool:
-        nonzero = list(pool.map(lambda ij: bool(np.any(grouped[bands[ij[0]], bands[ij[1]]])), pairs))
+
+    def found(pair):
+        return bool(np.any(grouped[bands[pair[0]], bands[pair[1]]]))
+    if grouped.nbytes < _SCAN_THREADED_BYTES:
+        nonzero = [found(pair) for pair in pairs]
+    else:
+        # Large pair matrices (about 0.6 GB at 131 virtuals) are scanned on a
+        # persistent pool (NumPy releases the GIL in the reduction). A pool per
+        # call started up to 16 threads several times per Jacobian action for
+        # matrices of a few kB: 18% of an EOM-CCSDT action in aug-cc-pVDZ.
+        nonzero = list(_scan_pool().map(found, pairs))
     shift = None
     for (i, j), found in zip(pairs, nonzero):
         if found:
@@ -901,23 +944,65 @@ class BareLadder:
         else:
             self.sectors, self.blocks = None, _ladder_sectors(g[v, v, v, v], virtual_irreps)
 
-    def __call__(self, t1, t2):
+    def __call__(self, t1, t2, *, tau=True):
+        """The ladder; `tau=False` leaves out the t1 t1 term (for dressed
+        integrals that keep it in g(abij): exactly 0.5 sum_cd g~(abcd) t2(ijcd))."""
+        t1 = np.ascontiguousarray(t1, dtype=np.float64)
+        ladder = self._ladder(t2 + t1[:, None, :, None] * t1[None, :, None, :] if tau else t2)
+        q, _ = self._corrections(t1, t2)
+        self._subtract(ladder, t1, q)
+        return ladder
+
+    def tangent(self, t1, t2, dt1, dt2, *, tau=True):
+        """The derivative of `__call__(t1, t2, tau=tau)` along (dt1, dt2), exact:
+        L(g, dtau) - dB - dB(ji,ba), dB = dt1^T Q + t1^T dQ,
+        dQ = dY - 0.5 (dW t1 + W dt1). The ladder takes the undressed g(vvvv)
+        in the pair sectors of the ground state for a direction of any irrep
+        (`doubles_ladder` is exact for any t2); Q and W at (t1, t2) are kept
+        for the next direction at the same amplitudes."""
         no, nv, threads = self.no, self.nv, self.threads
         t1 = np.ascontiguousarray(t1, dtype=np.float64)
-        tau = t2 + t1[:, None, :, None] * t1[None, :, None, :]
-        ladder = doubles_ladder(None, tau, virtual_irreps=self.virtual_irreps, sectors=self.sectors,
-                                blocks=self.blocks)
-        rows = np.ascontiguousarray(t2).reshape(no * no, nv * nv)
+        dt1 = np.zeros_like(t1) if dt1 is None else np.ascontiguousarray(dt1, dtype=np.float64)
+        dt2 = np.zeros((no, no, nv, nv)) if dt2 is None else np.ascontiguousarray(dt2, dtype=np.float64)
+        if tau:
+            dtau = dt2 + dt1[:, None, :, None] * t1[None, :, None, :]
+            dtau += t1[:, None, :, None] * dt1[None, :, None, :]
+            ladder = self._ladder(dtau)
+            del dtau
+        else:
+            ladder = self._ladder(dt2)
+        point = getattr(self, "_point", None)
+        if point is None or not (np.array_equal(point[0], t1) and np.array_equal(point[1], t2)):
+            self._point = point = (t1.copy(), np.array(t2, dtype=np.float64), *self._corrections(t1, t2))
+        q, w = point[2], point[3]
+        dq, dw = self._corrections(t1, dt2)              # dY - 0.5 dW t1, and dW
+        matmul(w.reshape(no**3, no), dt1, dq.reshape(no**3, nv), alpha=-0.5, beta=1.0, threads=threads)
+        self._subtract(ladder, dt1, q)
+        self._subtract(ladder, t1, dq)
+        return ladder
+
+    def _ladder(self, t2):
+        return doubles_ladder(None, t2, virtual_irreps=self.virtual_irreps, sectors=self.sectors,
+                              blocks=self.blocks)
+
+    def _corrections(self, t1, t2):
+        """(Q, W) of `t2`: Q(ij, kb) = Y - 0.5 W t1, W(ij, kl), linear in t2."""
+        no, nv, threads = self.no, self.nv, self.threads
+        rows = np.ascontiguousarray(t2, dtype=np.float64).reshape(no * no, nv * nv)
         q = matmul(rows, self.ovvv, np.empty((no * no, no * nv)), alpha=0.5, threads=threads)
         w = matmul(rows, self.oovv, np.empty((no * no, no * no)), alpha=0.5, threads=threads)
         matmul(w.reshape(no**3, no), t1, q.reshape(no**3, nv), alpha=-0.5, beta=1.0, threads=threads)
+        return q, w
+
+    def _subtract(self, ladder, t1, q):
+        """ladder -= B + B(ji,ba), B(ij,ab) = sum_k t1(k,a) Q(ij,k,b)."""
+        no, nv, threads = self.no, self.nv, self.threads
         # B as (a, ij, b) = t1^T @ Q with Q as (k, ij b).
         columns = np.ascontiguousarray(q.reshape(no * no, no, nv).transpose(1, 0, 2)).reshape(no, no * no * nv)
         b = matmul(np.ascontiguousarray(t1.T), columns, np.empty((nv, no * no * nv)), threads=threads)
         b = b.reshape(nv, no, no, nv).transpose(1, 2, 0, 3)
         ladder -= b
         ladder -= b.transpose(1, 0, 3, 2)
-        return ladder
 
 
 def _ladder_chunk(nv, count, pairs, budget):

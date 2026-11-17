@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+- Iterations no longer fault their memory in anew (Linux, glibc). glibc
+  maps large blocks on their own and unmaps them when freed, and returns
+  freed heap to the kernel at thresholds it moves at run time, so every
+  iteration's temporaries came back zero-filled through page faults, in
+  some processes and not others. IterCC now fixes the thresholds (blocks up
+  to 32 MiB from the heap, up to 1 GiB of free heap kept), takes every block
+  from the heap while a CCSDT solve runs and gives the free pages back when
+  it ends (`malloc_trim`), and CCSDT keeps one array of dressed integrals
+  across iterations (6.8 GB per iteration in water aug-cc-pVQZ). Water CCSDT
+  on one 56-core socket: cc-pVQZ 0.29 instead of 0.36 s per iteration,
+  aug-cc-pVTZ 0.15 instead of 0.17 s; without symmetry in aug-cc-pVDZ, 23 ms
+  in every run instead of 24 or 35 ms. Same peak memory with symmetry. CCSD,
+  EOM and CCSDTQ solves keep glibc's mapping of large blocks (no gain, and
+  slower or larger with the heap alone). `ITERCC_MALLOC=0`, or glibc's
+  `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_` or `MALLOC_MMAP_MAX_`,
+  leaves the allocator alone.
+- A process that finds the core sources and compiler unchanged loads the
+  runtime build without hashing the sources and running the compiler
+  (about 80 ms off every small calculation).
+- The CCSD dressing runs plane by plane on more than three threads per
+  occupied orbital: slab by slab gave only about two per occupied orbital
+  work (water aug-cc-pVQZ on one 56-core socket: 19 instead of 35 ms for the
+  dressing, 58 instead of 78 ms per iteration). Same operations in the same
+  order, so the same results; `ITERCC_DRESS_SLABS=1` or `0` forces either.
+- CCSD polarizabilities about 2x faster and EOM-CCSDT and CCSDT response
+  actions about 30% faster (water, 12 cores: CCSD cc-pVTZ static and 532 nm
+  4.3 instead of 9.4 s; EOM-CCSDT aug-cc-pVDZ, three roots, 7.4 instead of
+  10.5 s). Jacobian actions take the particle-particle ladder from the
+  undressed g(vvvv) through its derivative (`BareLadder.tangent`, exact for
+  directions of any irrep) instead of three dense products with the dressed
+  g(vvvv) and its derivative; for CCSD the derivative of the dressed
+  integrals skips the all-virtual planes (`itercc_dress_derivative_ccsd`,
+  into a buffer kept between actions). From 30 virtual orbitals: below, the
+  dense ladder is faster (`ITERCC_BARE_LADDER=0` or `1` forces either). The
+  sector scan of the dense-slot triples no longer starts a thread pool per
+  call. Core ABI 18.
+- The pair-sector ladders of CCSD and of EOM and response actions multiply
+  large blocks by one column per occupied pair; with up to 16 columns they
+  now stream through `itercc_gemm_narrow` (fixed summation order) at the
+  memory bandwidth instead of a fifth of it (water cc-pVQZ CCSD, 12 cores:
+  62 instead of 94 ms per iteration).
+- CCSDTQ plans its symmetry-blocked T4 products 1.8x faster (water 6-31G*:
+  2.3 instead of 3.2 s for the whole calculation; the plans are unchanged).
 - CCSD up to 5x faster per iteration (water aug-cc-pVTZ, 12 cores: 33 ms
   instead of 0.16 s; cc-pVTZ 9 instead of 24 ms). The T1-dressed integrals
   are no longer formed in their all-virtual block: the CCSD dressing

@@ -60,6 +60,12 @@ class PackedRows:
             total += n * length
         self.size = total
 
+    def cached_strides(self, combo):
+        cache = self.__dict__.setdefault("_strides", {})
+        if combo not in cache:
+            cache[combo] = self.strides(combo)
+        return cache[combo]
+
     def strides(self, combo):
         """Offset steps of the row letters within the grid of `combo`."""
         counts, steps, later = self.counts[combo], [], self.length[combo]
@@ -87,25 +93,25 @@ class Packed:
     def __init__(self, letters, rows, row_letters, virtual, layout, irrep=0):
         self.letters, self.rows, self.irrep = letters, rows, int(irrep)
         self.row_letters, self.virtual = tuple(row_letters), tuple(virtual)
-        self.vsize = np.asarray(layout._box_tables[0], dtype=np.int64)
-        self.boff = np.asarray(layout._box_tables[2], dtype=np.int64)
+        self.vsize = [int(x) for x in layout._box_tables[0]]
+        self.boff = [int(x) for x in layout._box_tables[2]]
         self.nirrep = layout.nirrep
 
     def place(self, irreps, members):
         combo = tuple(irreps[c] for c in self.row_letters)
-        gs = [irreps[c] for c in self.virtual]
-        h = gs[0] ^ gs[1] ^ gs[2] ^ gs[3]
+        g0, g1, g2, g3 = (irreps[c] for c in self.virtual)
+        h = g0 ^ g1 ^ g2 ^ g3
         if self.rows.irrep_of[tuple(members[c][0] for c in self.row_letters)] != h:
             raise ValueError("Packed row irrep and box irreps disagree")
-        n = [int(self.vsize[g]) for g in gs]
-        box = (n[1] * n[2] * n[3], n[2] * n[3], n[3], 1)
+        n1, n2, n3 = self.vsize[g1], self.vsize[g2], self.vsize[g3]
+        box = (n1 * n2 * n3, n2 * n3, n3, 1)
         N = self.nirrep
-        const = self.rows.base[combo] + int(self.boff[((h * N + gs[0]) * N + gs[1]) * N + gs[2]])
-        offsets = {c: np.zeros(len(members[c]), dtype=np.int64) for c in self.letters}
+        const = self.rows.base[combo] + self.boff[((h * N + g0) * N + g1) * N + g2]
+        offsets = {c: _steps(len(members[c]), 0) for c in self.letters}
         for k, c in enumerate(self.virtual):
-            offsets[c] = np.arange(len(members[c]), dtype=np.int64) * box[k]
-        for c, step in zip(self.row_letters, self.rows.strides(combo)):
-            offsets[c] = np.arange(len(members[c]), dtype=np.int64) * step
+            offsets[c] = _steps(len(members[c]), box[k])
+        for c, step in zip(self.row_letters, self.rows.cached_strides(combo)):
+            offsets[c] = _steps(len(members[c]), step)
         return const, offsets
 
 
@@ -234,11 +240,33 @@ class Plan:
                                    out, float(alpha), threads)
 
 
+_STEPS = {}
+
+
+def _steps(length, step):
+    """arange(length) * step as int64, shared (read-only): plans repeat a few
+    hundred (length, step) pairs tens of thousands of times."""
+    key = (length, step)
+    hit = _STEPS.get(key)
+    if hit is None:
+        hit = np.arange(length, dtype=np.int64) * step
+        hit.flags.writeable = False
+        _STEPS[key] = hit
+    return hit
+
+
+_ONE = np.zeros(1, dtype=np.int64)
+_ONE.flags.writeable = False
+
+
 def _grid(letters, offsets):
-    """Offsets of the C-order grid over `letters` (one entry without letters)."""
-    total = np.zeros(1, dtype=np.int64)
-    for c in letters:
-        total = (total[:, None] + offsets[c][None, :]).reshape(-1)
+    """Offsets of the C-order grid over `letters` (one entry without letters;
+    read-only, possibly an operand's own offsets)."""
+    if not letters:
+        return _ONE
+    total = offsets[letters[0]]
+    for c in letters[1:]:
+        total = np.add.outer(total, offsets[c]).reshape(-1)
     return total
 
 
@@ -247,26 +275,31 @@ def _assignments(letters, options, operands):
     has its irrep (XOR over its letters). An operand's last unassigned letter is
     determined by the others, so only consistent branches are visited."""
     allowed = [set(o) for o in options]
-    constraints = [(set(op.letters), op.irrep) for op in operands]
-    chosen = {}
+    position = {c: i for i, c in enumerate(letters)}
+    # An operand's irrep fixes its last letter (in assignment order).
+    forcing = [[] for _ in letters]
+    for op in operands:
+        places = sorted(position[c] for c in set(op.letters))
+        if places:
+            forcing[places[-1]].append((places[:-1], op.irrep))
+    values = [0] * len(letters)
 
     def visit(i):
         if i == len(letters):
-            yield dict(chosen)
+            yield dict(zip(letters, values))
             return
-        c = letters[i]
         forced = None
-        for group, irrep in constraints:
-            if c in group and all(d in chosen for d in group if d != c):
-                need = reduce(xor, (chosen[d] for d in group if d != c), irrep)
-                if forced is not None and forced != need:
-                    return
-                forced = need
+        for others, irrep in forcing[i]:
+            need = irrep
+            for j in others:
+                need ^= values[j]
+            if forced is not None and forced != need:
+                return
+            forced = need
         for value in ([forced] if forced is not None else options[i]):
             if value in allowed[i]:
-                chosen[c] = value
+                values[i] = value
                 yield from visit(i + 1)
-                del chosen[c]
     yield from visit(0)
 
 
@@ -274,6 +307,8 @@ def build_plan(spec, labels, a, b, out, nirrep):
     """Box-level plan of out += alpha * einsum(spec, a, b) for Dense or Packed
     operand descriptors; `labels` maps every letter to the irreps of its
     positions (the same index range in every operand)."""
+    if len(_STEPS) > 1 << 16:          # not during a build: its grids key on these arrays
+        _STEPS.clear()
     sa, sb, so = _parse(spec)
     rows = [c for c in so if c in sa and c not in sb]
     cols = [c for c in so if c in sb and c not in sa]
@@ -289,16 +324,25 @@ def build_plan(spec, labels, a, b, out, nirrep):
     starts = {"r": {}, "c": {}, "k": {}}
     sizes = {"r": 0, "c": 0, "k": 0}
 
+    known = {}
+
     def segment(kind, first, second):
+        # Segments with equal offsets are stored once; equal grid keys mean equal offsets.
+        token = (kind, first[0], second[0])
+        hit = known.get(token)
+        if hit is not None:
+            return hit
+        first, second = first[1], second[1]
         key = (first.tobytes(), second.tobytes())
         if key not in starts[kind]:
             starts[kind][key] = sizes[kind]
             segments[kind][0].append(first)
             segments[kind][1].append(second)
             sizes[kind] += len(first)
-        return starts[kind][key]
+        known[token] = starts[kind][key]
+        return known[token]
 
-    placed, grids = {}, {}
+    placed, grids, targets = {}, {}, {}
 
     def place(index, g):
         # An operand's offsets depend only on the irreps of its own letters.
@@ -308,28 +352,34 @@ def build_plan(spec, labels, a, b, out, nirrep):
             placed[key] = op.place(g, {c: members[c][g[c]] for c in op.letters})
         return key, placed[key]
 
-    def grid(key, group, offsets):
-        index = (key, tuple(group))
-        if index not in grids:
-            grids[index] = _grid(group, offsets)
-        return grids[index]
+    def grid(group, offsets):
+        """(key, offsets) of the grid over `group`: one per sequence of offset
+        arrays (the placements keep theirs alive, `_steps` shares equal ones)."""
+        index = tuple(id(offsets[c]) for c in group)
+        hit = grids.get(index)
+        if hit is None:
+            hit = grids[index] = (index, _grid(group, offsets))
+        return hit
 
+    rows_, cols_, sums_ = tuple(rows), tuple(cols), tuple(sums)
     for g in _assignments(letters, options, operands):
-        mem = {c: members[c][g[c]] for c in letters}
         (ka, (ca, oa)), (kb, (cb, ob)), (ko, (co, oo)) = (place(i, g) for i in range(3))
         if not steps:
             for name, offsets in (("a", oa), ("b", ob), ("o", oo)):
                 for c, values in offsets.items():
                     steps[name, c] = int(values[1] - values[0]) if len(values) > 1 else 1 << 60
-        out_rows, out_cols = grid(ko, rows, oo), grid(ko, cols, oo)
-        r0 = segment("r", grid(ka, rows, oa), out_rows)
-        c0 = segment("c", grid(kb, cols, ob), out_cols)
-        k0 = segment("k", grid(ka, sums, oa), grid(kb, sums, ob))
-        nr = prod(len(mem[c]) for c in rows)
-        nc = prod(len(mem[c]) for c in cols)
-        nk = prod(len(mem[c]) for c in sums)
+        out_rows, out_cols = grid(rows_, oo), grid(cols_, oo)
+        r0 = segment("r", grid(rows_, oa), out_rows)
+        c0 = segment("c", grid(cols_, ob), out_cols)
+        k0 = segment("k", grid(sums_, oa), grid(sums_, ob))
+        nr = prod(len(members[c][g[c]]) for c in rows)
+        nc = prod(len(members[c][g[c]]) for c in cols)
+        nk = prod(len(members[c][g[c]]) for c in sums)
         # Blocks with the same output entries go to successive waves.
-        target = (co, out_rows.tobytes(), out_cols.tobytes())
+        token = (co, out_rows[0], out_cols[0])
+        target = targets.get(token)
+        if target is None:
+            target = targets[token] = (co, out_rows[1].tobytes(), out_cols[1].tobytes())
         wave = seen.get(target, 0)
         seen[target] = wave + 1
         while len(table) <= wave:

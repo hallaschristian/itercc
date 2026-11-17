@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 17
+#define ITERCC_CORE_ABI 18
 
 /* Library identity. */
 int itercc_core_abi(void);
@@ -324,6 +324,10 @@ void itercc_dress_integrals_ccsd(double *dst, const double *src, const int64_t *
  * and 1, d times the virtual rows added to the occupied rows of legs 2 and 3,
  * each leg transformed once from g, in one pass. out need not be initialized. */
 void itercc_dress_derivative(double *out, const double *g, int64_t n, int64_t no, const double *d, int threads);
+void itercc_gemm_narrow(const double *a, int64_t lda, const double *b, int64_t ldb, double *out, int64_t ldo,
+                        int64_t m, int64_t k, int64_t n, double alpha, double beta, int threads);
+void itercc_dress_derivative_ccsd(double *out, const double *g, int64_t n, int64_t no, const double *d,
+                                  int threads);
 /* dst (n^4, C order) = src without the entries whose Abelian labels XOR to
  * nonzero; stats = (count of nonzero removed entries, largest magnitude, norm).
  * Returns 1 when a removed entry exceeds tolerance or is not finite, else 0. */

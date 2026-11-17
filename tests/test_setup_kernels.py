@@ -84,7 +84,7 @@ def _pair_symmetric(rng, n, no):
 
 
 @pytest.mark.parametrize("transposed", [False, True])
-def test_ccsd_dressing_matches_the_full_dressing_where_ccsd_reads(transposed):
+def test_ccsd_dressing_matches_the_full_dressing_where_ccsd_reads(transposed, monkeypatch):
     from itercc._cpu_triples import dressed_integrals
 
     if not hasattr(_cpu_kernels.library(), "dress_integrals_ccsd"):
@@ -95,7 +95,12 @@ def test_ccsd_dressing_matches_the_full_dressing_where_ccsd_reads(transposed):
     if transposed:
         g0 = g0.transpose(0, 2, 1, 3)                         # read through strides
     full = dressed_integrals(g0, t1, 3)
-    ccsd = dressed_integrals(g0, t1, 3, ccsd=True, out=np.full((n,) * 4, np.nan))
+    schedules = []
+    for slabs in ("1", "0"):                                  # slab by slab, plane by plane
+        monkeypatch.setenv("ITERCC_DRESS_SLABS", slabs)
+        schedules.append(dressed_integrals(g0, t1, 3, ccsd=True, out=np.full((n,) * 4, np.nan)))
+    np.testing.assert_array_equal(schedules[0], schedules[1])
+    ccsd = schedules[0]
     o, v = slice(0, no), slice(no, n)
     np.testing.assert_array_equal(ccsd[o], full[o])           # an occupied first or second index
     np.testing.assert_array_equal(ccsd[v, o], full[v, o])
@@ -119,3 +124,168 @@ def test_bare_ladder_adds_what_the_ccsd_dressing_leaves_out():
     ccsd = dressed_integrals(g, t1, 2, ccsd=True)
     total = 0.5 * ccsd[v, v, o, o].transpose(2, 3, 0, 1) + BareLadder(g, no, threads=2)(t1, t2)
     np.testing.assert_allclose(total, reference, rtol=1e-11, atol=1e-11)
+
+
+@pytest.mark.parametrize("no", [0, 4])
+def test_ccsd_dressing_derivative_matches_the_full_one_where_ccsd_reads(no):
+    library = _cpu_kernels.library()
+    if not hasattr(library, "dress_derivative_ccsd"):
+        pytest.skip("core without dress_derivative_ccsd")
+    rng = np.random.default_rng(11)
+    n = 13
+    g = rng.standard_normal((n,) * 4)
+    d = np.ascontiguousarray(rng.standard_normal((no, n - no)))
+    full = np.empty_like(g)
+    library.dress_derivative(full.ctypes.data, g.ctypes.data, n, no, d.ctypes.data, 2)
+    results = []
+    for threads in (1, 3):
+        out = np.full_like(g, np.nan)
+        library.dress_derivative_ccsd(out.ctypes.data, g.ctypes.data, n, no, d.ctypes.data, threads)
+        results.append(out)
+    ccsd = results[0]
+    o, v = slice(0, no), slice(no, n)
+    np.testing.assert_array_equal(ccsd[o], full[o])
+    np.testing.assert_array_equal(ccsd[v, o], full[v, o])
+    np.testing.assert_array_equal(ccsd[v, v, o, o], full[v, v, o, o])
+    assert np.isnan(ccsd[v, v, v]).all() and np.isnan(ccsd[v, v, o, v]).all()   # never written
+    np.testing.assert_array_equal(results[0], results[1])
+
+
+def _symmetric_model(rng, labels, no):
+    """Pair-symmetric g without symmetry-forbidden entries, A1 t1 and t2."""
+    n = len(labels)
+    g, t2, t1 = _pair_symmetric(rng, n, no)
+    total = labels[:, None, None, None] ^ labels[None, :, None, None] ^ labels[None, None, :, None] \
+        ^ labels[None, None, None, :]
+    occupied, virtual = labels[:no], labels[no:]
+    pair = occupied[:, None, None, None] ^ occupied[None, :, None, None] ^ virtual[None, None, :, None] \
+        ^ virtual[None, None, None, :]
+    return np.where(total == 0, g, 0.0), np.where(pair == 0, t2, 0.0), \
+        np.where(occupied[:, None] == virtual[None, :], t1, 0.0)
+
+
+@pytest.mark.parametrize("tau", [True, False])
+@pytest.mark.parametrize("symmetry", [None, "sectors", "scan"])
+def test_bare_ladder_tangent_is_its_derivative(tau, symmetry):
+    from itercc._blocked import irrep_groups
+    from itercc._cpu_triples import BareLadder, LadderSectors
+
+    rng = np.random.default_rng(12)
+    no, labels = 3, np.array([0, 1, 0, 0, 2, 1, 3, 0, 2, 3, 1, 0])
+    g, t2, t1 = _symmetric_model(rng, labels, no)
+    # A direction of irrep 2: the derivative of a non-A1 perturbation.
+    occupied, virtual = labels[:no], labels[no:]
+    dt1 = np.where((occupied[:, None] ^ virtual[None, :]) == 2, rng.standard_normal(t1.shape), 0.0)
+    dt2 = rng.standard_normal(t2.shape)
+    dt2 = dt2 + dt2.transpose(1, 0, 3, 2)
+    pair = occupied[:, None, None, None] ^ occupied[None, :, None, None] ^ virtual[None, None, :, None] \
+        ^ virtual[None, None, None, :]
+    dt2 = np.where(pair == 2, dt2, 0.0)
+    options = {}
+    if symmetry == "sectors":
+        options = dict(structure=LadderSectors(virtual, irrep_groups(labels)))
+    elif symmetry == "scan":
+        options = dict(virtual_irreps=virtual)
+    bare = BareLadder(g, no, threads=2, **options)
+
+    def along(step):
+        return bare(t1 + step * dt1, t2 + step * dt2, tau=tau)
+
+    # The ladder is cubic in the step: two central differences give its slope exactly.
+    h = 0.1
+    wide, narrow = (along(h) - along(-h)) / (2 * h), (along(h / 2) - along(-h / 2)) / h
+    slope = (4 * narrow - wide) / 3
+    tangent = bare.tangent(t1, t2, dt1, dt2, tau=tau)
+    np.testing.assert_allclose(tangent, slope, rtol=1e-10, atol=1e-10)
+    np.testing.assert_array_equal(bare.tangent(t1, t2, dt1, dt2, tau=tau), tangent)   # cached point
+
+
+def test_eom_actions_agree_with_and_without_the_bare_ladder(monkeypatch):
+    pytest.importorskip("pyscf")
+    from pyscf import gto, scf
+
+    from itercc import EOMSinglet, RestrictedCC
+    from itercc.pyscf_interface import from_rhf
+
+    mol = gto.M(atom="O 0 0 0.117; H 0 0.757 -0.469; H 0 -0.757 -0.469", basis="6-31g", symmetry=True,
+                verbose=0)
+    m = from_rhf(scf.RHF(mol).run(conv_tol=1e-12), frozen=1)
+    for rank in (2, 3):
+        cc = RestrictedCC(m.h, m.eri, m.nocc, m.constant, orbital_irreps=m.orbital_irreps,
+                          symmetry_tolerance=1e-8, rank=rank)
+        ground = cc.solve(energy_tol=1e-12, residual_tol=1e-10, max_iter=100)
+        images = []
+        for flag in ("0", "1"):
+            monkeypatch.setenv("ITERCC_BARE_LADDER", flag)
+            for irrep in (0, 2):
+                eom = EOMSinglet(cc, ground.amplitudes, orbital_irreps=m.orbital_irreps, irrep=irrep,
+                                 method="ccsd" if rank == 2 else "ccsdt")
+                assert (eom.proxy._tangent_ladder is not None) == (flag == "1")
+                vector = np.random.default_rng(irrep).standard_normal(eom.space.dimension
+                                                                       if hasattr(eom.space, "dimension")
+                                                                       else len(eom.diagonal))
+                images.append(eom.sigma(vector))
+        for with_bare, without in zip(images[2:], images[:2]):
+            np.testing.assert_allclose(with_bare, without, rtol=1e-11, atol=1e-11)
+    monkeypatch.delenv("ITERCC_BARE_LADDER")                  # 8 virtuals: the dense ladder
+    eom = EOMSinglet(cc, ground.amplitudes, orbital_irreps=m.orbital_irreps, method="ccsdt")
+    assert eom.proxy._tangent_ladder is None
+
+
+@pytest.mark.parametrize("columns", [1, 4, 10, 16])
+def test_narrow_gemm_matches_numpy(columns):
+    from itercc._cpu_triples import _narrow, matmul
+
+    if not hasattr(_cpu_kernels.library(), "gemm_narrow"):
+        pytest.skip("core without gemm_narrow")
+    rng = np.random.default_rng(columns)
+    big = rng.standard_normal((300, 420))
+    a = big[:, 7:407]                                        # row stride beyond the row length
+    b = np.ascontiguousarray(rng.standard_normal((400, columns)))
+    assert _narrow(a, b, np.empty((300, columns)))
+    reference = a @ b
+    np.testing.assert_allclose(matmul(a, b, np.empty((300, columns))), reference, rtol=1e-12, atol=1e-12)
+    out = rng.standard_normal((300, columns))
+    expected = 0.5 * out - 2.0 * reference
+    np.testing.assert_allclose(matmul(a, b, out, alpha=-2.0, beta=0.5), expected, rtol=1e-12, atol=1e-12)
+    one = matmul(a, b, np.empty((300, columns)), threads=1)
+    np.testing.assert_array_equal(matmul(a, b, np.empty((300, columns)), threads=5), one)
+
+
+def test_allocator_thresholds_are_set_once_unless_opted_out(monkeypatch):
+    import platform
+    import sys
+
+    from itercc import _core
+
+    for name in ("MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delitem(_core._state, "malloc", raising=False)
+    monkeypatch.setenv("ITERCC_MALLOC", "0")
+    assert _core.keep_freed_memory() is False
+    assert _core.keep_freed_memory() is False                 # decided once per process
+    monkeypatch.delitem(_core._state, "malloc")
+    monkeypatch.delenv("ITERCC_MALLOC")
+    glibc = sys.platform.startswith("linux") and platform.libc_ver()[0] == "glibc"
+    assert _core.keep_freed_memory() is glibc
+
+
+def test_heap_scope_nests_and_restores_mapping(monkeypatch):
+    from itercc import _core
+
+    calls = []
+    if not _core.keep_freed_memory():
+        with _core.heap_scope() as scope:                     # nothing to change here
+            assert scope.active is False
+        return
+    monkeypatch.setitem(_core._state, "libc", (lambda option, value: calls.append((option, value)) or 1,
+                                               lambda pad: calls.append(("trim", pad)) or 1))
+    with _core.heap_scope():
+        with _core.heap_scope():
+            assert calls == [(-4, 0)]                          # M_MMAP_MAX 0 once
+        assert calls == [(-4, 0)]
+    assert calls == [(-4, 0), (-4, 65536), ("trim", 0)]        # restored by the outermost scope
+    with pytest.raises(RuntimeError):
+        with _core.heap_scope():
+            raise RuntimeError
+    assert calls[-2:] == [(-4, 65536), ("trim", 0)] and _core._heap["depth"] == 0

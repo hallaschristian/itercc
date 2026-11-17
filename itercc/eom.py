@@ -7,6 +7,7 @@ from copy import copy
 from dataclasses import dataclass
 from functools import cache, partial
 import os
+import sys
 from time import perf_counter
 from types import SimpleNamespace
 
@@ -18,6 +19,8 @@ from .krylov import davidson
 from ._directional import Directional, DirectionalBackend, DirectionalCudaLayout
 from ._triples_layout import TriplesLayout
 from .restricted import RestrictedCC, _pair_ladder, _fock
+
+_BARE_MIN_VIRTUALS = 30     # `EOMSinglet._bare_ladder`: the dense ladder is faster below
 
 
 @cache
@@ -296,6 +299,7 @@ class EOMSinglet:
                 no = self.space.layout.no
                 labels = self.space.labels
                 self._tangent_feedback = CudaTangentFeedback(labels[:no], labels[no:], xp)
+        self.proxy._tangent_ladder = self._bare_ladder(getattr(self.space, "labels", None))
         residual = self._ground_residual(cache_dressing)
         maxima = [max(float(xp.max(r)), -float(xp.min(r))) if r.size else 0. for r in residual]
         maximum = max(maxima)
@@ -341,7 +345,9 @@ class EOMSinglet:
         _dress_axis(h0, 0, v, o, -self.amplitudes[0].T, xp)
         _dress_axis(h0, 1, o, v, self.amplitudes[0], xp)
 
-        def derivative_legs(tensor, response, creation, annihilation):
+        spare = {}
+
+        def derivative_legs(tensor, response, creation, annihilation, ccsd=False):
             library = _cpu_dressing_kernel() if xp is np else None
             if (library is not None and tensor.ndim == 4 and tensor.dtype == np.float64
                     and tensor.flags.c_contiguous and response.dtype == np.float64):
@@ -351,13 +357,22 @@ class EOMSinglet:
                 n, no = tensor.shape[0], response.shape[0]
                 nv = n - no
                 threads = cpu_threads(None)
-                if (tuple(creation), tuple(annihilation)) == ((0, 1), (2, 3)) and hasattr(
-                        library, "dress_derivative"):
-                    # All four legs in one pass over g, no zero fill.
-                    output = np.empty_like(tensor)
+                kernel = getattr(library, "dress_derivative_ccsd" if ccsd else "dress_derivative", None)
+                if (tuple(creation), tuple(annihilation)) == ((0, 1), (2, 3)) and kernel is not None:
+                    # All four legs in one pass over g, no zero fill; `ccsd`: not
+                    # the all-virtual planes beyond their occupied block, which
+                    # only the particle-particle ladder reads (`_bare_ladder`).
+                    output = spare.get(ccsd) if ccsd else None
+                    # The CCSD output leaves most of the all-virtual planes
+                    # unwritten: kept between actions while nothing else holds
+                    # the last one (a fresh n^4 array faulted in about a quarter
+                    # of its pages per action).
+                    if output is None or output.shape != tensor.shape or sys.getrefcount(output) > 3:
+                        output = np.empty_like(tensor)
+                        if ccsd:
+                            spare[ccsd] = output
                     d = np.ascontiguousarray(response)
-                    library.dress_derivative(output.ctypes.data, tensor.ctypes.data, n, no, d.ctypes.data,
-                                             threads)
+                    kernel(output.ctypes.data, tensor.ctypes.data, n, no, d.ctypes.data, threads)
                     return output
                 output = np.zeros_like(tensor)
                 down = np.ascontiguousarray(-response.T)      # (nv, no)
@@ -394,7 +409,7 @@ class EOMSinglet:
                 shifted.update(t1=t1, operators=(h1, f1, g1))
             return shifted["operators"]
 
-        def dressed(t1):
+        def dressed(t1, ccsd=False):
             if t1.value is self.amplitudes[0]:
                 h, f, g = h0, f0, g0
             elif (isinstance(t1.value, xp.ndarray) and t1.value.dtype == np.float64
@@ -406,7 +421,7 @@ class EOMSinglet:
             if t1.tangent is None:
                 return Directional(f), Directional(g)
             dh = derivative_legs(h, t1.tangent, (0,), (1,))
-            dg = derivative_legs(g, t1.tangent, (0, 1), (2, 3))
+            dg = derivative_legs(g, t1.tangent, (0, 1), (2, 3), ccsd=ccsd)
             return Directional(f, _fock(dh, dg, o, xp=xp)), Directional(g, dg)
 
         self.proxy._dressed = dressed
@@ -427,10 +442,60 @@ class EOMSinglet:
             # Always include T3 diagrams, even for a zero ground-state T3:
             # their derivatives with respect to R3 can be nonzero.
             return self.proxy._evaluate(amplitudes, True)
-        f, g = self.proxy._dressed(amplitudes[0])
-        r1, r2, *_ = eq.lower_residuals(f, g, amplitudes[1], self.proxy.o,
-                                      self.proxy.v, self.proxy._contract)
+        ladder = self.proxy._tangent_ladder
+        # With the ladder from the undressed g(vvvv), the dressing's derivative
+        # skips what only the dressed ladder would read.
+        f, g = self.proxy._dressed(amplitudes[0], ccsd=ladder is not None)
+        r1, r2, *_ = eq.lower_residuals(f, g, amplitudes[1], self.proxy.o, self.proxy.v, self.proxy._contract,
+                                        vvvv_ladder=None if ladder is None else partial(ladder, amplitudes[0]))
         return r1, r2 + r2.transpose(1, 0, 3, 2)
+
+    def _bare_ladder(self, labels):
+        """`proxy._tangent_ladder`: the particle-particle ladder of dual-number
+        amplitudes from the undressed g(vvvv) (`_cpu_triples.BareLadder`, built
+        once, exactly 0.5 sum_cd g~(abcd) t2(ijcd) and its derivative) instead
+        of three dense products with the dressed g(vvvv) and its derivative
+        per action; None off the compiled CPU path, with fewer than
+        `_BARE_MIN_VIRTUALS` virtual orbitals (water CCSD polarizabilities, 12
+        cores: 25 virtuals 1.1 instead of 1.0 s, 36 virtuals 1.9 instead of
+        3.7 s) or with ITERCC_BARE_LADDER=0 (=1 forces it)."""
+        from . import _cpu_triples as _cpu
+
+        g = self.proxy.g
+        choice = os.environ.get("ITERCC_BARE_LADDER", "")
+        if (self.xp is not np or _cpu._kernels.library() is None or not isinstance(g, np.ndarray)
+                or g.dtype != np.float64 or choice == "0"):
+            return None
+        no = self.proxy.layout.no
+        if choice != "1" and len(g) - no < _BARE_MIN_VIRTUALS:
+            return None
+        structure = virtual = None
+        if labels is not None:
+            labels = np.asarray(labels, dtype=np.int64)
+            virtual = labels[no:]
+            if self.symmetry_projected and len(np.unique(labels)) > 1:
+                # Exactly symmetric integrals: only the diagonal sector blocks.
+                from ._blocked import irrep_groups
+
+                structure = _cpu.LadderSectors(virtual, irrep_groups(labels))
+        bare = _cpu.BareLadder(g, no, structure=structure, virtual_irreps=virtual)
+        contract = self.proxy._contract
+
+        def ladder(t1, g_vvvv, t2):
+            value = (t1.value, t2.value)
+            tangent = (t1.tangent, t2.tangent)
+            if not all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in value + tangent
+                       if x is not None):
+                return 0.5 * contract("abcd,ijcd->ijab", g_vvvv, t2)     # complex: dense
+            # The dressed g keeps the t1 t1 term in g(abij): no tau.
+            point = getattr(ladder, "point", None)
+            if point is None or not (np.array_equal(point[0], value[0]) and np.array_equal(point[1], value[1])):
+                ladder.point = point = (value[0].copy(), value[1].copy(), bare(*value, tau=False))
+            if tangent[0] is None and tangent[1] is None:
+                return Directional(point[2].copy())
+            return Directional(point[2].copy(), bare.tangent(*value, *tangent, tau=False))
+
+        return ladder
 
     def sigma(self, vector):
         if self.xp.iscomplexobj(vector):

@@ -13,9 +13,10 @@ this CPU, so a `native` build from another node type is skipped.
 import ctypes
 import os
 from pathlib import Path
+import sys
 import threading
 
-CORE_ABI = 17
+CORE_ABI = 18
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -64,6 +65,8 @@ CPU_FUNCTIONS = {
     "dress_integrals_ccsd": ([_P, _P, _P, _I, _I, _P, _T], None),
     "project_symmetric": ([_P, _P, _I, _P, _D, _P, _T], _T),
     "dress_derivative": ([_P, _P, _I, _I, _P, _T], None),
+    "dress_derivative_ccsd": ([_P, _P, _I, _I, _P, _T], None),
+    "gemm_narrow": ([_P, _I, _P, _I, _P, _I, _I, _I, _I, _D, _D, _T], None),
     "unpack_s4": ([_P, _P, _I, _T], None),
     "ladder_sectors": ([_P, _P, _P, _I, _I, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _T, _T], None),
     "symmetrize_pairs": ([_P, _I, _P, _P, _T], _T),
@@ -203,6 +206,83 @@ def _directories():
     explicit = [Path(p) for p in os.environ.get("ITERCC_CORE_DIR", "").split(os.pathsep) if p]
     package = Path(__file__).resolve().parent
     return explicit, package, package.parent / "core" / "build"
+
+
+def keep_freed_memory():
+    """Let glibc keep freed memory for reuse (once per process, Linux only).
+
+    By default glibc maps blocks above a threshold that it moves at run time
+    and returns freed memory at the top of the heap to the kernel; depending on
+    the order of frees, every iteration then faults its temporaries in again,
+    zero-filled (water CCSDT aug-cc-pVDZ without symmetry, 12 threads: 9000
+    faults and a quarter of each iteration in some processes, none in others).
+    Fixed thresholds: blocks up to 32 MiB come from the heap, and up to 1 GiB
+    of free heap stays mapped. `ITERCC_MALLOC=0`, or setting glibc's own
+    `MALLOC_MMAP_THRESHOLD_` or `MALLOC_TRIM_THRESHOLD_`, leaves the allocator
+    alone, also within `heap_scope`. Returns whether the thresholds were set."""
+    done = _state.get("malloc")
+    if done is not None:
+        return done
+    with _lock:
+        if "malloc" in _state:
+            return _state["malloc"]
+        _state["malloc"] = False
+        if (not sys.platform.startswith("linux") or os.environ.get("ITERCC_MALLOC", "1") == "0"
+                or any(name in os.environ for name in _GLIBC_SETTINGS)):
+            return False
+        try:
+            libc = ctypes.CDLL(None)
+            mallopt, trim = libc.mallopt, libc.malloc_trim       # glibc (not on musl)
+        except (OSError, AttributeError):
+            return False
+        mallopt.argtypes, mallopt.restype = [ctypes.c_int, ctypes.c_int], ctypes.c_int
+        trim.argtypes, trim.restype = [ctypes.c_size_t], ctypes.c_int
+        M_TRIM_THRESHOLD, M_MMAP_THRESHOLD = -1, -3
+        _state["malloc"] = bool(mallopt(M_MMAP_THRESHOLD, 32 << 20) and mallopt(M_TRIM_THRESHOLD, 1 << 30))
+        if _state["malloc"]:
+            _state["libc"] = (mallopt, trim)
+        return _state["malloc"]
+
+
+_GLIBC_SETTINGS = ("MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_", "MALLOC_MMAP_MAX_")
+_heap = {"depth": 0}
+
+
+class heap_scope:
+    """Within: every block from the heap, none mapped on its own (glibc's
+    M_MMAP_MAX 0); on leaving the outermost scope, mapping is allowed again and
+    the free heap pages go back to the kernel (`malloc_trim`).
+
+    CCSDT solves allocate their T3-sized temporaries anew every iteration;
+    above 32 MiB glibc maps each one and unmaps it when freed, and the next
+    iteration faults it in again, zero-filled (water on one 56-core socket,
+    cc-pVQZ: 24000 faults per iteration, 0.36 instead of 0.29 s). Not used for
+    CCSD, EOM or CCSDTQ: no gain there, and in CCSDTQ calloc then clears
+    large arrays on one thread (2-7% slower), in dense CCSD the heap
+    fragments (aug-cc-pVQZ: 23 instead of 17 GiB). No effect where
+    `keep_freed_memory` does not apply."""
+
+    def __enter__(self):
+        if not keep_freed_memory() or "libc" not in _state:
+            self.active = False
+            return self
+        self.active = True
+        with _lock:
+            _heap["depth"] += 1
+            if _heap["depth"] == 1:
+                _state["libc"][0](-4, 0)               # M_MMAP_MAX
+        return self
+
+    def __exit__(self, *exc):
+        if self.active:
+            with _lock:
+                _heap["depth"] -= 1
+                if _heap["depth"] == 0:
+                    mallopt, trim = _state["libc"]
+                    mallopt(-4, 65536)                 # glibc's default
+                    trim(0)
+        return False
+
 
 
 def _load(path, abi_function, abi, functions, prefix="itercc_"):
