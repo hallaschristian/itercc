@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Triplet EOM-CCSDTQ rank-four slots run as one compiled program on the CPU
+  (`itercc_triplet_slots`, core ABI 28): water cc-pVDZ on 12 threads takes
+  4.0-4.3 s per action instead of 26.4 s (6-31G: 0.47 s instead of 8.3 s).
+  Tile kinds and slot classes are recorded once (the first action takes
+  5.8 s); every tile then runs on one thread with the single-threaded
+  contraction routes, intermediates are shared between tiles through a cache
+  with one producer per key, the products into a tile with the same output
+  blocks run as fused GEMMs, and each slot adds its tiles' partial sums in the
+  loop's order. The action does not depend on the thread count; it agrees
+  with the Python slot loop to round-off, and bit for bit with
+  `ITERCC_TRIPLET_FUSED=0`. `ITERCC_TRIPLET_PROGRAM=0` runs the loop. Tile
+  contraction trees now count an intermediate's work once per tiles that
+  share it: goovv t2 t4 contracts g with T4 first (one intermediate per T4
+  hole pair instead of a packed-T4 product per tile), which changes the
+  action at round-off. Without `intermediate_cache_gib`, the program's cache
+  takes half of what the memory budget leaves free (at least 256 MiB).
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

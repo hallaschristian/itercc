@@ -179,6 +179,10 @@ class TripletEOMCCSDTQ:
                 not isinstance(occupied_slab, (int, np.integer)) or occupied_slab < 1):
             raise ValueError("Occupied slab must be a positive integer or None")
         self.occupied_slab = None if occupied_slab is None else int(occupied_slab)
+        # Rank-four slots as one compiled program on the CPU (see _compiled_slots).
+        self.slot_program = True
+        self.fused_tiles = True
+        self._slot_programs = {}
         if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
         self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
@@ -200,6 +204,7 @@ class TripletEOMCCSDTQ:
             # Shared signed virtual maps: <=16 spin signatures x 8 irreps,
             # each with nv**4 int32 entries. No second copy for the R4 sector.
             self.estimated_dense_bytes += 512 * nv**4
+        self.memory_budget_bytes = int(memory_budget_gib * 2**30)
         if self.estimated_dense_bytes > memory_budget_gib * 2**30:
             raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
         ref = solver._reference
@@ -330,6 +335,9 @@ class TripletEOMCCSDTQ:
         space = self.space
         if rank == 4 and self._packed_direction:
             result = xp.zeros(self._direction_t4.size)
+            if self._compiled_slots(blocks, packed_direction, result, slot_limit, slot_finished, packed_action):
+                yield None, result
+                return
             pending = []
 
             def flush():
@@ -401,6 +409,77 @@ class TripletEOMCCSDTQ:
             particles = indices[:rank, rows] // 2
             result[rows] = self._project_tile(rank, signature, occupied, particles, primal, tangent)
         yield None, result
+
+    def _compiled_slots(self, blocks, direction, result, slot_limit, slot_finished, packed_action):
+        """Run the rank-four slots as one compiled program (`_spin_quadruples_program`):
+        the same result as the slot loop, bit for bit. False when it does not
+        apply (GPU, no symmetry engine, no direct packed terms, the reference
+        expansion or projection, a product without a blocked plan, or
+        ITERCC_TRIPLET_PROGRAM=0): the loop runs."""
+        import os
+
+        if (not self.slot_program or self.xp is not np or not self.packed_contractions
+                or not self.native_projection or not self._direction_t4.native_expansion
+                or not self._ground_t4.native_expansion
+                or not getattr(self._symmetry_engine, "packed_operands", False)
+                or os.environ.get("ITERCC_TRIPLET_PROGRAM", "1") == "0"):
+            return False
+        from ._cpu_triples import cpu_threads
+        from ._spin_quadruples_program import SlotProgram, Unsupported
+
+        presence = {name: pair.tangent is not None for name, pair in blocks.items()}
+        presence["t4"] = direction is not None
+        key = tuple(sorted(presence.items())), SlotProgram._signature(blocks)
+        if key not in self._slot_programs:
+            groups = [(equivalent, multiplicity, tuple(d for d in diagrams if d not in self._packed_diagrams[4]))
+                      for equivalent, multiplicity, diagrams in projection_diagrams(4)]
+            try:
+                program = SlotProgram(self, blocks, groups, presence)
+            except Unsupported:
+                program = None
+            self._slot_programs[key] = program
+        program = self._slot_programs[key]
+        if program is None or (self.amplitudes[3] is None and program.reads_ground):
+            return False
+        started = perf_counter()
+        layout = self._direction_t4
+        total = len(layout.slots)
+        done = total if slot_limit is None else min(int(slot_limit), total)
+        # Shared intermediates: the configured budget, else half of what the
+        # memory budget leaves beside the estimate and the program's own
+        # tiles and partial sums, at least 256 MiB.
+        cache = self.intermediate_cache_bytes
+        if not cache:
+            working = 8 * cpu_threads() * self.nvir**4 + 2**28
+            cache = (self.memory_budget_bytes - self.estimated_dense_bytes - working) // 2
+        cache = max(cache, 2**28)
+        # Fused tile products (other rounding); ITERCC_TRIPLET_FUSED=0 keeps
+        # the loop's products, bit for bit.
+        fused = self.fused_tiles and os.environ.get("ITERCC_TRIPLET_FUSED", "1") != "0"
+        self._program_cache = program.run(blocks, self.amplitudes[3], direction, result, cache_bytes=cache,
+                                          threads=cpu_threads(), slot_limit=done, fused=fused)
+        if packed_action is not None and done:
+            # The direct packed terms of consecutive slots (windows follow each
+            # other), at least 2^18 rows per call as in the loop.
+            slots = list(layout.slots.items())[:done]
+            start = 0
+            while start < done:
+                stop, count = start, 0
+                while stop < done and count < 1 << 18:
+                    count += len(layout.groups[slots[stop][1][0]])
+                    stop += 1
+                parts = []
+                for holes, (key, _) in slots[start:stop]:
+                    particles = layout.groups[key]
+                    coordinates = np.empty((len(particles), 8), dtype=np.int32)
+                    coordinates[:, :4], coordinates[:, 4:] = particles, holes
+                    parts.append(coordinates)
+                first, last = slots[start][1][1].start, slots[stop - 1][1][1].stop
+                packed_action.add(4, parts[0] if len(parts) == 1 else np.concatenate(parts), result[first:last])
+                start = stop
+        if slot_finished is not None:
+            slot_finished(done, total, perf_counter() - started)
+        return True
 
     def _project_lower_tiles(self, rank, tiles):
         """Accumulate antisymmetry directly in canonical coordinates for ranks 2 and 3."""
@@ -530,6 +609,7 @@ class TripletEOMCCSDTQ:
             packed_action = PackedBinaryAction(self, blocks,
                                               vector[self.space.slices[3]] if nonzero[3] else None)
         outputs = []
+        self._program_cache = None
         from ._intermediate_cache import IntermediateCache
         intermediates = IntermediateCache(self.intermediate_cache_bytes) if self.intermediate_cache_bytes else None
         for rank in ranks:
@@ -558,7 +638,8 @@ class TripletEOMCCSDTQ:
                 if xp is not np:
                     xp.cuda.get_current_stream().synchronize()
                 rank_finished(rank, perf_counter() - start)
-        self.last_intermediate_cache = (None if intermediates is None else
+        self.last_intermediate_cache = (self._program_cache if self._program_cache is not None else
+                                        None if intermediates is None else
                                         dict(hits=intermediates.hits, misses=intermediates.misses,
                                              peak_bytes=intermediates.peak_bytes))
         self._gather_plans = {}

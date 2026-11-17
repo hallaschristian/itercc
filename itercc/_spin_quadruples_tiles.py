@@ -14,35 +14,49 @@ from .bounded_einsum import einsum, einsum_into
 
 @lru_cache(maxsize=None)
 def contraction_schedule(spec, no, nv, fixed=()):
-    """Binary contraction tree, minimizing peak intermediate size first."""
+    """Binary contraction tree of one occupied tile (`fixed`: its unit letters).
+
+    An intermediate that does not read some fixed letters is the same for
+    every tile that differs only in them, and the intermediate caches share
+    it: its multiply-adds count once per no**(letters it does not read).
+    Among the trees whose largest intermediate stays within max(nv**4, the
+    smallest possible peak), the tree with the fewest such amortized
+    multiply-adds wins, then the smaller peak, then fewer multiply-adds. For
+    goovv t2 t4 (mnef,aeij,bcdfklmn) this contracts g with T4 first: an
+    intermediate per (k, l) instead of a packed-T4 product per tile.
+    """
     inputs, output = spec.split("->")
     inputs = tuple(inputs.split(","))
     count = len(inputs)
     lengths = {c: (1 if c in fixed else nv if c in "abcdef" else no)
                for c in set("".join(inputs))}
+    whole = (1 << count) - 1
 
     @lru_cache(maxsize=None)
-    def plan(mask):
+    def trees(mask):
+        """Every tree of the inputs in `mask`: ((amortized, peak, work), letters, tree)."""
         if mask.bit_count() == 1:
             pos = mask.bit_length() - 1
-            return (0, 0), inputs[pos], pos
+            return (((0, 0, 0), inputs[pos], pos),)
         inside = set().union(*(set(term) for i, term in enumerate(inputs) if mask >> i & 1))
         outside = set(output).union(*(set(term) for i, term in enumerate(inputs) if not mask >> i & 1))
         letters = "".join(sorted(inside & outside))
-        best = None
+        size = prod(lengths[c] for c in letters)
+        shared = 1 if mask == whole else no ** sum(c not in inside for c in fixed)
+        found = []
         for left in range(1, mask):
             if left & mask != left or not left & (mask & -mask):
                 continue
-            right = mask ^ left
-            ca, a, pa = plan(left)
-            cb, b, pb = plan(right)
-            cost = (max(ca[0], cb[0], prod(lengths[c] for c in letters)),
-                    ca[1] + cb[1] + prod(lengths[c] for c in set(a + b)))
-            if best is None or cost < best[0]:
-                best = cost, letters, (a + "," + b + "->" + letters, pa, pb)
-        return best
+            for ca, a, pa in trees(left):
+                for cb, b, pb in trees(mask ^ left):
+                    work = prod(lengths[c] for c in set(a + b))
+                    cost = (ca[0] + cb[0] + work / shared, max(ca[1], cb[1], size), ca[2] + cb[2] + work)
+                    found.append((cost, letters, (a + "," + b + "->" + letters, pa, pb)))
+        return tuple(found)
 
-    return plan((1 << count) - 1)[2]
+    candidates = trees(whole)
+    limit = max(nv**4, min(cost[1] for cost, _, _ in candidates))
+    return min((c for c in candidates if c[0][1] <= limit), key=lambda c: c[0])[2]
 
 
 def _expression_key(tree, keys):

@@ -51,7 +51,9 @@ stale prebuilt libraries are rejected.
 
 ## Remaining priorities
 
-1. **Batch the CCSDTQ rank-four work across occupied slots.** The scalar
+1. **Batch the CCSDTQ rank-four work across occupied slots.** The compiled
+   slot program (Evidence below) now runs every tile of an action in the core,
+   6.1-6.5x faster on water cc-pVDZ; it is not yet measured on CuF. The scalar
    occupied-slot loop repeatedly forms raw virtual tiles and projects them
    into canonical output. The earlier benchmark covers eight slots, not a
    full rank-four action. Fast triples and doubles do not establish a
@@ -101,6 +103,65 @@ orthogonalization and thick restart with reused images. Replacing that
 machinery is lower priority than action and projector costs.
 
 ## Evidence
+
+### Compiled rank-four slot program (November 17)
+
+`itercc/_spin_quadruples_program.py` records the rank-four slots once and
+runs every raw tile of an action in the compiled core (`itercc_triplet_slots`,
+core ABI 28). A tile kind (projection group and raw spin pattern) is
+recorded with its occupied tuple symbolic: dense operands at offsets affine
+in the tuple, packed T4 rows from the hole tables, intermediates keyed by
+their expression, plans per irrep pattern. A slot class (hole spins, particle
+spin groups, repeated occupied indices) fixes a slot's tiles, so the core
+expands each slot from its class. Every tile runs on one thread with the
+single-threaded contraction routes; intermediates are shared between tiles
+through a cache with one producer per key; each tile's gathers go to partial
+sums that the slot adds in the loop's order. The products into a tile with
+equal output offset tables (same partition of the tile's virtual indices)
+run as one fused GEMM per output block after the tile's intermediates, so
+the tile is read and written once per block instead of once per product.
+`ITERCC_TRIPLET_FUSED=0` runs them one by one in place, which gives the
+loop's action bit for bit; fused, the action agrees with it to about 3e-16
+(relative). Either way the result does not depend on the thread count.
+`ITERCC_TRIPLET_PROGRAM=0` runs the loop and `ITERCC_SLOT_PROFILE=1` times
+the program's phases.
+
+Water, 12 desktop threads, one model and ground state, the same random
+direction (seconds per action after the first; every column uses the tile
+trees below):
+
+| Basis | Slot loop | Compiled, unfused | Compiled, fused | First action (fused, with recording) |
+| --- | ---: | ---: | ---: | ---: |
+| 6-31G | 8.29 | 0.49 | 0.47 | 1.95 |
+| cc-pVDZ | 26.41 | 4.91 | 4.04-4.32 | 5.80 |
+
+Unfused output equals the loop's bit for bit; fused differs by at most
+2.5e-16 relative. Before the tree change below the compiled cc-pVDZ action
+took 5.2 s. In the fused cc-pVDZ action the slots take 2.2-2.5 s, the direct
+packed terms 1.1 s and ranks one to three 0.6 s. On one thread the slots take
+13.1 s (products into tiles 7.6 s, intermediates 1.9 s, gathers 0.6 s); on 12
+threads the products cost 2.3x their single-thread time, as the two memory
+channels saturate.
+
+Tile trees: `contraction_schedule` used to pick the tree with the smallest
+peak intermediate. It now counts an intermediate's multiply-adds once per
+tiles that share it (no**(fixed occupied letters it does not read)), among
+trees whose largest intermediate stays within a tile (nv**4). Two diagrams
+change. goovv t2 t4 (`mnef,aeij,bcdfklmn`) contracts g with T4 first, an
+intermediate per (k, l) shared through the cache, instead of a packed-T4
+product per tile: on one thread its 7,038 products took 9.4 s, now 432
+intermediates take 0.64 s. gvovv t2 t3 (`amef,beij,cdfklm`) likewise. Summed
+over the diagrams, amortized multiply-adds per tile fall 2.0x at water size
+and 6.6x at CuF size. The loop and the program share the trees; against the
+old trees the action changes at round-off. Without `intermediate_cache_gib`
+the program's cache gets half of what the memory budget leaves beside the
+engine's estimate (at least 256 MiB): with 256 MiB the cc-pVDZ slots took
+4.9 s instead of 2.7 s (unfused).
+
+The CuF layout has 14,235 slots with about 445 tiles each (6.3 million tiles
+per action) and up to 10 million partial sums (79 MB) per slot; slots run in
+waves of at most 256 MiB of partial sums. The program has not been measured
+on CuF yet.
 
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 

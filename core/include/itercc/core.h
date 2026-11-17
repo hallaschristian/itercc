@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 27
+#define ITERCC_CORE_ABI 28
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -544,6 +544,125 @@ void itercc_quad_tie(double *dense, const int64_t *slots, int64_t count, int64_t
 void itercc_quad_spin(const double *source, double *target, int64_t nslots, int64_t nv,
                       int64_t rank, int64_t nterms, const int64_t *perms, const double *weights,
                       double alpha, double divisor, double beta, int threads);
+
+/* Rank-four slot programs of the triplet EOM-CCSDTQ action, recorded by
+ * itercc/_spin_quadruples_program.py. Every field is eight bytes wide.
+ *
+ * An operand is a dense base (bases[index] at the element offset coef[0] +
+ * coef[1] f0 + .. + coef[4] f3 for the tile's occupied tuple f), packed T4
+ * rows (descriptor `index`, only as the second operand), an intermediate of
+ * the tile (number `index`) or the tile (offset coef[0]). */
+typedef struct {
+    int64_t kind;        /* 0 dense, 1 packed T4 rows, 2 intermediate, 3 tile */
+    int64_t index;
+    int64_t coef[5];
+} itercc_slot_operand;
+
+/* op 0 contracts out += alpha a b by the kind's contraction `plan` (an
+ * intermediate output is a fresh zeroed buffer); op 1 looks intermediate
+ * `inter` up (known: continue at instruction `next`); op 2 publishes it. */
+typedef struct {
+    int64_t op, inter, next, plan;
+    itercc_slot_operand a, b, out;
+    const int64_t *a_rows, *a_sum, *b_sum, *b_cols, *rpos, *cpos;
+    int64_t flags;
+    double alpha;
+} itercc_slot_instruction;
+
+/* An intermediate: expression `key`, `size` elements, and the positions in the
+ * tile's occupied tuple of the nvars indices its value depends on. */
+typedef struct {
+    int64_t key, size, nvars, positions[4];
+} itercc_slot_intermediate;
+
+/* Packed T4 rows (ground T4 for which = 0, the direction for 1): rows over the
+ * four hole letters in C order, letter k at occupied index fixed[k] of the
+ * tile (fixed[k] >= 0) or over start[k] .. + count[k], with hole spin
+ * spins[k]; `pointers` holds the signed map address of every sector. */
+typedef struct {
+    int64_t which, spins[4], fixed[4], start[4], count[4];
+    const int64_t *pointers;
+} itercc_slot_rows;
+
+/* A slot class's tile: its kind, the positions in the slot's occupied tuple
+ * of the tile's occupied indices, and its gathers parts[part_start ..
+ * + part_count]. A gather adds, for each row r of the slot's spin group
+ * `group` (rows and four virtual coordinates c), sum_t weights[t]
+ * tile[c . offsets[t]] over the terms of `terms` to the slot's row rows[r]. */
+typedef struct {
+    int64_t kind, positions[4], part_start, part_count;
+} itercc_slot_template;
+
+typedef struct {
+    int64_t group, terms;
+} itercc_slot_part;
+
+typedef struct {
+    const int64_t *offsets;   /* four tile strides per term */
+    const double *weights;
+    int64_t count;
+} itercc_slot_terms;
+
+typedef struct {
+    const int64_t *rows;          /* rows within the slot */
+    const int32_t *coordinates;   /* four virtual indices per row */
+    int64_t count;
+} itercc_slot_group;
+
+/* A slot: class, particle key (its spin groups start at key_group_start[key]),
+ * rows start .. + length of the result and occupied tuple. */
+typedef struct {
+    int64_t cls, key, start, length, occupied[4];
+} itercc_slot_info;
+
+typedef struct {
+    int64_t nv, holes, nirrep;   /* virtual orbitals; spin-orbital occupied orbitals; irreps */
+    const int64_t *kind_start, *kind_count, *inter_start, *inter_count;
+    const itercc_slot_instruction *instructions;
+    const itercc_slot_intermediate *intermediates;
+    const itercc_slot_rows *rows;
+    /* plan set p: block tables plan_table[plan_start[p] + c] (addresses) with
+     * plan_count[..] blocks for contraction c of its kind; plan_id[kind *
+     * nirrep^4 + code] is the plan set of a kind for the irrep pattern code
+     * ((g0 nirrep + g1) nirrep + g2) nirrep + g3 of a tile's occupied tuple. */
+    const int64_t *plan_start, *plan_table, *plan_count, *plan_id;
+    const int64_t *ground_bases;
+    const int32_t *ground_keys;
+    const int64_t *direction_bases;
+    const int32_t *direction_keys;
+    const int64_t *occupied_irreps;
+    const int64_t *class_start, *class_count;   /* tiles of a class: templates[class_start ..] */
+    const itercc_slot_template *templates;
+    const itercc_slot_part *parts;
+    const itercc_slot_terms *terms;
+    const int64_t *key_group_start;
+    const itercc_slot_group *groups;
+    const itercc_slot_info *slots;
+    /* Fusion groups of kind k: fuse_groups[fuse_start[k] .. + fuse_count[k]],
+     * each (first, count) of fuse_members (instruction numbers within the
+     * kind): products into the tile with equal output offset tables. */
+    const int64_t *fuse_start, *fuse_count, *fuse_groups, *fuse_members;
+} itercc_slot_program;
+
+/* Slots 0 .. nslots - 1 of `result` (zero on entry), in waves whose partial
+ * sums stay within partial_limit doubles (or one slot): every tile on one
+ * thread, then each slot's rows get its tiles' partial sums in order, divided
+ * by (4!)^2. Intermediates are shared through a cache of cache_bytes; stats
+ * gets its hits, misses and peak bytes. With `fused`, the products of a
+ * fusion group run after the tile's other instructions as fused GEMMs, one
+ * per block of output rows and columns (other sums, so other rounding);
+ * without, every product runs in place, as the Python loop does. The results
+ * do not depend on the thread count. Returns 0, or 1 (nothing done) for a
+ * tile without a plan. */
+int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
+                         const double *const *bases, const double *ground, const double *direction,
+                         double *result, int64_t cache_bytes, int64_t *stats, int threads, int fused);
+/* Diagnostic thread seconds of itercc_triplet_slots by phase (with
+ * ITERCC_SLOT_PROFILE=1): zeroing, products into tiles, into intermediates,
+ * packed row setup, gathers, cache lookups and waits, slot sums. */
+void itercc_triplet_profile(double *seconds, int reset);
+/* ... and by contraction (the contraction number of each instruction). */
+void itercc_triplet_contraction_profile(int64_t count, double *seconds, int64_t *calls, int reset);
 
 #ifdef __cplusplus
 }
