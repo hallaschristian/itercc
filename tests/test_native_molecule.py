@@ -66,3 +66,27 @@ def test_low_symmetry_and_basis_lookup():
     assert [entry[0] for entry in parsed["H"]] == [0, 1]
     with pytest.raises(FileNotFoundError):
         Molecule(WATER, "no-such-basis")
+
+
+@pytest.mark.parametrize("basis", ["def2-tzvp", "6-311g**"])
+def test_bundled_basis_sets_give_pyscf_energies(basis, monkeypatch):
+    from pathlib import Path
+
+    from pyscf import gto, scf
+
+    import itercc.molecule as molecule
+    from itercc.scf import run
+
+    bundled = Path(molecule.__file__).parent / "basis_sets"
+    monkeypatch.setattr(molecule, "_basis_directories", lambda: [bundled])   # the package's files only
+    mol = molecule.Molecule(WATER, basis)
+    result, _, _ = run(mol, conv_tol=1e-11)
+    reference = scf.RHF(gto.M(atom=WATER, basis=basis, verbose=0)).run(conv_tol=1e-11)
+    assert mol.nao == reference.mol.nao and abs(result.energy - reference.e_tot) < 1e-9
+
+
+def test_effective_core_potentials_are_refused():
+    from itercc.molecule import Molecule
+
+    with pytest.raises(NotImplementedError):
+        Molecule("Rb 0 0 0; H 0 0 2.4", "def2-svp", symmetry=False)

@@ -30,3 +30,11 @@ equations by Yu Jin and Huanchen Zhai. IterCC evaluates them with its own
 packed T4 layout, occupied-tile gather and scatter, spin sums, projectors and
 iteration, on CuPy/CUDA or on the compiled CPU core (`core/`). The spin permutation coefficients were checked against the
 upstream kernels. The installed solver does not import PySCF.
+
+`itercc/basis_sets` holds Gaussian basis sets in NWChem format, copied unchanged
+from the PySCF 2.14.0 distribution (`pyscf/gto/basis`, Apache License 2.0, see
+`LICENSE.pyscf` and `NOTICE.pyscf`), which took them from the Basis Set
+Exchange (https://www.basissetexchange.org). Each file's header lists the
+original publication of every element's basis; please cite those, and
+B. P. Pritchard, D. Altarawy, B. Didier, T. D. Gibson and T. L. Windus,
+J. Chem. Inf. Model. 59, 4814 (2019), for the Basis Set Exchange.

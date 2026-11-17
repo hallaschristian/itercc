@@ -3,9 +3,12 @@
 ## Unreleased
 
 - A calculation can now run without PySCF: `itercc.molecule.Molecule`
-  (geometry, NWChem-format basis sets from `ITERCC_BASIS_PATH` or an
-  installed PySCF's data files, Abelian point group and symmetry-adapted
-  basis from `itercc.symmetry`), the package's own Gaussian integrals
+  (geometry; NWChem-format basis sets from `ITERCC_BASIS_PATH`, the bundled
+  `itercc/basis_sets` (STO-3G, Pople 3-21G to 6-311G**, cc-pVXZ and
+  aug-cc-pVXZ up to 5Z, def2-SVP to QZVPP; about 2 MB, from PySCF's Basis Set
+  Exchange files, see THIRD_PARTY.md) or an installed PySCF's data files;
+  elements that need an effective core potential are refused; Abelian point
+  group and symmetry-adapted basis from `itercc.symmetry`), the package's own Gaussian integrals
   (`itercc.integrals`: overlap, kinetic, nuclear attraction, dipole and
   8-fold packed ERIs by McMurchie-Davidson in the core, libcint's
   conventions, equal to libcint to 1e-13 through g functions), native

@@ -9,3 +9,4 @@ prune core/build
 recursive-include tests *.py
 recursive-include tools *.py
 global-exclude *.py[cod]
+recursive-include itercc/basis_sets *.dat

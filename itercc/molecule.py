@@ -2,8 +2,11 @@
 basis sets read from NWChem-format files, and Abelian point-group symmetry.
 
 Basis sets are read by name from `ITERCC_BASIS_PATH` (directories of
-NWChem-format files, separated like PATH), then from the basis-set data an
-installed PySCF carries (its files only; no PySCF code runs).
+NWChem-format files, separated like PATH), then from the sets bundled in
+`itercc/basis_sets` (STO-3G, Pople, cc-pVXZ, aug-cc-pVXZ, def2; see
+THIRD_PARTY.md), then from the basis-set data of an installed PySCF (its files
+only; no PySCF code runs). Effective core potentials are not supported: an
+element whose basis comes with one is refused.
 """
 import os
 from pathlib import Path
@@ -30,16 +33,35 @@ def _normalize_name(name):
     return "".join(c for c in name.lower().replace("*", "s") if c not in " -_(),")
 
 
+class BasisSet(dict):
+    """{element symbol: [(l, exponents, coefficient columns)]}; `ecp`: the
+    elements the file gives an effective core potential."""
+    ecp = frozenset()
+
+
 def parse_nwchem(text):
-    """{element symbol: [(l, exponents, coefficient columns)]} from NWChem
-    basis-set text; SP blocks give an S and a P entry."""
+    """`BasisSet` from NWChem basis-set text; SP blocks give an S and a P
+    entry. ECP sections are skipped, their elements recorded."""
     out = {}
     current = None
+    section = None
+    ecp = set()
     for raw in text.splitlines():
         line = raw.split("#")[0].strip()
-        if not line or line.upper().startswith(("BASIS", "END")):
+        if not line:
+            continue
+        word = line.split()[0].upper()
+        if word in ("BASIS", "ECP", "SO"):
+            section, current = word, None
+            continue
+        if word == "END":
+            section, current = None, None
             continue
         parts = line.split()
+        if section in ("ECP", "SO"):
+            if parts[0][0].isalpha():
+                ecp.add(parts[0].capitalize())
+            continue
         if parts[0][0].isalpha():
             symbol, kind = parts[0].capitalize(), parts[1].upper()
             current = (symbol, kind, [])
@@ -59,11 +81,14 @@ def parse_nwchem(text):
             else:
                 entries.append((_ANGULAR[kind], data[:, 0], data[:, 1:]))
         result[symbol] = entries
-    return result
+    parsed = BasisSet(result)
+    parsed.ecp = frozenset(ecp)
+    return parsed
 
 
 def _basis_directories():
     dirs = [Path(p) for p in os.environ.get("ITERCC_BASIS_PATH", "").split(os.pathsep) if p]
+    dirs.append(Path(__file__).resolve().parent / "basis_sets")
     try:
         import importlib.util
 
@@ -143,6 +168,9 @@ class Molecule:
                 tables[name] = load_basis(name)
             if symbol not in tables[name]:
                 raise ValueError(f"basis {name!r} has no entry for {symbol}")
+            if symbol in tables[name].ecp:
+                raise NotImplementedError(f"basis {name!r} gives {symbol} an effective core potential, "
+                                          "which IterCC does not support")
             for l, exps, columns in tables[name][symbol]:
                 for k in range(columns.shape[1]):
                     keep = columns[:, k] != 0.0

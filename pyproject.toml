@@ -42,8 +42,9 @@ packages = ["itercc"]
 version = { attr = "itercc.__version__" }
 
 [tool.setuptools.package-data]
-# Core libraries installed into itercc/ by CMake (see README, core/build_levels.sh).
-itercc = ["libitercc_*.so"]
+# Core libraries installed into itercc/ by CMake (see README, core/build_levels.sh),
+# and the bundled basis sets (NWChem format, see THIRD_PARTY.md).
+itercc = ["libitercc_*.so", "basis_sets/*.dat"]
 
 [tool.setuptools.exclude-package-data]
 # Machine-specific builds run from core/build or an explicit ITERCC_CORE_DIR.
