@@ -4,7 +4,9 @@
 
 - Faster triplet EOM-CCSDTQ actions on the CPU (packed spin, occupied
   tiles): water cc-pVDZ on 12 threads takes 26.5 s per action instead of
-  47 s, with the same action bit for bit.
+  47 s, with the same action bit for bit. A 16-slot CuF quadruples sample
+  on 56 cores takes 35.5 s instead of 63.2 s; see docs/triplet-cpu-audit.md.
+  Automatic occupied slab width is now the fastest setting on both systems.
   The blocked GEMMs now read packed T4 in place. A T4 operand is passed as
   `SignedRows` (the signed rows of `signed_gather_rows`, described by the
   shape and strides of the dense tile), and `itercc_sym_contract_packed`

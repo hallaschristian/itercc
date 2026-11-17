@@ -102,6 +102,28 @@ machinery is lower priority than action and projector costs.
 
 ## Evidence
 
+### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
+
+The blocked GEMMs now read packed T4 in place: a T4 operand is `SignedRows`
+and `itercc_sym_contract_packed` gathers each piece of B a route needs into
+its own scratch, so no dense T4 slab is expanded. The same 16-slot
+general-input quadruples sample was run on the full CuF checkpoint with
+three fresh workers in one 56-core Sapphire Rapids allocation (128 GiB, 8 GiB
+intermediate cache, profiling on):
+
+| Source and occupied slab | Seconds | Speedup | Peak RSS (GiB) | Output against the first row |
+| --- | ---: | ---: | ---: | --- |
+| Dense expansion `889eef3`, width 2 | 63.17 | 1.00x | 75.81 | — |
+| Packed rows `42cc1e4`, width 2 | 41.49 | 1.52x | 75.71 | bitwise equal |
+| Packed rows `42cc1e4`, automatic width | 35.48 | 1.78x | 75.51 | max abs 8.7e-19 |
+
+The first row repeats the 63.05 s width-2 result below, so the allocations
+are comparable. Without the dense slab, automatic (byte-budget) width is the
+fastest setting here, as it is on water cc-pVDZ (12 desktop threads, full
+action: 25.9 s automatic, 28.4 s width 2, 36.9 s width 1). The width-2
+recommendation below holds only for sources before `0afcdff`. These are
+component timings of 16 slots, not the 14,235-slot action.
+
 ### CuF slab-width validation (November 17, latest CPU kernels)
 
 The `889eef3` update is numerically valid on the full 26-electron/29-virtual
