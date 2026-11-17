@@ -72,33 +72,42 @@ class PackedSpinQuadruples:
         self._virtual_maps[cache_key] = tuple(indices)
         return self._virtual_maps[cache_key]
 
+    def signed_rows(self, vector, signature, cuts, xp):
+        """The occupied tile of `expand` as `SignedRows` (rows not gathered),
+        or None without the compiled core or for a non-NumPy vector."""
+        if not (self.native_expansion and xp is np and isinstance(vector, np.ndarray)
+                and vector.dtype == np.float64 and vector.ndim == 1 and vector.flags.c_contiguous):
+            return None
+        from ._cpu_kernels import library
+        if library() is None:
+            return None
+        from ._tensor_scatter import SignedRows
+        lengths = tuple(len(range(*cut.indices(self.no))) for cut in cuts)
+        bases, maps = [], []
+        for labels in product(*(range(*cut.indices(self.no)) for cut in cuts)):
+            holes = tuple(2 * i + spin for i, spin in zip(labels, signature[4:]))
+            item = self.slots.get(tuple(sorted(holes))) if len(set(holes)) == 4 else None
+            if item is None:
+                bases.append(0)
+                maps.append(None)
+                continue
+            key, window = item
+            cache_key = signature[:4], key
+            if cache_key not in self._cpu_signed_maps:
+                mapping = np.zeros(self.nv**4, dtype=np.int32)
+                for source, positions, sign in self._virtual_map(signature[:4], key, np):
+                    mapping[positions] = sign * (source + 1)
+                self._cpu_signed_maps[cache_key] = mapping
+            bases.append(parity(holes) * (window.start + 1))
+            maps.append(self._cpu_signed_maps[cache_key])
+        return SignedRows(vector, bases, maps, self.nv**4, lengths, (self.nv,) * 4, (4, 5, 6, 7, 0, 1, 2, 3))
+
     def expand(self, vector, signature, cuts, xp):
         """Expand only the occupied tile requested by one contraction."""
         lengths = tuple(len(range(*cut.indices(self.no))) for cut in cuts)
-        if self.native_expansion and xp is np and isinstance(vector, np.ndarray) and vector.dtype == np.float64:
-            from ._cpu_kernels import library
-            if library() is not None:
-                from ._tensor_scatter import signed_gather_rows
-                bases, maps = [], []
-                for labels in product(*(range(*cut.indices(self.no)) for cut in cuts)):
-                    holes = tuple(2 * i + spin for i, spin in zip(labels, signature[4:]))
-                    item = self.slots.get(tuple(sorted(holes))) if len(set(holes)) == 4 else None
-                    if item is None:
-                        bases.append(0)
-                        maps.append(None)
-                        continue
-                    key, window = item
-                    cache_key = signature[:4], key
-                    if cache_key not in self._cpu_signed_maps:
-                        mapping = np.zeros(self.nv**4, dtype=np.int32)
-                        for source, positions, sign in self._virtual_map(signature[:4], key, np):
-                            mapping[positions] = sign * (source + 1)
-                        self._cpu_signed_maps[cache_key] = mapping
-                    bases.append(parity(holes) * (window.start + 1))
-                    maps.append(self._cpu_signed_maps[cache_key])
-                output = signed_gather_rows(vector, bases, maps, self.nv**4)
-                if output is not None:
-                    return output.reshape(lengths + (self.nv,) * 4).transpose(4, 5, 6, 7, 0, 1, 2, 3)
+        rows = self.signed_rows(vector, signature, cuts, xp)
+        if rows is not None:
+            return rows.dense()
         output = xp.zeros(lengths + (self.nv**4,), dtype=vector.dtype)
         occupied = (range(*cut.indices(self.no)) for cut in cuts)
         for row, labels in enumerate(product(*occupied)):

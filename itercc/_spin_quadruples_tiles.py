@@ -239,6 +239,10 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
             slabs = _packed_cuts(inputs[t4][4:], tuple((c, s.start, s.stop) for c, s in cuts.items()),
                                  no, nv, max_cache_bytes if occupied_slab else max_cache_bytes // 4,
                                  occupied_slab)
+        # The CPU blocked engine reads packed T4 rows in place: the dense
+        # slab is never written (it was most of an action's memory traffic).
+        packed = (t4 is not None and engine is not None and getattr(engine, "packed_operands", False)
+                  and (len(names) == 2 or compiled_products))
         for derivative in range(len(names)):
             if tangent[names[derivative]] is None:
                 continue
@@ -255,10 +259,11 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                         selector = tuple(selected.get(c, slice(None)) for c in inputs[i])
                         if not callable(block):
                             return block[selector]
-                        key = i == derivative, signatures[i], tuple((s.start, s.stop) for s in selector)
+                        # Packed rows only reach the blocked engine; dense tiles anything.
+                        key = packed, i == derivative, signatures[i], tuple((s.start, s.stop) for s in selector)
                         if key in cache:
                             return cache[key]
-                        tile = block(selector)
+                        tile = block(selector, packed=True) if packed else block(selector)
                         if tile.nbytes <= max_cache_bytes:
                             while cache_bytes + tile.nbytes > max_cache_bytes:
                                 oldest = next(iter(cache))

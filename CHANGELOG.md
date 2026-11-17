@@ -3,17 +3,27 @@
 ## Unreleased
 
 - Faster triplet EOM-CCSDTQ actions on the CPU (packed spin, occupied
-  tiles). A summed occupied axis of an expanded T4 slab is now as wide as a
-  quarter of the tile cache allows, not two slots, so one deeper product
-  replaces several that each read and write the whole output tile. Packed T4
-  rows expand in fixed column chunks with no division per entry, and the rows
-  of a repeated hole are a plain zero fill. The blocked engine keeps each
-  plan's kernel addresses and keys per-tile labels by identity, and an action
-  resolves its thread count once instead of on every kernel call. Water
-  cc-pVDZ on 12 threads: 37 s per action instead of 47 s, with the same
-  results to 13 digits. What remains is mostly memory traffic: one action
-  expands about 112 GiB of dense T4 rows, half of them zero, from 15 GiB of
-  distinct rows.
+  tiles): water cc-pVDZ on 12 threads takes 26.5 s per action instead of
+  47 s, with the same action bit for bit.
+  The blocked GEMMs now read packed T4 in place. A T4 operand is passed as
+  `SignedRows` (the signed rows of `signed_gather_rows`, described by the
+  shape and strides of the dense tile), and `itercc_sym_contract_packed`
+  gathers each piece of B a route needs into its own scratch: GEMM panels of
+  about 512 KB, skinny chunks, and the small and shallow blocks. The dense
+  tile is never written; before, one action wrote and read back about
+  112 GiB of it, half of it zero rows, from 15 GiB of distinct rows.
+  Addresses split into row and entry once per sum and once per column, so no
+  entry needs a division. Core ABI 27.
+  A summed occupied axis of a T4 slab is now as wide as a quarter of the tile
+  cache allows, not two slots, so one deeper product replaces several that
+  each read and write the whole output tile. Dense expansion (GPU, fallbacks)
+  works in fixed column chunks, and the rows of a repeated hole are a plain
+  zero fill. The blocked engine keeps each plan's kernel addresses and keys
+  per-tile labels by identity. An action also resolves its thread count once
+  instead of on every kernel call.
+  What remains is about 16 s of small GEMMs, most of them shallow ones
+  (summing over one occupied index) that are limited by writing their output
+  tile, plus about 10 s of Python scheduling the tiles.
 - A calculation can now run without PySCF: `itercc.molecule.Molecule`
   (geometry; NWChem-format basis sets from `ITERCC_BASIS_PATH`, the bundled
   `itercc/basis_sets` (STO-3G, Pople 3-21G to 6-311G**, cc-pVXZ and

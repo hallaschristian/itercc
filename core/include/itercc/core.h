@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 26
+#define ITERCC_CORE_ABI 27
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -235,6 +235,16 @@ int itercc_sym_contract(int64_t nblocks, const int64_t *table, const double *a, 
                         double *out, const int64_t *a_rows, const int64_t *a_sum,
                         const int64_t *b_sum, const int64_t *b_cols, const int64_t *rpos,
                         const int64_t *cpos, double alpha, int flags, int threads);
+
+/* itercc_sym_contract with b given as the signed rows of itercc_signed_gather_rows
+ * (rows of `width` entries; b's offsets address that dense row-major layout),
+ * read in place: the same results as gathering b first and contracting. */
+int itercc_sym_contract_packed(int64_t nblocks, const int64_t *table, const double *a,
+                               const double *source, const int64_t *bases, const int64_t *maps,
+                               int64_t width, double *out, const int64_t *a_rows,
+                               const int64_t *a_sum, const int64_t *b_sum, const int64_t *b_cols,
+                               const int64_t *rpos, const int64_t *cpos, double alpha, int flags,
+                               int threads);
 
 /* Symmetry-packed restricted T4 (QuadruplesLayout of itercc/_quadruples_cuda.py):
  * virtual irreps virr, local index vloc and irrep sizes vsize (int32), block

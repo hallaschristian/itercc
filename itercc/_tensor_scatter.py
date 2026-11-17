@@ -43,6 +43,44 @@ def signed_gather_rows(vector, bases, maps, width, *, threads=None):
     return output
 
 
+class SignedRows:
+    """A float64 tensor kept as the signed rows of `signed_gather_rows`.
+
+    Row r of `width` entries reads `vector` through `maps[r]` from base
+    `bases[r]` (zero: a zero row). The rows form a row-major array of shape
+    `lengths + entry_shape`; `shape` and `strides` describe that array with its
+    axes permuted by `axes`, as if it existed. The CPU symmetry-blocked engine
+    reads the rows in place (`itercc_sym_contract_packed`); `dense()` gathers
+    them. Maps are layout-owned int32 arrays (see `signed_gather_rows`).
+    """
+    dtype = np.dtype(np.float64)
+
+    def __init__(self, vector, bases, maps, width, lengths, entry_shape, axes):
+        self.vector = vector
+        self.bases = np.ascontiguousarray(bases, dtype=np.int64)
+        self.maps = maps
+        self.width = int(width)
+        self.pointers = np.asarray([0 if m is None else m.ctypes.data for m in maps], dtype=np.int64)
+        layout = tuple(lengths) + tuple(entry_shape)
+        if prod(entry_shape) != self.width or prod(lengths) != len(self.bases):
+            raise ValueError("Signed rows do not match their dense shape")
+        steps = [8] * len(layout)
+        for i in range(len(layout) - 2, -1, -1):
+            steps[i] = steps[i + 1] * layout[i + 1]
+        self._layout, self._axes = layout, tuple(axes)
+        self.shape = tuple(layout[a] for a in axes)
+        self.strides = tuple(steps[a] for a in axes)
+        self.ndim = len(self.shape)
+        self.nbytes = self.bases.nbytes + self.pointers.nbytes
+
+    def dense(self):
+        """The tensor itself (gathered on the compiled core)."""
+        rows = signed_gather_rows(self.vector, self.bases, self.maps, self.width)
+        if rows is None:
+            raise RuntimeError("Signed rows need the compiled core")
+        return rows.reshape(self._layout).transpose(self._axes)
+
+
 @lru_cache(maxsize=256)
 def _gather_steps(terms, strides):
     offsets = np.zeros((len(terms), len(strides)), dtype=np.int64)

@@ -142,6 +142,54 @@ bool skinny(const Block &g)
 
 enum class Route { loops, shallow, gemm };
 
+// B entries base + ks[k] + cs[c] (k < n, c < m) of packed rows into
+// dst[k * ldk + c * ldc]. Addresses split into (row, entry) once per sum and
+// once per column, never per entry: each offset is a sum of letter strides,
+// those of occupied letters multiples of the row width, so the two parts add
+// without carry. The values equal those of itercc_signed_gather_rows.
+void packed_gather(const itercc::PackedRows &v, i64 base, const i64 *ks, i64 n, const i64 *cs, i64 m,
+                   i64 ldk, i64 ldc, double *dst)
+{
+    thread_local std::vector<i64> col_row, col_entry;
+    col_row.resize(size_t(m));
+    col_entry.resize(size_t(m));
+    bool one_row = true;
+    for (i64 c = 0; c < m; ++c) {
+        col_row[size_t(c)] = cs[c] / v.width;
+        col_entry[size_t(c)] = cs[c] - col_row[size_t(c)] * v.width;
+        one_row = one_row && col_row[size_t(c)] == 0;
+    }
+    const i64 *entries = col_entry.data();
+    auto value = [&](i64 row, i64 entry) {
+        const i64 b = v.bases[row];
+        if (!b) return 0.;
+        const int32_t index = reinterpret_cast<const int32_t *>(static_cast<intptr_t>(v.maps[row]))[entry];
+        const double *from = v.source + ((b < 0 ? -b : b) - 1);
+        const double sign = b < 0 ? -1. : 1.;
+        return index > 0 ? sign * from[index - 1] : index < 0 ? -sign * from[-int64_t(index) - 1] : 0.;
+    };
+    for (i64 k = 0; k < n; ++k) {
+        const i64 address = base + ks[k], row = address / v.width, entry = address - row * v.width;
+        double *d = dst + k * ldk;
+        if (!one_row) {
+            for (i64 c = 0; c < m; ++c) d[c * ldc] = value(row + col_row[size_t(c)], entry + entries[c]);
+            continue;
+        }
+        const i64 b = v.bases[row];
+        if (!b) {
+            for (i64 c = 0; c < m; ++c) d[c * ldc] = 0.;
+            continue;
+        }
+        const int32_t *map = reinterpret_cast<const int32_t *>(static_cast<intptr_t>(v.maps[row])) + entry;
+        const double *from = v.source + ((b < 0 ? -b : b) - 1);
+        const double sign = b < 0 ? -1. : 1.;
+        for (i64 c = 0; c < m; ++c) {
+            const int32_t index = map[entries[c]];
+            d[c * ldc] = index > 0 ? sign * from[index - 1] : index < 0 ? -sign * from[-int64_t(index) - 1] : 0.;
+        }
+    }
+}
+
 Route route(const Block &g)
 {
     if (g.work() < kNaive) return Route::loops;
@@ -188,6 +236,11 @@ void gather_a(const Plan &p, const Block &g, i64 k1, i64 k2, bool k_major, doubl
 void gather_b(const Plan &p, const Block &g, i64 k1, i64 k2, bool c_major, double *dst)
 {
     const i64 n = k2 - k1, cols = g.cols;
+    if (p.packed_b != nullptr) {
+        packed_gather(*p.packed_b, g.b_base, p.b_sum + g.k0 + k1, n, p.b_cols + g.c0, cols,
+                      c_major ? 1 : cols, c_major ? n : 1, dst);
+        return;
+    }
     const double *base = p.b + g.b_base;
     const i64 *cs = p.b_cols + g.c0, *ks = p.b_sum + g.k0 + k1;
     if (c_major) {
@@ -260,6 +313,46 @@ void shallow_block(const Plan &p, const Block &g)
     }
 }
 
+// The indirect GEMM of block g over sums [k1, k2) with B from packed rows: B
+// is gathered in panels of columns (about 512 KB, in cache) and each panel is
+// one indirect GEMM over all the sums, so every output entry gets the same sum
+// in the same order as from a dense B. `swap` runs out^T = B^T A^T (as
+// gemm_view does when out's rows are faster); c, cr, cc place the output.
+constexpr i64 kPanel = i64(1) << 16;
+
+void packed_indirect(const Plan &p, const Block &g, i64 k1, i64 k2, bool swap, double *c,
+                     const i64 *cr, const i64 *cc, double alpha)
+{
+    const i64 depth = k2 - k1;
+    if (depth <= 0 || g.rows <= 0 || g.cols <= 0) return;
+    const i64 width = std::min(g.cols, std::max<i64>(64, kPanel / depth));
+    double *panel = scratch(6).get(size_t(depth * width));
+    thread_local std::vector<i64> ks, cs;
+    ks.resize(size_t(depth));
+    cs.resize(size_t(width));
+    for (i64 j = 0; j < width; ++j) cs[size_t(j)] = j;
+    for (i64 c1 = 0; c1 < g.cols; c1 += width) {
+        const i64 m = std::min(width, g.cols - c1);
+        packed_gather(*p.packed_b, g.b_base, p.b_sum + g.k0 + k1, depth, p.b_cols + g.c0 + c1, m, m, 1, panel);
+        for (i64 k = 0; k < depth; ++k) ks[size_t(k)] = k * m;
+        if (!swap)
+            itercc::indirect_gemm({g.rows, m, depth, p.a + g.a_base, p.a_rows + g.r0, p.a_sum + g.k0 + k1,
+                                   p.a_k_major, panel, ks.data(), cs.data(), false, c, cr, cc + c1, alpha});
+        else
+            itercc::indirect_gemm({m, g.rows, depth, panel, cs.data(), ks.data(), true, p.a + g.a_base,
+                                   p.a_sum + g.k0 + k1, p.a_rows + g.r0, !p.a_k_major, c, cc + c1, cr, alpha});
+    }
+}
+
+// The GEMM route of one block or task.
+void gemm_block(const Plan &p, const Block &g)
+{
+    if (p.packed_b != nullptr)
+        packed_indirect(p, g, 0, g.depth, p.r_fast, p.out + g.o_base, p.rpos + g.r0, p.cpos + g.c0, p.alpha);
+    else
+        itercc::indirect_gemm(gemm_view(p, g));
+}
+
 // A block with a small output and a deep sum: slices of the sum in parallel
 // (indirect GEMMs into dense partial products), added in order into `out`.
 void split_block(const Plan &p, const Block &g, i64 parts, int threads)
@@ -275,6 +368,10 @@ void split_block(const Plan &p, const Block &g, i64 parts, int threads)
 #pragma omp for schedule(dynamic, 1)
         for (i64 s = 0; s < parts; ++s) {
             const i64 k1 = g.depth * s / parts, k2 = g.depth * (s + 1) / parts;
+            if (p.packed_b != nullptr) {
+                packed_indirect(p, g, k1, k2, false, partial + s * size, row_at.data(), col_at.data(), 1.0);
+                continue;
+            }
             itercc::indirect_gemm({g.rows, g.cols, k2 - k1,
                                    p.a + g.a_base, p.a_rows + g.r0, p.a_sum + g.k0 + k1, p.a_k_major,
                                    p.b + g.b_base, p.b_sum + g.k0 + k1, p.b_cols + g.c0, p.b_c_major,
@@ -299,16 +396,25 @@ struct Skinny {
     const double *small, *big;
     const i64 *small_short, *small_sum, *big_sum, *big_long, *pos_short, *pos_long;
     i64 nshort, nlong, depth, o_base;
+    const itercc::PackedRows *small_packed, *big_packed;   // B from packed rows (with b_base)
+    i64 b_base;
 };
 
 Skinny skinny_view(const Plan &p, const Block &g)
 {
+    const double *b = p.packed_b != nullptr ? nullptr : p.b + g.b_base;
     if (g.rows <= g.cols)
-        return Skinny{p.a + g.a_base, p.b + g.b_base, p.a_rows + g.r0, p.a_sum + g.k0, p.b_sum + g.k0,
-                      p.b_cols + g.c0, p.rpos + g.r0, p.cpos + g.c0, g.rows, g.cols, g.depth, g.o_base};
-    return Skinny{p.b + g.b_base, p.a + g.a_base, p.b_cols + g.c0, p.b_sum + g.k0, p.a_sum + g.k0,
-                  p.a_rows + g.r0, p.cpos + g.c0, p.rpos + g.r0, g.cols, g.rows, g.depth, g.o_base};
+        return Skinny{p.a + g.a_base, b, p.a_rows + g.r0, p.a_sum + g.k0, p.b_sum + g.k0,
+                      p.b_cols + g.c0, p.rpos + g.r0, p.cpos + g.c0, g.rows, g.cols, g.depth, g.o_base,
+                      nullptr, p.packed_b, g.b_base};
+    return Skinny{b, p.a + g.a_base, p.b_cols + g.c0, p.b_sum + g.k0, p.a_sum + g.k0,
+                  p.a_rows + g.r0, p.cpos + g.c0, p.rpos + g.r0, g.cols, g.rows, g.depth, g.o_base,
+                  p.packed_b, nullptr, g.b_base};
 }
+
+// Entries of the `line` buffer a skinny chunk needs: one line, or with a
+// packed long operand all its lines, gathered at once.
+i64 skinny_line(const Skinny &s) { return s.big_packed != nullptr ? s.depth * kChunk : kChunk; }
 
 // Long-side entries [l1, l2) of a skinny block, one sum index at a time over a
 // line of long entries (the lines of later sums are then in cache, whatever
@@ -317,17 +423,26 @@ Skinny skinny_view(const Plan &p, const Block &g)
 void skinny_chunk(const Plan &p, const Skinny &s, i64 l1, i64 l2, double *small, double *line, double *acc)
 {
     const i64 n = l2 - l1, ns = s.nshort, depth = s.depth;
-    for (i64 i = 0; i < ns; ++i)
-        for (i64 k = 0; k < depth; ++k) small[i * depth + k] = s.small[s.small_short[i] + s.small_sum[k]];
+    if (s.small_packed != nullptr)
+        packed_gather(*s.small_packed, s.b_base, s.small_sum, depth, s.small_short, ns, 1, depth, small);
+    else
+        for (i64 i = 0; i < ns; ++i)
+            for (i64 k = 0; k < depth; ++k) small[i * depth + k] = s.small[s.small_short[i] + s.small_sum[k]];
     std::fill(acc, acc + ns * n, 0.0);
     const i64 *longs = s.big_long + l1;
+    if (s.big_packed != nullptr)
+        packed_gather(*s.big_packed, s.b_base, s.big_sum, depth, longs, n, n, 1, line);
     for (i64 k = 0; k < depth; ++k) {
-        const double *src = s.big + s.big_sum[k];
-        for (i64 l = 0; l < n; ++l) line[l] = src[longs[l]];
+        const double *row = line + k * n;     // packed: every line gathered above
+        if (s.big_packed == nullptr) {
+            const double *src = s.big + s.big_sum[k];
+            for (i64 l = 0; l < n; ++l) line[l] = src[longs[l]];
+            row = line;
+        }
         for (i64 i = 0; i < ns; ++i) {
             const double value = small[i * depth + k];
             double *ai = acc + i * n;
-            for (i64 l = 0; l < n; ++l) ai[l] += value * line[l];
+            for (i64 l = 0; l < n; ++l) ai[l] += value * row[l];
         }
     }
     double *base = p.out + s.o_base;
@@ -364,7 +479,7 @@ void contract_serial(const ContractPlan &p, const int64_t *table, int64_t nblock
         if (skinny(block)) {
             const Skinny s = skinny_view(p, block);
             double *small = scratch(0).get(size_t(s.nshort * s.depth));
-            double *line = scratch(2).get(size_t(kChunk));
+            double *line = scratch(2).get(size_t(skinny_line(s)));
             double *acc = scratch(1).get(size_t(s.nshort * kChunk));
             for (i64 l = 0; l < s.nlong; l += kChunk)
                 skinny_chunk(p, s, l, std::min(s.nlong, l + kChunk), small, line, acc);
@@ -378,7 +493,7 @@ void contract_serial(const ContractPlan &p, const int64_t *table, int64_t nblock
             shallow_block(p, block);
             break;
         case Route::gemm:
-            indirect_gemm(gemm_view(p, block));
+            gemm_block(p, block);
             break;
         }
     }
@@ -411,6 +526,10 @@ extern "C" void itercc_scale(double *x, int64_t n, double beta, int threads)
     PROFILE_ADD(5);
 }
 
+namespace {
+int run_contract(const Plan &p, int64_t nblocks, const int64_t *table, int threads);
+}
+
 extern "C" int itercc_sym_contract(int64_t nblocks, const int64_t *table, const double *a,
                                    const double *b, double *out, const int64_t *a_rows,
                                    const int64_t *a_sum, const int64_t *b_sum,
@@ -420,6 +539,28 @@ extern "C" int itercc_sym_contract(int64_t nblocks, const int64_t *table, const 
     if (nblocks <= 0 || alpha == 0.0) return 0;
     const Plan p{a, b, out, a_rows, a_sum, b_sum, b_cols, rpos, cpos, alpha,
                  (flags & 1) != 0, (flags & 2) != 0, (flags & 4) != 0};
+    return run_contract(p, nblocks, table, threads);
+}
+
+extern "C" int itercc_sym_contract_packed(int64_t nblocks, const int64_t *table, const double *a,
+                                          const double *source, const int64_t *bases,
+                                          const int64_t *maps, int64_t width, double *out,
+                                          const int64_t *a_rows, const int64_t *a_sum,
+                                          const int64_t *b_sum, const int64_t *b_cols,
+                                          const int64_t *rpos, const int64_t *cpos, double alpha,
+                                          int flags, int threads)
+{
+    if (nblocks <= 0 || alpha == 0.0) return 0;
+    const itercc::PackedRows rows{source, bases, maps, width};
+    Plan p{a, nullptr, out, a_rows, a_sum, b_sum, b_cols, rpos, cpos, alpha,
+           (flags & 1) != 0, (flags & 2) != 0, (flags & 4) != 0};
+    p.packed_b = &rows;
+    return run_contract(p, nblocks, table, threads);
+}
+
+namespace {
+int run_contract(const Plan &p, int64_t nblocks, const int64_t *table, int threads)
+{
     i64 all = 0;
     for (i64 g = 0; g < nblocks; ++g) all += block_at(table, g).work();
     static const i64 parallel_work = tuned("ITERCC_SYM_PARALLEL_WORK", kParallelWork);
@@ -452,7 +593,7 @@ extern "C" int itercc_sym_contract(int64_t nblocks, const int64_t *table, const 
                 const Skinny s = skinny_view(p, g);
                 const i64 l1 = chunks[size_t(t)].second, l2 = std::min(s.nlong, l1 + kChunk);
                 skinny_chunk(p, s, l1, l2, scratch(0).get(size_t(s.nshort * s.depth)),
-                             scratch(2).get(size_t(kChunk)),
+                             scratch(2).get(size_t(skinny_line(s))),
                              scratch(1).get(size_t(s.nshort * kChunk)));
             }
         }
@@ -513,7 +654,7 @@ extern "C" int itercc_sym_contract(int64_t nblocks, const int64_t *table, const 
             PROFILE_ADD(2);
             break;
         case Route::gemm:
-            itercc::indirect_gemm(gemm_view(p, task.block));
+            gemm_block(p, task.block);
             PROFILE_ADD(1);
             break;
         }
@@ -521,6 +662,7 @@ extern "C" int itercc_sym_contract(int64_t nblocks, const int64_t *table, const 
     PROFILE_ADD(6);
     return 0;
 }
+}  // namespace
 
 extern "C" void itercc_scratch_release(int threads)
 {

@@ -17,6 +17,7 @@ import numpy as np
 
 from . import _cpu_kernels
 from ._cpu_triples import cpu_threads
+from ._tensor_scatter import SignedRows
 from .symmetry_blocks import SymmetryBlocks, _offsets
 
 _COLUMNS = ("a_rows", "a_sum", "b_sum", "b_cols", "rpos", "cpos")
@@ -36,7 +37,11 @@ def numpy_einsum(spec, a, b, out=None, alpha=1.0, beta=0.0):
 
 
 class CpuSymmetryBlocks(SymmetryBlocks):
-    """`SymmetryBlocks` for NumPy arrays (see the module docstring)."""
+    """`SymmetryBlocks` for NumPy arrays (see the module docstring). An
+    operand may also be `SignedRows`: its rows are read in place, never
+    gathered into the dense tensor (packed T4 into the GEMMs)."""
+
+    packed_operands = True
 
     def __init__(self, labels, combinations, nirrep, *, fallback=numpy_einsum, threads=None):
         super().__init__(labels, combinations, nirrep, fallback=fallback)
@@ -65,7 +70,9 @@ class CpuSymmetryBlocks(SymmetryBlocks):
 
     def _supported(self, a, b, out):
         return (self._library is not None and out.flags.writeable
-                and all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in (a, b, out)))
+                and isinstance(a, np.ndarray) and isinstance(b, (np.ndarray, SignedRows))
+                and isinstance(out, np.ndarray)
+                and all(x.dtype == np.float64 for x in (a, b, out)))
 
     def _plan(self, structure, labels, irreps):
         """Block table (rows, cols, depth, r0, c0, k0, a_base, b_base, o_base) for
@@ -134,10 +141,18 @@ class CpuSymmetryBlocks(SymmetryBlocks):
 
     def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0)):
         """out = beta * out + alpha * einsum(spec, a, b) (see `SymmetryBlocks.einsum`)."""
+        if isinstance(a, SignedRows):
+            if isinstance(b, SignedRows):
+                a = a.dense()
+            else:                                 # packed rows are read as the second operand
+                inputs, output = spec.split("->")
+                first, second = inputs.split(",")
+                spec, a, b, irreps = f"{second},{first}->{output}", b, a, (irreps[1], irreps[0])
         structure, plan, arguments = self._entry(spec, a, b, out, labels, irreps)
         if not structure:
             if self.fallback is None:
                 raise ValueError(f"No symmetry-blocked plan for {spec}")
+            b = b.dense() if isinstance(b, SignedRows) else b
             return self.fallback(spec, a, b, out=out, alpha=alpha, beta=beta)
         threads = cpu_threads(self.threads)
         library = self._library
@@ -151,6 +166,11 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         if arguments is None or alpha == 0.0:
             return out
         count, table, a_rows, a_sum, b_sum, b_cols, rpos, cpos, flags = arguments
-        library.sym_contract(count, table, a.ctypes.data, b.ctypes.data, out.ctypes.data,
-                             a_rows, a_sum, b_sum, b_cols, rpos, cpos, float(alpha), flags, threads)
+        if isinstance(b, SignedRows):
+            library.sym_contract_packed(count, table, a.ctypes.data, b.vector.ctypes.data, b.bases.ctypes.data,
+                                        b.pointers.ctypes.data, b.width, out.ctypes.data, a_rows, a_sum,
+                                        b_sum, b_cols, rpos, cpos, float(alpha), flags, threads)
+        else:
+            library.sym_contract(count, table, a.ctypes.data, b.ctypes.data, out.ctypes.data,
+                                 a_rows, a_sum, b_sum, b_cols, rpos, cpos, float(alpha), flags, threads)
         return out

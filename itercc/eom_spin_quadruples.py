@@ -304,7 +304,12 @@ class TripletEOMCCSDTQ:
                 tensors["t4"] = None
                 continue
             def view(signature, layout=layout, vector=vector):
-                def fetch(selector):
+                def fetch(selector, packed=False):
+                    # packed: the tile as signed rows for the CPU blocked engine
+                    if packed and all(s == slice(None) for s in selector[:4]):
+                        rows = layout.signed_rows(vector, signature, selector[4:], xp)
+                        if rows is not None:
+                            return rows
                     return layout.expand(vector, signature, selector[4:], xp)[selector[:4]]
                 return fetch
             tensors["t4"] = {signature: view(signature) for signature in product((0, 1), repeat=8)}

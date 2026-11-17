@@ -29,7 +29,7 @@ struct Scratch {
     }
 };
 
-constexpr int kScratchSlots = 6;   // 0-3 contraction routes, 4-5 tile programs
+constexpr int kScratchSlots = 7;   // 0-3 contraction routes, 4-5 tile programs, 6 packed B panels
 
 // Slot `which` (0 .. kScratchSlots - 1) of the calling thread.
 Scratch &scratch(int which);
