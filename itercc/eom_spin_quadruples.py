@@ -6,8 +6,12 @@ import numpy as np
 
 from ._directional import Directional, dress_direction, product_directions
 from ._spin_quadruples_diagrams import DIAGRAMS
-from ._spin_quadruples_storage import PackedSpinQuadruples, signed_permutations as _permutations
-from ._spin_quadruples_tiles import contract_tile, external_routes, spin_blocks
+from ._spin_quadruples_storage import (
+    PackedSpinProjector, PackedSpinQuadruples,
+)
+from ._tensor_symmetry import signed_permutations as _permutations
+from ._tensor_scatter import unpack_antisymmetric
+from ._spin_quadruples_tiles import contract_tile, external_routes, projection_diagrams, spin_blocks
 from .bounded_einsum import einsum_into
 from .eom import EOMSinglet
 from .hamiltonian import Hamiltonian
@@ -109,6 +113,8 @@ class SpinFlipSpace:
         if packed is not None:
             self.slices.append(slice(self.size, self.size + packed.size))
             self.size += packed.size
+        self._packed_projector = (PackedSpinProjector(packed, xp)
+                                  if packed is not None and packed.size and project_spin else None)
         if not self.size:
             raise ValueError("The requested spin-flip symmetry sector is empty")
         source, target, raised = [], [], {}
@@ -123,15 +129,13 @@ class SpinFlipSpace:
                                                     np.array(target, dtype=np.int32)))
         self._phase = xp.asarray(np.array(phases, dtype=np.float64))[self._source]
 
-    def unpack(self, vector, *, max_rank=4):
+    def unpack(self, vector, *, max_rank=4, nonzero=None):
         for rank, (shape, indices, section) in enumerate(
                 zip(self.shapes[:max_rank], self.indices, self.slices), 1):
-            full = self.xp.zeros(shape, dtype=vector.dtype)
-            values = vector[section]
-            for (p, sp), (h, sh) in product(_permutations(rank), repeat=2):
-                axes = (*p, *(rank + j for j in h))
-                full[tuple(indices[j] for j in axes)] = sp * sh * values
-            yield full
+            if nonzero is not None and not nonzero[rank - 1]:
+                yield None
+                continue
+            yield unpack_antisymmetric(vector[section], indices, shape, xp=self.xp)
 
     def pack(self, tensors):
         return self.xp.concatenate([array[tuple(indices)]
@@ -139,14 +143,18 @@ class SpinFlipSpace:
 
     def project(self, vector):
         # S- S+ has eigenvalues 0, 4, 10 and 18 for S=1..4 at M_S=1.
-        if not self._raised_size:
+        if not self._raised_size and self._packed_projector is None:
             return vector
         xp = self.xp
         vector = vector.copy()
-        for eigenvalue in (4., 10., 18.):
-            raised = xp.zeros(self._raised_size, dtype=vector.dtype)
-            xp.add.at(raised, self._target, self._phase * vector[self._source])
-            xp.add.at(vector, self._source, (-self._phase / eigenvalue) * raised[self._target])
+        if self._raised_size:
+            for eigenvalue in (4., 10., 18.):
+                raised = xp.zeros(self._raised_size, dtype=vector.dtype)
+                xp.add.at(raised, self._target, self._phase * vector[self._source])
+                xp.add.at(vector, self._source, (-self._phase / eigenvalue) * raised[self._target])
+        if self._packed_projector is not None:
+            tail = self.slices[3]
+            vector[tail] = self._packed_projector.project(vector[tail])
         return vector
 
 
@@ -163,8 +171,15 @@ class TripletEOMCCSDTQ:
     method = "ccsdtq"
 
     def __init__(self, solver, amplitudes, orbital_irreps=None, irrep=0, *,
-                 backend="cpu", memory_budget_gib=4, occupied_tiles=False, action_only=False):
+                 backend="cpu", memory_budget_gib=4, occupied_tiles=False, action_only=False,
+                 packed_spin=False, packed_contractions=None, intermediate_cache_gib=0):
         no, nv = solver.nocc, solver.nvir
+        if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
+            raise ValueError("Intermediate cache budget must be finite and nonnegative")
+        self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
+        self._packed_direction = packed_spin or action_only
+        if self._packed_direction and not occupied_tiles:
+            raise ValueError("The packed spin layout requires occupied tiling")
         self.estimated_dense_bytes = 8 * (5 * (4 * no * nv)**4 + 6 * (2 * (no + nv))**4)
         if action_only:
             # The rank-four probe keeps T3 and R3 dense, a bounded virtual
@@ -175,6 +190,7 @@ class TripletEOMCCSDTQ:
         elif occupied_tiles:
             self.estimated_dense_bytes = 8 * (10 * (4 * no * nv)**3 +
                                               4 * no**3 * nv**4 + 6 * (2 * (no + nv))**4)
+        self.estimated_dense_bytes += self.intermediate_cache_bytes
         if self.estimated_dense_bytes > memory_budget_gib * 2**30:
             raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
         ref = solver._reference
@@ -215,26 +231,34 @@ class TripletEOMCCSDTQ:
                 if _cpu_quadruples.available():
                     self._symmetry_engine = _cpu_quadruples.blocked_einsum(by_letter, "ijkl", nirrep)
         self.occupied_tiles = occupied_tiles
+        if packed_contractions is None:
+            from . import _cpu_quadruples
+            packed_contractions = (xp is np and occupied_tiles and self._packed_direction
+                                   and _cpu_quadruples.available())
+        self.packed_contractions = bool(packed_contractions)
+        self._packed_diagrams = {}
+        if self.packed_contractions:
+            from . import _cpu_quadruples
+            if xp is not np or not occupied_tiles or not self._packed_direction or not _cpu_quadruples.available():
+                raise ValueError("Direct packed contractions require the compiled CPU and packed occupied tiles")
+            from ._spin_quadruples_cpu import supported_diagrams
+            self._packed_diagrams = {r: supported_diagrams(r) for r in (2, 3, 4)}
         if occupied_tiles:
             self._ground_t4 = PackedSpinQuadruples(labels[:no], labels[no:], 0, 0)
             self._direction_t4 = PackedSpinQuadruples(labels[:no], labels[no:], irrep, 1)
-        if action_only and not occupied_tiles:
-            raise ValueError("The action-only benchmark requires occupied tiling")
         self.action_only = action_only
+        self._lower_projection = {}
         self.space = SpinFlipSpace(no, nv, labels, irrep, xp,
-                                   packed=self._direction_t4 if action_only else None,
+                                   packed=self._direction_t4 if self._packed_direction else None,
                                    project_spin=not action_only)
         self.amplitudes = _ground_amplitudes(solver, amplitudes, xp,
                                             self._ground_t4 if occupied_tiles else None)
         t1 = self.amplitudes[0]
         self.fock, self.integrals, self.one_body = self.proxy._dressed(t1, one_body=True)
         self.ground_energy = self.proxy.reference_energy + self.proxy._correlation_energy(self.amplitudes)
-        eo, ev = xp.asarray(np.diag(self.proxy.fock)[:2 * no]), xp.asarray(np.diag(self.proxy.fock)[2 * no:])
-        self.diagonal = (None if action_only else xp.concatenate(
-            [sum(ev[x] for x in axes[:rank]) - sum(eo[x] for x in axes[rank:])
-             for rank, axes in enumerate(self.space.indices, 1)]))
+        self.diagonal = None if action_only else self._orbital_diagonal()
         self.matvec_count, self.matvec_seconds = 0, 0.
-        if occupied_tiles and not action_only:
+        if occupied_tiles and not self._packed_direction:
             coordinates = self.space.indices[3]
             self._tiled_r4_order = xp.empty(coordinates.shape[1], dtype=np.int32)
             # The dense reference coordinates are particle-major. The storage
@@ -245,44 +269,81 @@ class TripletEOMCCSDTQ:
                 values = [order[(*p, *holes)] for p in self._direction_t4.groups[key]]
                 self._tiled_r4_order[window] = xp.asarray(values, dtype=np.int32)
 
-    def _tiled_action(self, blocks, rank, packed_direction, *, slot_limit=None):
+    def _orbital_diagonal(self):
+        xp, space = self.xp, self.space
+        occupied, virtual = np.split(np.diag(self.proxy.fock), [2 * self.nocc])
+        eo, ev = xp.asarray(occupied), xp.asarray(virtual)
+        diagonal = xp.empty(space.size)
+        for rank, (axes, part) in enumerate(zip(space.indices, space.slices), 1):
+            diagonal[part] = sum(ev[x] for x in axes[:rank]) - sum(eo[x] for x in axes[rank:])
+        if self._packed_direction:
+            layout = self._direction_t4
+            particle_energy = {key: xp.asarray(virtual[rows].sum(axis=1))
+                               for key, rows in layout.groups.items()}
+            tail = diagonal[space.slices[3]]
+            for holes, (key, part) in layout.slots.items():
+                tail[part] = particle_energy[key] - occupied[list(holes)].sum()
+        return diagonal
+
+    def _tiled_action(self, blocks, rank, packed_direction, *, slot_limit=None, slot_finished=None,
+                      packed_action=None, intermediates=None):
         xp = self.xp
         no, nv = self.nocc, self.nvir
         primal = {name: spin_blocks(pair.value) for name, pair in blocks.items()}
         tangent = {name: spin_blocks(pair.tangent) for name, pair in blocks.items()}
         for tensors, layout, vector in ((primal, self._ground_t4, self.amplitudes[3]),
                                         (tangent, self._direction_t4, packed_direction)):
+            if vector is None:
+                tensors["t4"] = None
+                continue
             def view(signature, layout=layout, vector=vector):
                 def fetch(selector):
                     return layout.expand(vector, signature, selector[4:], xp)[selector[:4]]
                 return fetch
             tensors["t4"] = {signature: view(signature) for signature in product((0, 1), repeat=8)}
         space = self.space
-        if rank == 4 and self.action_only:
+        if rank == 4 and self._packed_direction:
             result = xp.zeros(self._direction_t4.size)
+            spin_groups = {}
+            started = perf_counter() if slot_finished is not None else 0.
+            total = len(self._direction_t4.slots)
             for index, (holes, (key, rows)) in enumerate(self._direction_t4.slots.items()):
                 if slot_limit is not None and index >= slot_limit:
                     break
-                particles = self._direction_t4.groups[key]
-                # A canonical particle list can have several spin signatures.
-                for pspin in product((0, 1), repeat=4):
-                    mask = np.flatnonzero(np.all(particles % 2 == pspin, axis=1))
-                    if not len(mask):
-                        continue
-                    signature = pspin + tuple(h % 2 for h in holes)
-                    result[rows][xp.asarray(mask)] = self._project_tile(
-                        rank, signature, tuple(h // 2 for h in holes),
-                        xp.asarray(particles[mask].T // 2), primal, tangent)
+                if key not in spin_groups:
+                    particles = self._direction_t4.groups[key]
+                    signatures = particles % 2
+                    groups = []
+                    for pspin in product((0, 1), repeat=4):
+                        mask = np.flatnonzero(np.all(signatures == pspin, axis=1))
+                        if mask.size:
+                            groups.append((pspin, xp.asarray(mask), xp.asarray(particles[mask].T // 2)))
+                    spin_groups[key] = groups
+                self._project_packed_tile(result[rows], holes, spin_groups[key], primal, tangent, intermediates)
+                if packed_action is not None:
+                    particles = self._direction_t4.groups[key]
+                    coordinates = np.empty((len(particles), 8), dtype=np.int32)
+                    coordinates[:, :4], coordinates[:, 4:] = particles, holes
+                    packed_action.add(rank, coordinates, result[rows])
+                done = index + 1
+                if slot_finished is not None and (done in (1, 4, 16, total) or done % 64 == 0):
+                    if xp is not np:
+                        xp.cuda.get_current_stream().synchronize()
+                    slot_finished(done, total, perf_counter() - started)
             yield None, result
             return
         indices = space.indices[rank - 1]
         host = indices if xp is np else indices.get()
         if rank < 4:
+            diagrams = tuple(d for d in DIAGRAMS[rank] if d not in self._packed_diagrams.get(rank, ()))
             for raw in product((0, 1), repeat=2 * rank):
                 if sum(raw[rank:]) - sum(raw[:rank]) != 1:
                     continue
                 cuts = (slice(0, no),) * rank
-                yield raw, contract_tile(xp, rank, raw, cuts, primal, tangent, no, nv)
+                yield raw, contract_tile(xp, rank, raw, cuts, primal, tangent, no, nv,
+                                         irrep=space.irrep, labels=self._spatial_labels,
+                                         engine=self._symmetry_engine, diagrams=diagrams,
+                                         intermediates=intermediates, compiled_products=self.packed_contractions)
             return
         groups = {}
         for index, values in enumerate(host.T):
@@ -295,6 +356,67 @@ class TripletEOMCCSDTQ:
             particles = indices[:rank, rows] // 2
             result[rows] = self._project_tile(rank, signature, occupied, particles, primal, tangent)
         yield None, result
+
+    def _project_lower_tiles(self, rank, tiles):
+        """Accumulate antisymmetry directly in canonical coordinates for ranks 2 and 3."""
+        xp = self.xp
+        indices = self.space.indices[rank - 1]
+        if rank not in self._lower_projection:
+            signatures = xp.zeros(indices.shape[1], dtype=xp.uint8)
+            for row in indices:
+                signatures <<= 1
+                signatures |= (row & 1).astype(xp.uint8)
+            by_raw = {}
+            for code in xp.unique(signatures).tolist():
+                bits = tuple((code >> bit) & 1 for bit in reversed(range(2 * rank)))
+                rows = xp.flatnonzero(signatures == code)
+                positions = tuple(indices[:, rows] // 2)
+                for raw, placements in external_routes(rank, bits):
+                    # The raw tile axes are those specified by the external permutation.
+                    by_raw.setdefault(raw, []).append((rows, positions, placements))
+            self._lower_projection[rank] = by_raw
+        by_raw = self._lower_projection[rank]
+        result = xp.zeros(indices.shape[1])
+        for raw, tile in tiles:
+            for rows, positions, placements in by_raw.get(raw, ()):
+                contribution = xp.zeros(rows.size)
+                for p, h, sign in placements:
+                    coordinates = tuple(positions[i] for i in p) + tuple(positions[rank + i] for i in h)
+                    contribution += sign * tile[coordinates]
+                result[rows] += contribution
+        return result / len(_permutations(rank))**2
+
+    def _project_packed_tile(self, result, holes, groups, primal, tangent, intermediates=None):
+        """Contract each raw tile once and scatter to every compatible particle spin pattern."""
+        rank = 4
+        occupied = tuple(h // 2 for h in holes)
+        hole_spins = tuple(h % 2 for h in holes)
+        for equivalent, multiplicity, diagrams in projection_diagrams(rank):
+            if self.packed_contractions:
+                diagrams = tuple(d for d in diagrams if d not in self._packed_diagrams[rank])
+                if not diagrams:
+                    continue
+            scatter = {}
+            for particle_spins, rows, particles in groups:
+                signature = particle_spins + hole_spins
+                for raw, placements in external_routes(rank, signature, equivalent):
+                    for p, h, sign in placements:
+                        fixed = tuple(occupied[i] for i in h)
+                        by_group = scatter.setdefault((raw, fixed), {})
+                        by_group.setdefault(particle_spins, (rows, particles, []))[2].append((p, sign))
+            for (raw, fixed), by_group in scatter.items():
+                cuts = tuple(slice(i, i + 1) for i in fixed)
+                tile = contract_tile(self.xp, rank, raw, cuts, primal, tangent, self.nocc, self.nvir,
+                                     irrep=self.space.irrep, labels=self._spatial_labels,
+                                     engine=self._symmetry_engine, diagrams=diagrams,
+                                     intermediates=intermediates,
+                                     compiled_products=self.packed_contractions).reshape((self.nvir,) * rank)
+                for rows, particles, permutations in by_group.values():
+                    subtotal = self.xp.zeros(len(rows))
+                    for p, sign in permutations:
+                        subtotal += (multiplicity * sign) * tile[tuple(particles[i] for i in p)]
+                    result[rows] += subtotal
+        result /= len(_permutations(rank))**2
 
     def _project_tile(self, rank, signature, occupied, particles, primal, tangent):
         xp, no, nv = self.xp, self.nocc, self.nvir
@@ -312,51 +434,95 @@ class TripletEOMCCSDTQ:
                     subtotal += sign * tile[tuple(particles[i] for i in p)]
         return subtotal / len(_permutations(rank))**2
 
-    def _action(self, vector, *, slot_limit=None):
+    def _action(self, vector, *, ranks=range(1, 5), slot_limit=None, rank_finished=None, slot_finished=None):
         xp = self.xp
         no = self.proxy.hamiltonian.nocc
-        r1, *direction = self.space.unpack(vector, max_rank=3 if self.occupied_tiles else 4)
-        dg = dress_direction(self.integrals, r1, no, xp)
-        df = dress_direction(self.one_body, r1, no, xp) + xp.einsum("piqi->pq", dg[:, :no, :, :no])
-        blocks = {"f" + key: Directional(self.fock[ix], df[ix]) for key, ix in self.proxy._fblocks.items()}
-        blocks.update({"g" + key: Directional(self.integrals[ix], dg[ix])
-                       for key, ix in self.proxy._blocks.items()})
+        nonzero = (tuple(bool(xp.any(vector[section])) for section in self.space.slices)
+                   if self.occupied_tiles else None)
+        r1, *direction = self.space.unpack(vector, max_rank=3 if self.occupied_tiles else 4, nonzero=nonzero)
+        dg = df = None
+        if r1 is not None:
+            dg = dress_direction(self.integrals, r1, no, xp)
+            df = dress_direction(self.one_body, r1, no, xp) + xp.einsum("piqi->pq", dg[:, :no, :, :no])
+        blocks = {"f" + key: Directional(self.fock[ix], None if df is None else df[ix])
+                  for key, ix in self.proxy._fblocks.items()}
+        # T1 dressing changes virtual creator and occupied annihilator legs.
+        # The oovv block has neither, so avoid expanding T4 for a zero product.
+        for key, ix in self.proxy._blocks.items():
+            tangent = dg[ix] if dg is not None and (not self.occupied_tiles or key != "oovv") else None
+            blocks["g" + key] = Directional(self.integrals[ix], tangent)
         blocks.update({f"t{rank}": Directional(t, r) for rank, (t, r) in
                        enumerate(zip(self.amplitudes[1:], direction), 2)})
+        packed_action = None
+        if self.packed_contractions:
+            from ._spin_quadruples_cpu import PackedBinaryAction
+            packed_action = PackedBinaryAction(self, blocks,
+                                              vector[self.space.slices[3]] if nonzero[3] else None)
         outputs = []
-        ranks = (4,) if slot_limit is not None else range(1, 5)
+        from ._intermediate_cache import IntermediateCache
+        intermediates = IntermediateCache(self.intermediate_cache_bytes) if self.intermediate_cache_bytes else None
         for rank in ranks:
+            start = perf_counter() if rank_finished is not None else 0.
             shape = self.space.shapes[rank - 1]
             if self.occupied_tiles and rank > 1:
-                r4 = vector[self.space.slices[3]]
-                if not self.action_only:
+                r4 = vector[self.space.slices[3]] if nonzero[3] else None
+                if r4 is not None and not self._packed_direction:
                     r4 = r4[self._tiled_r4_order]
-                tiles = self._tiled_action(blocks, rank, r4, slot_limit=slot_limit)
+                tiles = self._tiled_action(blocks, rank, r4, slot_limit=slot_limit,
+                                           slot_finished=slot_finished, packed_action=packed_action,
+                                           intermediates=intermediates)
                 if rank == 4:
                     outputs.append(next(tiles)[1])
                 else:
-                    result = xp.zeros(shape)
-                    for raw, tile in tiles:
-                        result[tuple(slice(s, None, 2) for s in raw)] = tile
-                    outputs.append(_antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])])
-                continue
-            result = xp.zeros(shape)
-            for coefficient, spec, names in DIAGRAMS[rank]:
-                for operands in product_directions(*(blocks[name] for name in names)):
-                    einsum_into(xp, result, coefficient, spec, *operands)
-            outputs.append(_antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])])
+                    outputs.append(self._project_lower_tiles(rank, tiles))
+            else:
+                result = xp.zeros(shape)
+                for coefficient, spec, names in DIAGRAMS[rank]:
+                    for operands in product_directions(*(blocks[name] for name in names)):
+                        einsum_into(xp, result, coefficient, spec, *operands)
+                outputs.append(_antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])])
+            if packed_action is not None and 1 < rank < 4:
+                packed_action.add(rank, self.space.indices[rank - 1].T, outputs[-1])
+            if rank_finished is not None:
+                if xp is not np:
+                    xp.cuda.get_current_stream().synchronize()
+                rank_finished(rank, perf_counter() - start)
+        self.last_intermediate_cache = (None if intermediates is None else
+                                        dict(hits=intermediates.hits, misses=intermediates.misses,
+                                             peak_bytes=intermediates.peak_bytes))
         return xp.concatenate(outputs)
 
     def probe_rank_four(self, vector, slots):
         """Measure a bounded prefix of occupied rank-four slots."""
         if not self.action_only or slots < 1:
             raise ValueError("Rank-four probing needs the action-only packed layout and positive slots")
-        return self._action(vector, slot_limit=slots)
+        return self._action(vector, ranks=(4,), slot_limit=slots)
+
+    def probe_lower_ranks(self, vector):
+        """Apply the full Jacobian into ranks one through three, including R4 feedback.
+
+        The input uses the action-only layout with a packed rank-four tail.
+        The output uses the canonical coordinates of ranks one through three.
+        """
+        if not self.action_only:
+            raise ValueError("The feedback probe needs the action-only packed layout")
+        return self._action(vector, ranks=range(1, 4))
 
     def solve(self, *args, **options):
         if self.action_only:
             raise ValueError("The action-only layout has no large-system triplet spin projector")
         return EOMSinglet.solve(self, *args, **options)
+
+    def davidson_working_bytes(self, max_space):
+        """Conservative tensor workspace plus packed Davidson vectors.
+
+        The logical rank-four shape is not a dense allocation on the packed
+        path. Reuse the constructor's tiled estimate, including its cache.
+        """
+        estimate = int(self.estimated_dense_bytes) + (2 * max_space + 6) * self.space.size * 8
+        if not self._packed_direction:
+            estimate += 7 * sum(int(np.prod(shape)) for shape in self.space.shapes) * 8
+        return estimate
 
     def sigma(self, vector):
         if self.action_only:

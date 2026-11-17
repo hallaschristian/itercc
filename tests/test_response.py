@@ -4,8 +4,8 @@ import os
 import numpy as np
 import pytest
 
-from itercc import DipoleResponse, Hamiltonian, RestrictedCC
-from itercc.response import HC_EH_NM
+from itercc import DipoleResponse, Hamiltonian, ResponseCheckpoint, RestrictedCC
+from itercc.response import HC_EH_NM, _shifted_guesses
 from test_restricted import make_model
 from test_tensor_oracle import determinant_problem
 
@@ -149,3 +149,35 @@ def test_recycled_solutions_keep_the_sweep_and_save_actions():
     y = np.linalg.lstsq(shifted, rhs, rcond=None)[0]
     np.testing.assert_allclose(guess, basis @ y, atol=1e-9)
     assert abs(estimate - np.linalg.norm(rhs - shifted @ y)) < 1e-8
+
+
+def test_shift_projection_matches_dense_fit_without_stored_images():
+    rng = np.random.default_rng(391)
+    matrix = 10 * np.eye(15) + rng.standard_normal((15, 15))
+    rhs = rng.standard_normal(15)
+    shift = .25
+    eye = np.eye(len(rhs))
+    old = [(np.linalg.solve(matrix - s * eye, rhs), s) for s in (.13, -.2)]
+    basis = np.stack([v for v, _ in old], axis=1)
+    image = (matrix - shift * eye) @ basis
+    expected = np.linalg.lstsq(image, rhs, rcond=None)[0]
+    guess, estimate = _shifted_guesses(rhs, shift, old, np)
+    np.testing.assert_allclose(guess, basis @ expected, atol=2e-9, rtol=0)
+    np.testing.assert_allclose(estimate, np.linalg.norm(rhs - image @ expected) / np.linalg.norm(rhs),
+                               atol=1e-10, rtol=0)
+
+
+def test_dipole_checkpoint_resumes_with_a_true_residual_check(tmp_path):
+    h, eri, constant, dipoles = model(2, 3)
+    dipoles[1:] = 0.
+    solver, state = ground(h, eri, 2, constant)
+    args = solver, state.amplitudes, dipoles
+    cache = ResponseCheckpoint(tmp_path, "matched-ground")
+    cold = DipoleResponse(*args, checkpoint=cache, recycle_gib=0.).polarizability(1100.)
+    warm = DipoleResponse(*args, checkpoint=cache, recycle_gib=0.).polarizability(1100.)
+    np.testing.assert_allclose(cold.tensor_au, warm.tensor_au, atol=2e-8, rtol=0)
+    assert len(cold.solves) == 3
+    assert all(s["checkpoint_guess"] and s["jacobian_actions"] == 1 for s in warm.solves[:2])
+    assert not warm.solves[-1]["checkpoint_guess"]
+    with pytest.raises(ValueError, match="checkpoint identity"):
+        DipoleResponse(*args, checkpoint=ResponseCheckpoint(tmp_path, "other-ground")).polarizability(1100.)

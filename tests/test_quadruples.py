@@ -150,7 +150,8 @@ print(repr(solver.solve(resume=state[-1], max_iter=1, damping=0.2, diis_size=3).
 assert sys.modules["cupy"] is None
 """
     tests = Path(__file__).resolve().parent
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tests.parent), str(tests)]))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        [str(tests.parent), str(tests), os.environ.get("PYTHONPATH", "")]))
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env,
                          cwd=tests)
     assert run.returncode == 0, run.stderr
@@ -527,13 +528,18 @@ def test_pair_blocked_t3_tile_programs(monkeypatch, precision):
                                                        pairs.position[43]])
 
 
-def test_cpu_triplet_eom_ccsdtq_solve_matches_fci():
+@pytest.mark.parametrize("packed_spin,direct", [(False, False), (True, False), (True, True)])
+def test_cpu_triplet_eom_ccsdtq_solve_matches_fci(packed_spin, direct):
     """Spin-flip EOM-CCSDTQ (`TripletEOMCCSDTQ.solve`) on the CPU: four
     electrons, so the lowest triplet root is the FCI singlet-triplet gap."""
     from itercc import TripletEOMCCSDTQ
+    if direct:
+        from itercc import _cpu_quadruples
+        if not _cpu_quadruples.available():
+            pytest.skip("compiled CPU core unavailable")
 
     fci = pytest.importorskip("pyscf.fci")
-    h, eri, no, constant = make_model(2, 2)
+    h, eri, no, constant = make_model(2, 3 if packed_spin else 2)
     eri = eri * 0.45
     solver = RestrictedCCSDTQ(h, eri, no, constant, backend="cpu")
     ground = solver.solve(max_iter=100, energy_tol=1e-13, residual_tol=1e-11, damping=0.2,
@@ -550,13 +556,16 @@ def test_cpu_triplet_eom_ccsdtq_solve_matches_fci():
         s2 = fci.spin_op.spin_square(full.reshape(ndets, ndets), n, (no, no))[0]
         spins.setdefault(int(round(s2)), []).append(value + constant)
     assert abs(spins[0][0] - ground.energy) < 1e-11
-    engine = TripletEOMCCSDTQ(solver, ground.amplitudes, backend="cpu")
-    result = engine.solve(1, max_space=16, max_iter=60, residual_tol=1e-8)
+    engine = TripletEOMCCSDTQ(solver, ground.amplitudes, backend="cpu",
+                             occupied_tiles=packed_spin, packed_spin=packed_spin,
+                             packed_contractions=direct)
+    result = engine.solve(1, max_space=16, max_iter=60, residual_tol=1e-8,
+                          memory_budget_gib=0.02 if packed_spin else None)
     assert result.converged
     assert abs(result.excitation_energies[0] - (spins[2][0] - spins[0][0])) < 2e-8
 
 
-def test_cpu_triplet_occupied_tiles_use_the_executor():
+def test_cpu_triplet_occupied_tiles_use_the_executor(monkeypatch):
     """Triplet EOM-CCSDTQ with occupied tiles on the CPU: the symmetry-blocked
     tile products run on the compiled executor and match the dense action."""
     from itercc import TripletEOMCCSDTQ, _cpu_quadruples
@@ -570,14 +579,129 @@ def test_cpu_triplet_occupied_tiles_use_the_executor():
                           diis_quadruples="host", diis_size=4)
     assert ground.converged
     actions = []
+    compiled_specs = set()
     for tiles in (False, True):
         engine = TripletEOMCCSDTQ(solver, ground.amplitudes, labels, 1, backend="cpu",
                                   occupied_tiles=tiles)
         assert (engine._symmetry_engine is not None) == tiles
+        if tiles:
+            executor = engine._symmetry_engine
+            original = executor.einsum
+
+            def checked(spec, a, b, out, **kwargs):
+                plan, _ = executor.plan_for(spec, a, b, out, kwargs["labels"], kwargs["irreps"])
+                if plan:
+                    compiled_specs.add(spec)
+                return original(spec, a, b, out, **kwargs)
+
+            monkeypatch.setattr(executor, "einsum", checked)
         vector = engine.space.project(np.random.default_rng(5).normal(size=engine.space.size))
         actions.append(engine.sigma(vector))
+    assert "klcd,abcdijkl->abij" in compiled_specs
+    assert "alde,bcdeijkl->abcijk" in compiled_specs
     np.testing.assert_allclose(actions[1], actions[0], rtol=0,
                                atol=1e-11 * max(1.0, float(np.max(np.abs(actions[0])))))
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_packed_triplet_probe_preserves_lower_rank_feedback(monkeypatch, direct):
+    from itercc import TripletEOMCCSDTQ, _spin_quadruples_tiles
+    if direct:
+        from itercc import _cpu_quadruples
+        if not _cpu_quadruples.available():
+            pytest.skip("compiled CPU core unavailable")
+
+    # Force slicing of free occupied indices even for a small reference.
+    monkeypatch.setattr(_spin_quadruples_tiles, "_PACKED_TILE_BYTES", 8 * 3**4 * 3)
+    labels = np.array([0, 1, 0, 1, 1])
+    solver = RestrictedCCSDTQ(*symmetric_model(labels, no=2), orbital_irreps=labels, backend="cpu")
+    ground = solver.solve(max_iter=80, energy_tol=1e-12, residual_tol=1e-10, damping=0.1,
+                          diis_quadruples="host", diis_size=4)
+    assert ground.converged
+    reference = TripletEOMCCSDTQ(solver, ground.amplitudes, labels, 1)
+    packed = TripletEOMCCSDTQ(solver, ground.amplitudes, labels, 1,
+                             occupied_tiles=True, action_only=True, packed_contractions=direct,
+                             intermediate_cache_gib=0.0001)
+    production = TripletEOMCCSDTQ(solver, ground.amplitudes, labels, 1,
+                                 occupied_tiles=True, packed_spin=True, packed_contractions=direct,
+                                 intermediate_cache_gib=0.0001)
+    tail = reference.space.slices[3]
+    rows = {tuple(row): i for i, row in enumerate(reference.space.indices[3].T)}
+    layout = packed._direction_t4
+    order = [rows[(*particles, *holes)] for holes, (key, _) in layout.slots.items()
+             for particles in layout.groups[key]]
+    assert order
+    vector = np.random.default_rng(72).normal(size=reference.space.size)
+    probe_vector = np.concatenate((vector[:tail.start], vector[tail][order]))
+    expected = reference.sigma(vector)
+    without_r4 = vector.copy()
+    without_r4[tail] = 0
+    assert np.linalg.norm(expected[:tail.start] - reference.sigma(without_r4)[:tail.start]) > 1e-9
+    np.testing.assert_allclose(packed.probe_lower_ranks(probe_vector), expected[:tail.start], atol=1e-11)
+    np.testing.assert_allclose(packed.probe_rank_four(probe_vector, len(layout.slots)),
+                               expected[tail][order], atol=1e-11)
+    np.testing.assert_allclose(production.sigma(probe_vector),
+                               np.r_[expected[:tail.start], expected[tail][order]], atol=1e-11)
+    for active in (reference.space.slices[0], tail):
+        sparse = np.zeros_like(vector)
+        sparse[active] = vector[active]
+        dense = reference.sigma(sparse)
+        packed_sparse = np.r_[sparse[:tail.start], sparse[tail][order]]
+        np.testing.assert_allclose(production.sigma(packed_sparse),
+                                   np.r_[dense[:tail.start], dense[tail][order]], atol=1e-11)
+        if active == reference.space.slices[0]:
+            def unexpected_expansion(*args, **kwargs):
+                pytest.fail("Singles-only doubles projection expanded ground-state T4")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(production._ground_t4, "expand", unexpected_expansion)
+                np.testing.assert_allclose(production._action(packed_sparse, ranks=(2,)),
+                                           dense[reference.space.slices[1]], atol=1e-11)
+    np.testing.assert_allclose(production.diagonal,
+                               np.r_[reference.diagonal[:tail.start], reference.diagonal[tail][order]])
+
+
+def test_packed_rank_four_spin_projector_matches_dense():
+    from itercc.eom_spin_quadruples import SpinFlipSpace
+    from itercc._spin_quadruples_storage import PackedSpinQuadruples
+
+    no, nv, irrep = 4, 5, 1
+    labels = np.array([0, 0, 1, 2, 0, 1, 2, 3, 3])
+    layout = PackedSpinQuadruples(labels[:no], labels[no:], irrep, 1)
+    dense = SpinFlipSpace(no, nv, labels, irrep, np)
+    packed = SpinFlipSpace(no, nv, labels, irrep, np, packed=layout)
+    tail = dense.slices[3]
+    rows = {tuple(row): i for i, row in enumerate(dense.indices[3].T)}
+    order = [rows[(*particles, *holes)] for holes, (key, _) in layout.slots.items()
+             for particles in layout.groups[key]]
+    take = np.r_[np.arange(tail.start), tail.start + np.asarray(order)]
+    vector = np.random.default_rng(730).normal(size=dense.size)
+    expected = dense.project(vector)
+    assert np.linalg.norm(expected[tail] - vector[tail]) > 1e-3
+    projected = packed.project(vector[take])
+    np.testing.assert_allclose(projected, expected[take], rtol=0, atol=1e-13)
+    np.testing.assert_allclose(packed.project(projected), projected, rtol=0, atol=1e-13)
+
+
+def test_cpu_direct_spin_quadruples_six_electrons_match_dense():
+    from itercc import TripletEOMCCSDTQ, _cpu_quadruples
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    labels = np.array([0, 1, 2, 0, 1, 2, 3])
+    solver, amplitudes = warm_amplitudes(symmetric_model(labels, no=3), evaluations=2, backend="cpu")
+    dense = TripletEOMCCSDTQ(solver, amplitudes, labels, 2)
+    direct = TripletEOMCCSDTQ(solver, amplitudes, labels, 2, occupied_tiles=True,
+                             action_only=True, packed_contractions=True)
+    vector = np.random.default_rng(715).normal(size=dense.space.size)
+    tail = dense.space.slices[3]
+    rows = {tuple(row): i for i, row in enumerate(dense.space.indices[3].T)}
+    layout = direct._direction_t4
+    order = [rows[(*particles, *holes)] for holes, (key, _) in layout.slots.items()
+             for particles in layout.groups[key]]
+    expected = dense._action(vector)
+    measured = direct._action(np.r_[vector[:tail.start], vector[tail][order]])
+    np.testing.assert_allclose(measured, np.r_[expected[:tail.start], expected[tail][order]],
+                               rtol=2e-11, atol=2e-11)
 
 
 def test_cpu_finite_difference_eom_refuses_single_precision():

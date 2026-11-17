@@ -18,7 +18,31 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 19
+#define ITERCC_CORE_ABI 22
+
+/* Expand a sector vector into a zeroed flat tensor. Indices must be distinct
+ * and in [0,size), owned and validated by the caller's immutable layout. */
+void itercc_sector_unpack(int64_t size, int64_t count, const int64_t *indices,
+    const double *vector, double *out, int threads);
+
+/* Expand canonical spin-orbital amplitudes, first touching the dense output
+ * in parallel. Coordinates: count x (2*rank); permutations: npermutations x
+ * (2*rank). Distinct canonical orbits are a precondition (no overlapping writes). */
+void itercc_spin_unpack(int64_t count, int rank, int64_t nv, int64_t no,
+    const int32_t *coordinates, const double *vector, int npermutations,
+    const int32_t *permutations, const int32_t *signs, double *out, int threads);
+
+/* Binary small-operand / canonical spin-orbital T4 contraction. Coordinates
+ * are count x (2*rank) int32. Signed maps encode address+1 (zero is forbidden).
+ * Sparse coefficient rows are starts[group]..starts[group+1], with four int32
+ * internal indices per entry. amplitude_axes[8] selects output coordinates
+ * (>=0) or internal indices (-1-index). Every output is owned by one thread. */
+void itercc_spin_quad_contract(int64_t count, int rank, const int32_t *coordinates,
+    int64_t no, int64_t nv, const int32_t *virtual_map, const uint8_t *virtual_key,
+    const int64_t *hole_map, const uint8_t *hole_key, const double *packed,
+    int nexternal, const int32_t *external_axes, const int32_t *external_extents,
+    const int32_t *amplitude_axes, const int64_t *starts, const int32_t *internal,
+    const double *values, double alpha, double *out, int threads);
 
 /* Library identity. */
 int itercc_core_abi(void);

@@ -791,10 +791,12 @@ class SymmetryBlocks:
                                                       for c, v in labels.items()}}
         # Labels of enumerated letters (combinations and unit free letters) only
         # select GEMMs; the others shape the sorted composites.
-        unit = {c for c, n in zip(_parse(spec)[2], out.shape) if n == 1}
+        output = _parse(spec)[2]
+        enumerated = self.combinations.intersection(output) | {
+            c for c, n in zip(output, out.shape) if n == 1}
         fixed = () if not labels else tuple(sorted(
             (c, self._labels_key(current[c])) for c in labels
-            if c not in self.combinations and c not in unit))
+            if c not in enumerated))
         key = (spec, a.shape, a.strides, b.shape, b.strides, out.shape, out.strides, fixed)
         structure = self._structures.get(key)
         if structure is None:

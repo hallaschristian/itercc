@@ -110,6 +110,35 @@ states.excitation_energies, states.total_energies, states.converged
 - Not implemented: left eigenvectors, transition moments, oscillator
   strengths. Experimental: triplet (spin-flip) EOM-CCSDTQ (`TripletEOMCCSDTQ`).
 
+For CPU triplet EOM-CCSDTQ, `occupied_tiles=True, packed_spin=True` uses the
+compiled canonical spin-orbital contractions when the CPU core is available.
+They avoid dense T4 expansions in lower-rank feedback and part of the
+quadruples action. Five nonlinear quadruples terms reuse small effective
+coefficients. The remaining products use the shared symmetry-blocked CPU
+executor, including their intermediate contractions. Set
+`packed_contractions=False` for the earlier tiled reference, or `True` to
+require the compiled path (it raises if unavailable).
+
+Cluster runs can set `intermediate_cache_gib=8` (default 0) to retain repeated
+products within each Jacobian action. This is a byte cap on cached arrays,
+not on total process memory. It is included in the existing memory estimate;
+set `memory_budget_gib` for the full allocation. Cached direction-dependent
+products are discarded between actions. `last_intermediate_cache` reports
+hits, misses and peak cached array bytes. Ground-state effective coefficients
+and canonical address maps are reused for the lifetime of the EOM engine.
+Canonical CPU input expansion also uses the compiled core. The packed
+engine's Davidson memory check accounts for its actual packed/tiled storage
+instead of a logical dense rank-four tensor. See the
+[triplet CPU audit](triplet-cpu-audit.md) for measured doubles timings and
+remaining CCSDT/CCSDTQ integration work.
+
+`python -m benchmarks.spin_quadruples_cpu` compares this path with the tiled
+reference on a saved CuF DZ checkpoint. Its triples sample retains all
+virtuals and internal occupied sums while restricting external holes; its
+quadruples sample retains complete canonical occupied slots. These timings
+are bounded action benchmarks, not full eigensolve speedups. Both versions
+must use the same input, vector, output sample and thread allocation.
+
 ## Polarizabilities (linear response)
 
 ```python
@@ -127,8 +156,12 @@ damped = response.polarizability(532.0, damping_Eh=0.001).tensor_au      # compl
 - `dipoles` are the electronic dipole matrices (-r) in the same orbital frame
   as the amplitudes; for scalar X2C, supply picture-changed dipoles.
 - Keep one `DipoleResponse` for a sweep of wavelengths: every converged
-  solution is stored with its Jacobian image and seeds the next solves, so later
-  wavelengths cost far fewer Jacobian actions.
+  solution can seed later solves. A positive `recycle_gib` budget that is too
+  small for the image store still enables projected real dipole guesses.
+- For preemptible jobs, pass `checkpoint=ResponseCheckpoint(directory, identity)`
+  to `DipoleResponse`. Use an identity derived from the Hamiltonian, ground
+  amplitudes, dipoles and solver version, and a separate directory per writer.
+  Restarted solves check each saved dipole vector against the current residual.
 - `tol` is the relative residual of each linear solve (default 1e-8). On water,
   `tol=1e-6` reproduced tightly converged tensors to about 2e-8 relative.
 
@@ -165,6 +198,13 @@ and saved CCSDTQ states carry the autotuned GEMM choices so resumes are bit for
 bit.
 
 ## Performance and tuning
+
+Tensor expansion, signed permutations and bounded intermediate caching are
+shared package machinery, rather than method-specific copies. EOM and response
+use the same sector-expansion dispatcher; canonical spin-orbital amplitudes use
+its antisymmetric counterpart. Spatial and spin-orbital symmetries remain
+distinct. See the [reuse and validation matrix](triplet-cpu-audit.md#shared-machinery-follow-up-november-17)
+for applicability, measured timings and remaining integration work.
 
 - **Threads**: one per physical core of the process's CPU affinity. Set
   `ITERCC_CPU_THREADS` to the cores you were allocated (the kernels ignore

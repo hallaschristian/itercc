@@ -9,10 +9,10 @@ from .quadruples import CCSDTQState, RestrictedCCSDTQ
 from .solver import Iteration, Result, TensorCC
 from .eom import EOMSinglet, EOMResult
 from .eom_spin_quadruples import TripletEOMCCSDTQ
-from .response import DipoleResponse, Polarizability
+from .response import DipoleResponse, Polarizability, ResponseCheckpoint
 from .spin_orbit import SpinOrbitResult, spin_orbit_from_components, spin_orbit_state_interaction
 
 __all__ = ["Hamiltonian", "Iteration", "RestrictedCC", "Result", "TensorCC", "EOMSinglet",
            "EOMResult", "TripletEOMCCSDTQ", "DipoleResponse", "Polarizability", "RestrictedCCSDTQ", "CCSDTQState",
-           "SpinOrbitResult", "spin_orbit_from_components", "spin_orbit_state_interaction"]
+           "ResponseCheckpoint", "SpinOrbitResult", "spin_orbit_from_components", "spin_orbit_state_interaction"]
 

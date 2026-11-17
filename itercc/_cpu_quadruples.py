@@ -20,6 +20,7 @@ from functools import lru_cache
 import numpy as np
 
 from . import _core, _cpu_kernels
+from ._tensor_scatter import expand_antisymmetric  # compatibility import
 from . import _quadruples_cpu as _numpy
 from ._cpu_symmetry_blocks import CpuSymmetryBlocks
 from ._quadruples_cpu import NumpyQuadruplesLayout

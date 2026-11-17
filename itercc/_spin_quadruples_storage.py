@@ -1,21 +1,14 @@
 """Canonical spin-orbital quadruples indexed by occupied tuple and virtual irrep."""
 from functools import lru_cache
-from itertools import combinations, permutations, product
+from itertools import combinations, product
+
+from ._tensor_symmetry import parity, signed_permutations
 
 import numpy as np
 
 
 def alpha_count(indices):
     return sum(i % 2 == 0 for i in indices)
-
-
-def parity(indices):
-    return (-1) ** sum(i > j for i, j in combinations(indices, 2))
-
-
-@lru_cache(maxsize=None)
-def signed_permutations(rank):
-    return tuple((order, parity(order)) for order in permutations(range(rank)))
 
 
 def orbital_irrep(indices, labels):
@@ -113,4 +106,62 @@ class PackedSpinQuadruples:
             for source, positions, sign in self._virtual_map(spins, key, np):
                 values[source] += sign * flat[positions]
             result[window] = xp.asarray(values)
+        return result
+
+
+class PackedSpinProjector:
+    """Apply the M_S=1 triplet projector without per-determinant spin maps."""
+
+    def __init__(self, source, xp):
+        if source.spin_change != 1:
+            raise ValueError("The triplet projector expects M_S=1")
+        self.xp = xp
+        raised = PackedSpinQuadruples(source.occupied, source.virtual, source.irrep, 2)
+        self.raised_size = raised.size
+        self.routes = []
+        virtual_routes = {}
+        base = 2 * source.nv
+        for key, particles in source.groups.items():
+            target = raised.groups.get((key[0] + 1, key[1]))
+            if target is None:
+                continue
+            target_ids = np.ravel_multi_index(target.T, (base,) * 4)
+            maps = []
+            for column in range(4):
+                allowed = particles[:, column] % 2 == 1
+                if column:
+                    allowed &= particles[:, column - 1] != particles[:, column] - 1
+                rows = np.flatnonzero(allowed)
+                if rows.size:
+                    flipped = particles[rows].copy()
+                    flipped[:, column] -= 1
+                    ids = np.ravel_multi_index(flipped.T, (base,) * 4)
+                    columns = np.searchsorted(target_ids, ids)
+                    maps.append((xp.asarray(rows, dtype=xp.int32), xp.asarray(columns, dtype=xp.int32)))
+            virtual_routes[key] = maps
+
+        for holes, (key, window) in source.slots.items():
+            if holes in raised.slots:
+                _, target = raised.slots[holes]
+                self.routes.extend((window, target, rows, columns, 1)
+                                   for rows, columns in virtual_routes.get(key, ()))
+            for at, hole in enumerate(holes):
+                if hole % 2 == 0 and hole + 1 not in holes:
+                    flipped = holes[:at] + (hole + 1,) + holes[at + 1:]
+                    _, target = raised.slots[flipped]
+                    # Flipping an occupied spin changes the hole-order phase.
+                    self.routes.append((window, target, slice(None), slice(None), -1))
+
+    def project(self, vector):
+        if not self.routes:
+            return vector
+        result = vector.copy()
+        raised = self.xp.empty(self.raised_size, dtype=vector.dtype)
+        # S- S+ has eigenvalues 0, 4, 10 and 18 in the M_S=1 rank-four space.
+        for eigenvalue in (4., 10., 18.):
+            raised.fill(0)
+            for source, target, rows, columns, sign in self.routes:
+                raised[target][columns] += sign * result[source][rows]
+            for source, target, rows, columns, sign in self.routes:
+                result[source][rows] -= sign / eigenvalue * raised[target][columns]
         return result

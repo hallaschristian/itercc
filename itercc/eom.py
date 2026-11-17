@@ -19,6 +19,7 @@ from .krylov import davidson
 from ._directional import Directional, DirectionalBackend, DirectionalCudaLayout
 from ._triples_layout import TriplesLayout
 from .restricted import RestrictedCC, _pair_ladder, _fock
+from ._tensor_scatter import unpack_sector
 
 _BARE_MIN_VIRTUALS = 30     # `EOMSinglet._bare_ladder`: the dense ladder is faster below
 
@@ -115,8 +116,7 @@ class SingletSpace:
                 arrays.append(PackedTriples(owner, owner.symmetrize(source, 0)))
                 start += size
                 continue
-            array = xp.zeros(shape, dtype=xp.result_type(vector.dtype, xp.float64))
-            array.reshape(-1)[index] = vector[start:start + size]
+            array = unpack_sector(vector[start:start + size], index, shape, xp=xp)
             arrays.append(array)
             start += size
         arrays[1] = 0.5 * (arrays[1] + arrays[1].transpose(1, 0, 3, 2))
@@ -628,13 +628,12 @@ class EOMSinglet:
         if (not isinstance(nroots, int) or nroots < 1 or max_space < 2 * nroots + 1
                 or max_iter < 1 or not np.isfinite(residual_tol) or residual_tol <= 0):
             raise ValueError("Invalid root count, subspace, iteration or residual controls")
-        estimated = (2 * max_space + 6) * space.size * 8
-        estimated += 12 * sum(np.prod(shape, dtype=np.int64) for shape in space.shapes) * 8
-        # The proxy is a RestrictedCC (h) or, for spin-flip engines, a TensorCC.
-        orbitals = len(self.proxy.h if hasattr(self.proxy, "h") else self.proxy.hamiltonian.h)
-        estimated += 4 * orbitals**4 * 8
-        if memory_budget_gib is not None and estimated > memory_budget_gib * 1024**3:
-            raise MemoryError(f"Estimated EOM working set {estimated / 1024**3:.2f} GiB exceeds budget")
+        if memory_budget_gib is not None:
+            if not np.isfinite(memory_budget_gib) or memory_budget_gib <= 0:
+                raise ValueError("Memory budget must be finite and positive")
+            estimated = _working_bytes(self, max_space)
+            if estimated > memory_budget_gib * 1024**3:
+                raise MemoryError(f"Estimated EOM working set {estimated / 1024**3:.2f} GiB exceeds budget")
         outcome = davidson(lambda vector: self.sigma(vector), self.diagonal, space.project,
                            size=space.size, nroots=nroots, xp=xp, residual_tol=residual_tol,
                            max_iter=max_iter, max_space=max_space, guesses=guesses,
@@ -645,6 +644,19 @@ class EOMSinglet:
         return EOMResult(outcome.converged, values, self.ground_energy + values, outcome.vectors,
                          outcome.residual_norms, outcome.history, self.method, space.irrep,
                          self.matvec_count, self.matvec_seconds)
+
+
+def _working_bytes(engine, max_space):
+    """Honor backend storage estimates through all EOM wrappers."""
+    estimate = getattr(engine, "davidson_working_bytes", None)
+    if estimate is not None:
+        return estimate(max_space)
+    space = engine.space
+    estimated = (2 * max_space + 6) * space.size * 8
+    estimated += 12 * sum(int(np.prod(shape)) for shape in space.shapes) * 8
+    proxy = engine.proxy
+    orbitals = len(proxy.h if hasattr(proxy, "h") else proxy.hamiltonian.h)
+    return estimated + 4 * orbitals**4 * 8
 
 
 class HostDavidson:
@@ -664,6 +676,12 @@ class HostDavidson:
                                      project=project if project is not None else self._project)
         if audit is not None:
             self.full_residual_norm = audit
+
+    def davidson_working_bytes(self, max_space):
+        # Aggregate host/device estimate, not a device-only capacity check.
+        # Preserve the engine's packed layout and cache accounting. Add the
+        # host/device transfer pair instead of inferring dense logical shapes.
+        return _working_bytes(self.engine, max_space) + 2 * self.space.size * 8
 
     def _project(self, vector):
         return self.engine.space.project(self.engine.xp.asarray(vector)).get()

@@ -58,11 +58,6 @@ def write_array_archive(path, arrays, *, compressed=False):
             os.unlink(temporary)
 
 
-def _fsync(path):
-    with open(path, "rb") as stream:
-        os.fsync(stream.fileno())
-
-
 def _fsync_directory(path):
     if hasattr(os, "O_DIRECTORY"):
         descriptor = os.open(path, os.O_DIRECTORY)
@@ -146,8 +141,10 @@ def write_array_directory(path, arrays, metadata, *, chunk_bytes=128 * 2**20):
     temporary.mkdir()
     for name, array in arrays.items():
         _write_npy(temporary / f"{name}.npy", array, chunk_bytes)
-    (temporary / "metadata.json").write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
-    _fsync(temporary / "metadata.json")
+    with (temporary / "metadata.json").open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
     _fsync_directory(temporary)
     if path.exists():
         previous = parent / f".{path.name}.previous-{os.getpid()}-{time.time_ns()}"

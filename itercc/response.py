@@ -2,10 +2,12 @@
 from dataclasses import dataclass
 from functools import partial
 from numbers import Integral
+from pathlib import Path
 
 import numpy as np
 
 from . import _restricted_equations as eq
+from .checkpoint_io import read_array_directory, to_device, write_array_directory
 from .eom import EOMSinglet, SingletSpace
 from .hamiltonian import _real64
 from .krylov import RecycledImages, gmres
@@ -25,6 +27,29 @@ def _gmres(action, rhs, diagonal, xp, *, tol, restart, maxiter, initial=None, de
                  initial=initial, deflation=deflation)
 
 
+def _shifted_guesses(rhs, shift, vectors, xp):
+    """Project into stored same-RHS solutions without retaining their images."""
+    rhs_norm_sq = float(xp.vdot(rhs, rhs).real)
+    displacements = np.array([previous - shift for _, previous in vectors])
+    overlaps = np.array([xp.vdot(rhs, vector).item() for vector, _ in vectors])
+    # If (A - previous_i) x_i = b, then (A - shift) x_i = b + delta_i x_i.
+    # Form the Gram system from overlaps to avoid allocating any full images.
+    gram = np.array([[xp.vdot(left, right).item() for right, _ in vectors]
+                     for left, _ in vectors])
+    mixed = displacements * overlaps
+    normal = (rhs_norm_sq + mixed[None, :] + mixed.conj()[:, None]
+              + displacements.conj()[:, None] * gram * displacements[None, :])
+    target = rhs_norm_sq + mixed.conj()
+    weights = np.linalg.lstsq(normal, target, rcond=1e-12)[0]
+    relative = float(np.sqrt(max(0., 1. - np.vdot(target, weights).real / rhs_norm_sq)))
+    if relative >= .5:
+        return None, relative
+    initial = weights[0] * vectors[0][0]
+    for weight, (vector, _) in zip(weights[1:], vectors[1:]):
+        initial += weight * vector
+    return initial, relative
+
+
 @dataclass(frozen=True)
 class Polarizability:
     wavelength_nm: float
@@ -32,6 +57,39 @@ class Polarizability:
     damping_Eh: float
     tensor_au: np.ndarray
     solves: tuple
+
+
+class ResponseCheckpoint:
+    """Store converged dipole vectors as warm starts, under a caller's input identity.
+
+    Use a separate directory per writer. Loaded guesses pass through the same
+    true-residual test as other initial vectors before a result is accepted.
+    """
+
+    def __init__(self, directory, identity):
+        self.directory = Path(directory)
+        self.identity = str(identity)
+
+    def _entry(self, key, sector, shift):
+        real, imag = float(np.real(shift)).hex(), float(np.imag(shift)).hex()
+        path = self.directory / f"dipole-{key[1]}-{sector}-{real}-{imag}"
+        return path, dict(identity=self.identity, sector=int(sector), solve=list(key), shift=[real, imag])
+
+    def load(self, key, sector, shift, rhs, xp):
+        path, identity = self._entry(key, sector, shift)
+        if not path.is_dir() and not any(path.parent.glob(f".{path.name}.previous-*")):
+            return None
+        arrays, metadata = read_array_directory(path, lazy=True)
+        if metadata != identity:
+            raise ValueError("Response checkpoint identity differs from the requested calculation")
+        vector = arrays["vector"]
+        if vector.shape != rhs.shape or vector.dtype != rhs.dtype:
+            raise ValueError("Response checkpoint vector differs from the requested system")
+        return np.asarray(vector) if xp is np else to_device(vector)
+
+    def save(self, key, sector, shift, vector):
+        path, identity = self._entry(key, sector, shift)
+        write_array_directory(path, {"vector": vector}, identity)
 
 
 class DipoleResponse:
@@ -54,14 +112,16 @@ class DipoleResponse:
     sweep has only two or three solutions per sector and wavelength.
     `recycle_gib=None` takes half of the host memory left after the engine
     and one solve's Krylov basis on the CPU, and keeps no store on CUDA
-    (device memory); 0 turns it off.
+    (device memory); 0 disables shift recycling. When a positive budget cannot
+    hold a sector's image store, real dipole solves still start in the span of earlier
+    same-RHS solutions, using the known shifts to reconstruct their images.
     """
     RECYCLE_MAX = 64            # solutions per sector
     RECYCLE_WORK = 40           # vectors held back for one solve's (complex) Krylov basis
 
     def __init__(self, solver, amplitudes, dipoles, *, orbital_irreps=None,
                  dipole_irreps=None, backend="cpu", method="ccsdt", recycle_gib=None,
-                 symmetry_tolerance=2e-9, host_krylov=False):
+                 symmetry_tolerance=2e-9, host_krylov=False, checkpoint=None):
         raw = _real64(dipoles)
         nmo = len(solver.h)
         if (raw.shape != (3, nmo, nmo)
@@ -117,6 +177,8 @@ class DipoleResponse:
             - acting.g[self.o, self.o, self.v, self.v].swapaxes(2, 3))
         self.fock_ov = self.xp.asarray(acting.fock[self.o, self.v])
         self._guesses = {}
+        self._dipole_shifts = {}
+        self.checkpoint = checkpoint
         self.deflation = None
         if recycle_gib is None:
             recycle_gib = 0.0
@@ -211,28 +273,48 @@ class DipoleResponse:
         cache_key = (*key, dtype)
         initial = self._guesses.get(cache_key)
         prior = initial is not None
+        checkpoint = self.checkpoint if key[0] == "dipole" else None
+        saved = checkpoint.load(key, sector, shift, rhs, xp) if checkpoint is not None and not prior else None
+        if saved is not None:
+            initial = saved
         # The best start in the span of every earlier solution of this sector,
         # which holds the previous wavelength's solution unless the store
         # filled up (then that solution alone may be the better start).
         # Without such a solution, a start must at least halve the residual
         # to pay for the action that checks it.
         store, guess_residual, stored = self._store(sector), None, 0
-        if store is not None and store.count and not (prior and store.skipped):
+        if saved is None and store is not None and store.count and not (prior and store.skipped):
             stored = store.count
             guess, estimate = store.guess(rhs, shift)
             norm = float(xp.linalg.norm(rhs))
             if guess is not None and estimate < (1.0 if prior else 0.5) * norm:
                 initial, guess_residual = guess.astype(dtype, copy=False), estimate / norm
+        elif saved is None and store is None and self.recycle_gib > 0 and key[0] == "dipole" and dtype == xp.float64:
+            # The +/- systems share a right-hand side, even across wavelengths.
+            # GMRES checks the true residual before trusting this projection.
+            keys = [("dipole", key[1], sign, dtype) for sign in (1, -1)]
+            vectors = [(self._guesses[old], self._dipole_shifts[old]) for old in keys
+                       if old in self._dipole_shifts]
+            if vectors and not any(vector is initial and old_shift == shift for vector, old_shift in vectors):
+                guess, estimate = _shifted_guesses(rhs, shift, vectors, xp)
+                if guess is not None:
+                    initial, guess_residual = guess, estimate
         vector, defect, steps = _gmres(action, rhs, diagonal, xp, tol=tol, restart=restart,
                                        maxiter=maxiter, initial=initial, deflation=self.deflation)
+        reused_checkpoint = saved is not None
+        del initial, saved
         reports(dict(irrep=sector, solve=key, shift_Eh=[float(np.real(shift)), float(np.imag(shift))],
                      relative_residual=defect, jacobian_actions=actions, arnoldi_steps=steps,
                      prior_wavelength_guess=prior, recycled_directions=stored,
-                     recycled_guess_relative_residual=guess_residual))
+                     recycled_guess_relative_residual=guess_residual, checkpoint_guess=reused_checkpoint))
         if not np.isfinite(defect) or defect > tol:
             raise RuntimeError(f"CC response solve failed for irrep {sector} at {shift} Eh "
                                f"(relative residual {defect:.3e} after {steps} iterations)")
+        if checkpoint is not None and (not reused_checkpoint or steps > 0):
+            checkpoint.save(key, sector, shift, vector)
         self._guesses[cache_key] = vector
+        if key[0] == "dipole" and dtype == xp.float64:
+            self._dipole_shifts[cache_key] = shift
         if store is not None:
             # A x = b + shift x up to the residual (A is real: real and
             # imaginary parts separately). A part almost in the span is
@@ -336,7 +418,8 @@ class DipoleResponse:
         restarts (None picks min(10, restart // 3); 0 is classical GMRES(m)).
         The basis is restart + 1 vectors on the backend or the host. Solves start from
         the earlier solutions (see the class docstring);
-        `reuse_guesses=False` drops them first.
+        `reuse_guesses=False` drops in-memory guesses first. A configured disk
+        checkpoint can still supply guesses for its saved systems.
         """
         wavelength_nm, damping_Eh = float(wavelength_nm), float(damping_Eh)
         if (not wavelength_nm > 0 or not np.isfinite(damping_Eh) or damping_Eh < 0
@@ -351,6 +434,7 @@ class DipoleResponse:
         controls, reports = (tol, restart, maxiter), []
         if not reuse_guesses:       # a cold start: no earlier solutions or images
             self._guesses.clear()
+            self._dipole_shifts.clear()
             self._recycled.clear()
         if deflation is not None and (isinstance(deflation, bool) or not isinstance(deflation, Integral)
                                       or deflation < 0):
@@ -375,6 +459,8 @@ class DipoleResponse:
                     key = ("dipole", i, 1, self.krylov_xp.float64)
                     self._guesses[("dipole", i, -1, self.krylov_xp.float64)] = (
                         self._guesses[key] if key in self._guesses else self._krylov_array(value))
+                    if key in self._dipole_shifts:
+                        self._dipole_shifts[("dipole", i, -1, self.krylov_xp.float64)] = 0.
         tensor = np.zeros((3, 3), dtype=np.complex128)
         for i in range(3):
             for j in range(i, 3):
