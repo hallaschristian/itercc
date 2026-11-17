@@ -15,12 +15,12 @@ polarizabilities converged to tight thresholds.
 
 ## Highlights
 
-- **Fast where it counts.** On one 12-core desktop, water CCSDT in aug-cc-pVTZ
-  converges in 12.5 s with IterCC, against 94 s for NWChem and 201 s for PySCF;
-  ccpy needs 57 s per iteration and more memory than the machine has. A CCSDTQ
-  iteration in cc-pVDZ is 56 times faster than PySCF's and 490 times faster than
-  ccpy's, and IterCC converges aug-cc-pVDZ CCSDTQ in 40 s where PySCF runs out of
-  memory. On one core, a cc-pVTZ CCSDT iteration takes 0.44 s in IterCC and
+- **Fast where it counts.** On one 56-core cluster CPU socket, water CCSDT in
+  aug-cc-pVTZ converges in 3.3 s with IterCC, against 30 s for NWChem, 136 s
+  for PySCF and 383 s for ccpy. An aug-cc-pVDZ CCSDTQ iteration is 33 times
+  faster than NWChem's and 350 times faster than PySCF's, and an aug-cc-pVQZ
+  CCSD iteration 4 to 39 times faster than those of NWChem, PySCF, Psi4 and
+  ccpy. On one core, a cc-pVTZ CCSDT iteration takes 0.43 s in IterCC and
   162 s in ORCA 6.1.1. [Benchmarks](docs/benchmarks.md)
 - **Big calculations.** One 56-core CPU socket runs a CCSDT iteration with 13
   occupied and 131 virtual orbitals in 9.2 s (an A100 GPU: 26.6 s), and a

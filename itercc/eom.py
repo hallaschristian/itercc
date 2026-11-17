@@ -350,10 +350,18 @@ class EOMSinglet:
 
                 n, no = tensor.shape[0], response.shape[0]
                 nv = n - no
+                threads = cpu_threads(None)
+                if (tuple(creation), tuple(annihilation)) == ((0, 1), (2, 3)) and hasattr(
+                        library, "dress_derivative"):
+                    # All four legs in one pass over g, no zero fill.
+                    output = np.empty_like(tensor)
+                    d = np.ascontiguousarray(response)
+                    library.dress_derivative(output.ctypes.data, tensor.ctypes.data, n, no, d.ctypes.data,
+                                             threads)
+                    return output
                 output = np.zeros_like(tensor)
                 down = np.ascontiguousarray(-response.T)      # (nv, no)
                 up = np.ascontiguousarray(response)           # (no, nv)
-                threads = cpu_threads(None)
                 for axis in creation:
                     library.dress_axis_from(output.ctypes.data, tensor.ctypes.data, n, axis, no, nv, 0, no,
                                             down.ctypes.data, threads)

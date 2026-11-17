@@ -439,7 +439,8 @@ class RestrictedCC:
         # (_blocked_residual) whenever the amplitudes are exactly symmetric.
         self._labels = labels if orbital_irreps is not None else None
         self._blocked_plan = None
-        self._integrals_symmetric = self._ladder_structure = None
+        self._integrals_symmetric = self._ladder_structure = self._bare_ladder = None
+        self._dressing_buffer, self._hold_dressing = None, False
         self._cpu_blocked = os.environ.get("ITERCC_BLOCKED", "1") != "0"
         self._contract = partial(eq.contract, xp=self._xp)
         if self._xp is np and _cpu._kernels.library() is not None:
@@ -473,14 +474,17 @@ class RestrictedCC:
                 raise ValueError("T3 repeated occupied slots must have matching virtual symmetry")
         return arrays
 
-    def _dressed(self, t1):
+    def _dressed(self, t1, ccsd=False):
+        """(f, g) dressed with T1; `ccsd`: only what the CCSD residual reads
+        (`_cpu.dressed_integrals`), for `_bare_ladder_for`."""
         o, v = self.o, self.v
         xp = self._xp
         h = xp.array(self.h, copy=True)
         _dress_axis(h, 0, v, o, -t1.T, xp)
         _dress_axis(h, 1, o, v, t1, xp)
         if xp is np and self._t1_dressing is None:
-            g = _cpu.dressed_integrals(self.g, t1, self._cpu_threads)
+            g = _cpu.dressed_integrals(self.g, t1, self._cpu_threads, ccsd=ccsd,
+                                       out=self._dressing_output() if ccsd else None)
             if g is not None:
                 return _fock(h, g, o, xp=xp), g
         g = xp.array(self.g, order="C", copy=True)
@@ -594,10 +598,17 @@ class RestrictedCC:
         xp, contract = self._xp, self._contract
         t1, t2, t3 = amplitudes
         o, v = self.o, self.v
-        f, g = self._dressed(t1)
-        ladder_g = self._ladder_g(g, t1) if xp is np and self._cpu_fast else None
-        ladder = (partial(_cpu.doubles_ladder, virtual_irreps=self._virtual_irreps, sectors=ladder_g)
-                  if xp is np and self._cpu_fast else None)
+        bare = self._bare_ladder_for(t1, t2, t3)
+        if bare is not None:
+            # CCSD: g(vvvv) stays undressed and unread (`_cpu.BareLadder`).
+            f, g = self._dressed(t1, ccsd=True)
+            ladder_g = None
+            ladder = lambda _, t2: bare(t1, t2)                  # noqa: E731
+        else:
+            f, g = self._dressed(t1)
+            ladder_g = self._ladder_g(g, t1) if xp is np and self._cpu_fast else None
+            ladder = (partial(_cpu.doubles_ladder, virtual_irreps=self._virtual_irreps, sectors=ladder_g)
+                      if xp is np and self._cpu_fast else None)
         r1, r2, intermediates, spin_g, c2 = eq.lower_residuals(f, g, t2, o, v, contract,
                                                                vvvv_ladder=ladder)
         if not len(t3):
@@ -684,6 +695,45 @@ class RestrictedCC:
                 self.h, self.g.transpose(0, 2, 1, 3), self._labels,
                 threads=_cpu.cpu_threads(threads if threads is not None else self._cpu_threads)))
         return self._integrals_symmetric
+
+    def _dressing_output(self):
+        """During `solve`, the n^4 array the CCSD dressing of each
+        evaluation writes into (nothing reads it after the evaluation, so one
+        array serves every iteration and its pages are faulted in once: about
+        a quarter of a water aug-cc-pVTZ iteration), released when `solve`
+        returns; None otherwise."""
+        if not self._hold_dressing:
+            return None
+        if self._dressing_buffer is None:
+            self._dressing_buffer = np.empty(self.g.shape)
+        return self._dressing_buffer
+
+    def _bare_ladder_for(self, t1, t2, t3):
+        """The CCSD particle-particle ladder without dressing g(vvvv)
+        (`_cpu.BareLadder`, built once) when the compiled CPU path evaluates
+        plain CCSD amplitudes with this class's dressing; else None (CCSDT
+        reads the dressed g(vvvv) in its T3 ladder; EOM and response dress
+        dual numbers). ITERCC_BARE_LADDER=0 turns it off."""
+        if (type(t1) is not np.ndarray or type(t2) is not np.ndarray or len(t3) or self._xp is not np
+                or not self._cpu_fast or self._t1_dressing is not None or "_dressed" in vars(self)
+                or type(self)._dressed is not RestrictedCC._dressed
+                or t1.dtype != np.float64 or t2.dtype != np.float64
+                or not hasattr(_cpu._kernels.library(), "dress_integrals_ccsd")
+                or self.g.dtype != np.float64 or os.environ.get("ITERCC_BARE_LADDER", "1") == "0"):
+            return None
+        if self._bare_ladder is None:
+            structure = None
+            if (self._labels is not None and self._cpu_blocked and self._virtual_irreps is not None
+                    and self._symmetric_integrals()):
+                if self._ladder_structure is None:
+                    from ._blocked import irrep_groups
+
+                    no = self.layout.no
+                    self._ladder_structure = _cpu.LadderSectors(self._labels[no:], irrep_groups(self._labels))
+                structure = self._ladder_structure
+            self._bare_ladder = _cpu.BareLadder(self.g, self.layout.no, structure=structure,
+                                                virtual_irreps=self._virtual_irreps, threads=self._cpu_threads)
+        return self._bare_ladder
 
     def _ladder_g(self, g, t1):
         """(LadderSectors, even, odd): the sector blocks of the dressed g(vvvv), for
@@ -850,6 +900,7 @@ class RestrictedCC:
         d3v = np.ascontiguousarray(d3v)
         history = []
         last, converged = np.inf, False
+        self._hold_dressing = True             # `_dressing_output`
         for iteration in range(max_iter):
             t1, t2, t3 = amplitudes
             correlation = self._energy(t1, t2)
@@ -912,4 +963,5 @@ class RestrictedCC:
                 del r3
             del residuals, steps
             last = correlation
+        self._hold_dressing, self._dressing_buffer = False, None
         return Result(self.reference_energy + correlation, correlation, amplitudes, converged, tuple(history))

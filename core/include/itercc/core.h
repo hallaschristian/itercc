@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 16
+#define ITERCC_CORE_ABI 17
 
 /* Library identity. */
 int itercc_core_abi(void);
@@ -313,6 +313,25 @@ void itercc_pair_matrices(const double *w, int64_t nv, int64_t ne, const int64_t
  * -t1^T times the occupied rows. Two passes over the tensor. */
 void itercc_dress_integrals(double *dst, const double *src, const int64_t *ss, int64_t n, int64_t no,
                             const double *t1, int threads);
+/* What the T1-dressed CCSD residual reads, never reading g(vvvv): the (p, q)
+ * planes with an occupied index as itercc_dress_integrals; of a plane with p
+ * and q virtual only the occupied-occupied block, without
+ * sum_ef t1(i,e) t1(j,f) g(p,q,e,f). Other entries are left as they were. */
+void itercc_dress_integrals_ccsd(double *dst, const double *src, const int64_t *ss, int64_t n, int64_t no,
+                                 const double *t1, int threads);
+/* out (n^4) = the first-order change of the T1-dressed g (C order) along d
+ * (no x nv): -d^T times the occupied rows added to the virtual rows of legs 0
+ * and 1, d times the virtual rows added to the occupied rows of legs 2 and 3,
+ * each leg transformed once from g, in one pass. out need not be initialized. */
+void itercc_dress_derivative(double *out, const double *g, int64_t n, int64_t no, const double *d, int threads);
+/* dst (n^4, C order) = src without the entries whose Abelian labels XOR to
+ * nonzero; stats = (count of nonzero removed entries, largest magnitude, norm).
+ * Returns 1 when a removed entry exceeds tolerance or is not finite, else 0. */
+int itercc_project_symmetric(double *dst, const double *src, int64_t n, const int64_t *labels,
+                             double tolerance, double *stats, int threads);
+/* dst[i, j, k, l] = src[ij, kl] for PySCF's 4-fold packed two-electron
+ * integrals (n(n+1)/2 x n(n+1)/2, lower-triangular pair order). */
+void itercc_unpack_s4(double *dst, const double *src, int64_t n, int threads);
 /* The symmetry-sector blocks of the even and odd pair matrices above, packed
  * one sector after another: for each sector g (rows and columns
  * start[g]..start[g+1] of the sector-ordered pairs) a square block at off[g].

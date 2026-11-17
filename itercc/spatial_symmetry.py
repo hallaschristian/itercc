@@ -79,8 +79,27 @@ def project_integrals(h, eri, labels, *, tolerance):
     labels = orbital_labels(labels, n)
     pairs = labels[:, None] ^ labels
     h, h_audit = _project(h, [(slice(None), pairs != 0)], tolerance)
-    eri, eri_audit = _project(eri, _eri_forbidden(pairs), tolerance)
+    eri, eri_audit = _project_eri(eri, labels, tolerance)
     return h, eri, (h_audit, eri_audit)
+
+
+def _project_eri(eri, labels, tolerance):
+    """`_project` of the ERIs: in one pass on all threads with the compiled core
+    (NumPy's masked copies moved the n^4 tensor several times on one thread)."""
+    from . import _cpu_kernels
+
+    library = _cpu_kernels.library()
+    if library is None or eri.dtype != np.float64 or not eri.flags.c_contiguous:
+        return _project(eri, _eri_forbidden(labels[:, None] ^ labels), tolerance)
+    from ._cpu_triples import cpu_threads
+
+    out = np.empty_like(eri)
+    stats = np.zeros(3)
+    labels64 = np.ascontiguousarray(labels, dtype=np.int64)
+    if library.project_symmetric(out.ctypes.data, eri.ctypes.data, len(labels), labels64.ctypes.data,
+                                 float(tolerance), stats.ctypes.data, cpu_threads(None)):
+        raise ValueError(f"Symmetry leakage {stats[1]:.6g} exceeds {tolerance:.6g}")
+    return out, SymmetryLeakage(int(stats[0]), float(stats[1]), float(stats[2]))
 
 
 def project_amplitudes(amplitudes, labels, *, tolerance):

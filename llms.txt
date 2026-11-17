@@ -173,9 +173,12 @@ the CPU path is usually faster there.
 - Cost grows as n_occ^3 n_vir^5 per CCSDT iteration and n_occ^4 n_vir^6 per CCSDTQ iteration (less with symmetry).
 - Memory: CCSDT holds a few copies of T3 (8 * n_occ^3/6 * n_vir^3 bytes each);
   CCSDTQ a few copies of T4 (about 8 * n_occ^4/24 * n_vir^4 / n_irreps bytes each).
-- Measured (12-core desktop, water): CCSDT aug-cc-pVTZ (4 occ, 87 vir) 0.7 s per
-  iteration, 12.5 s total; CCSDTQ aug-cc-pVDZ (36 vir) 2.4 s per iteration, 40 s total. 56-core Sapphire Rapids socket: CCSDT 13 occ / 131 vir 9.2 s
-  per iteration; CCSDTQ 13 occ / 47 vir (C2v) 85 s per iteration.
+- Measured (one 56-core Sapphire Rapids socket, water): CCSD aug-cc-pVQZ (4 occ,
+  167 vir) 0.15 s per iteration, 5.0 s total; CCSDT aug-cc-pVTZ (87 vir) 0.17 s per
+  iteration, 3.3 s total; CCSDT aug-cc-pVQZ 1.4 s per iteration, 25 s total;
+  CCSDTQ aug-cc-pVDZ (36 vir) 0.49 s per iteration, 12.5 s total. Same socket:
+  CCSDT 13 occ / 131 vir 9.2 s per iteration; CCSDTQ 13 occ / 47 vir (C2v) 85 s.
+  CCSDT and CCSDTQ gain 15-19x from 56 threads; a second socket adds nothing.
 
 ## Errors
 
@@ -190,5 +193,5 @@ the CPU path is usually faster there.
 ## More
 
 - docs/guide.md: full user guide (all options, checkpoints, tuning switches).
-- docs/benchmarks.md: comparisons with PySCF, ccpy, NWChem and ORCA.
+- docs/benchmarks.md: comparisons with PySCF, Psi4, ccpy, NWChem and ORCA.
 - examples/: runnable scripts (minimal.py needs only NumPy).

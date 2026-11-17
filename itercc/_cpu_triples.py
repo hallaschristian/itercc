@@ -833,7 +833,7 @@ class LadderSectors:
         return even, odd
 
 
-def doubles_ladder(gvvvv, t2, *, virtual_irreps=None, sectors=None):
+def doubles_ladder(gvvvv, t2, *, virtual_irreps=None, sectors=None, blocks=None):
     """0.5 sum_cd g(ab,cd) t2(ij,cd) through the pair sectors of the T3 ladder.
 
     g commutes with pair interchange, so t2(ij) splits into its symmetric and
@@ -842,13 +842,16 @@ def doubles_ladder(gvvvv, t2, *, virtual_irreps=None, sectors=None):
     is computed: the product L(ij,ab) satisfies L(ji,ba) = L(ij,ab). Exact for
     any t2; about 16x fewer operations than the dense contraction with C2v.
     `sectors` = (LadderSectors, even, odd) supplies the sector blocks of g
-    already built (`gvvvv` is then not read).
+    already built, or `blocks` what `_ladder_sectors` returns (`gvvvv` is then
+    not read).
     """
     no, nv = t2.shape[0], t2.shape[2]
     if sectors is not None:
         structure, even, odd = sectors
         p, q, r, s = structure.pairs
         even_blocks, odd_blocks = structure.blocks(even, "even"), structure.blocks(odd, "odd")
+    elif blocks is not None:
+        (p, q, r, s), even_blocks, odd_blocks = blocks
     else:
         (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(gvvvv, virtual_irreps)
     i, j = np.triu_indices(no)
@@ -867,6 +870,54 @@ def doubles_ladder(gvvvv, t2, *, virtual_irreps=None, sectors=None):
     ladder[j, i] = upper.transpose(0, 2, 1)
     ladder *= 0.5
     return ladder
+
+
+class BareLadder:
+    """The CCSD ladder 0.5 sum_cd g~(ab,cd) t2(ij,cd) of the T1-dressed integrals
+    g~ without dressing g(vvvv), which is most of a pass over n^4 per iteration.
+
+    Axes 2 and 3 keep their virtual rows, so g~(abcd) = g(abcd)
+    - sum_k t(ka) g(kbcd) - sum_k t(kb) g(akcd) + sum_kl t(ka) t(lb) g(klcd), and
+    with the pair symmetry of g and t2 the ladder is L(g) - B - B(ji,ba) with
+        B(ij,ab) = sum_k t(ka) Q(ij,k,b),  Q(ij,k,b) = Y(ij,k,b) - 0.5 sum_l W(ij,k,l) t(lb),
+        Y(ij,k,b) = 0.5 sum_cd g(kbcd) t2(ijcd),  W(ij,kl) = 0.5 sum_cd g(klcd) t2(ijcd):
+    the undressed ladder from pair sectors built once (`structure`, a
+    LadderSectors, else `_ladder_sectors` with `virtual_irreps`) and o^3 v^3
+    corrections. Exact for any T1. The undressed ladder also takes
+    t1(ic) t1(jd), adding 0.5 sum_ef g(abef) t1(ie) t1(jf): the part of the
+    dressed g(abij) that `dressed_integrals(..., ccsd=True)` leaves out.
+    """
+
+    def __init__(self, g, no, *, structure=None, virtual_irreps=None, threads=None):
+        n = g.shape[0]
+        o, v = slice(0, no), slice(no, n)
+        nv = n - no
+        self.no, self.nv, self.threads, self.virtual_irreps = no, nv, threads, virtual_irreps
+        # (cd, kb) and (cd, kl): the right-hand sides of Y and W.
+        self.ovvv = np.ascontiguousarray(g[o, v, v, v].transpose(2, 3, 0, 1)).reshape(nv * nv, no * nv)
+        self.oovv = np.ascontiguousarray(g[o, o, v, v].transpose(2, 3, 0, 1)).reshape(nv * nv, no * no)
+        if structure is not None:
+            self.sectors, self.blocks = (structure, *structure.build(g[v, v, v, v], threads=threads)), None
+        else:
+            self.sectors, self.blocks = None, _ladder_sectors(g[v, v, v, v], virtual_irreps)
+
+    def __call__(self, t1, t2):
+        no, nv, threads = self.no, self.nv, self.threads
+        t1 = np.ascontiguousarray(t1, dtype=np.float64)
+        tau = t2 + t1[:, None, :, None] * t1[None, :, None, :]
+        ladder = doubles_ladder(None, tau, virtual_irreps=self.virtual_irreps, sectors=self.sectors,
+                                blocks=self.blocks)
+        rows = np.ascontiguousarray(t2).reshape(no * no, nv * nv)
+        q = matmul(rows, self.ovvv, np.empty((no * no, no * nv)), alpha=0.5, threads=threads)
+        w = matmul(rows, self.oovv, np.empty((no * no, no * no)), alpha=0.5, threads=threads)
+        matmul(w.reshape(no**3, no), t1, q.reshape(no**3, nv), alpha=-0.5, beta=1.0, threads=threads)
+        # B as (a, ij, b) = t1^T @ Q with Q as (k, ij b).
+        columns = np.ascontiguousarray(q.reshape(no * no, no, nv).transpose(1, 0, 2)).reshape(no, no * no * nv)
+        b = matmul(np.ascontiguousarray(t1.T), columns, np.empty((nv, no * no * nv)), threads=threads)
+        b = b.reshape(nv, no, no, nv).transpose(1, 2, 0, 3)
+        ladder -= b
+        ladder -= b.transpose(1, 0, 3, 2)
+        return ladder
 
 
 def _ladder_chunk(nv, count, pairs, budget):
@@ -1031,14 +1082,19 @@ def _feedback_terms(m, q, x_plane, r1, r2, vooo, vvvo, f, g, o, v):
     subtract_reversed(vvvo, y6.reshape(no, nv, nv, nv))
 
 
-def dressed_integrals(g0, t1, threads=None):
+def dressed_integrals(g0, t1, threads=None, *, ccsd=False, out=None):
     """A C-ordered copy of the integrals g0 dressed with T1 along all four axes
     (`solver._dress_axis` in turn: axes 0 and 1 add -t1.T times the occupied
     rows to the virtual ones, axes 2 and 3 t1 times the virtual rows to the
     occupied ones), copied and dressed on all threads; None without the
     compiled kernels. NumPy's copy and tensordot moved the whole tensor several
     times on one thread (about 1.4 s per evaluation at 88 virtuals) for 9 GF of
-    arithmetic."""
+    arithmetic. With `ccsd` only what the CCSD residual reads, never reading
+    g(vvvv) (`itercc_dress_integrals_ccsd`): in the planes g(a, b, ., .) of two
+    virtual indices only the occupied-occupied block, and that without
+    sum_ef t1(i,e) t1(j,f) g(abef), which `BareLadder` adds; the rest of those
+    planes is left unset. `out` (a C-ordered float64 n^4 array) receives the
+    fused dressing when given."""
     library = _kernels.library()
     if (library is None or not all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in (g0, t1))
             or g0.ndim != 4 or t1.ndim != 2):
@@ -1049,15 +1105,18 @@ def dressed_integrals(g0, t1, threads=None):
     n = g0.shape[0]
     if g0.shape != (n,) * 4 or n != no + nv:
         return None
+    if ccsd and (not hasattr(library, "dress_integrals_ccsd") or any(s % 8 for s in g0.strides)):
+        raise ValueError("the CCSD dressing needs the compiled kernel and a float64 g0")
     threads = cpu_threads(threads)
     up = np.ascontiguousarray(t1, dtype=np.float64)            # (no, nv)
     if all(stride % 8 == 0 for stride in g0.strides):
         # Fused: two passes over the tensor instead of a copy and four (the
         # dressing is memory bound; the four axis maps commute).
-        g = np.empty((n,) * 4)
+        g = (out if out is not None and out.shape == (n,) * 4 and out.dtype == np.float64
+             and out.flags.c_contiguous and out is not g0 else np.empty((n,) * 4))
         strides = np.asarray([stride // 8 for stride in g0.strides], dtype=np.int64)
-        library.dress_integrals(g.ctypes.data, g0.ctypes.data, strides.ctypes.data, n, no,
-                                up.ctypes.data, threads)
+        kernel = library.dress_integrals_ccsd if ccsd else library.dress_integrals
+        kernel(g.ctypes.data, g0.ctypes.data, strides.ctypes.data, n, no, up.ctypes.data, threads)
         return g
     g = _cpu_quadruples.copy(g0)
     down = np.ascontiguousarray(-t1.T, dtype=np.float64)       # (nv, no)

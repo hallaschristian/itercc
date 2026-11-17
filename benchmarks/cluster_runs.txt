@@ -1,0 +1,176 @@
+# Runs of benchmarks/cluster_campaign.sh: water, one 56-core Sapphire Rapids socket
+# per run, one run at a time; longest first (with WORKERS=2 the sockets then finish
+# together). Slow program/basis pairs time a few iterations (--max-iter) instead of
+# converging.
+
+# ---- long
+--code ccpy --method ccsdtq --basis aug-cc-pvdz --max-iter 1 --timeout 10800
+--code pyscf --method ccsdtq --basis aug-cc-pvdz --max-iter 2 --timeout 10800
+--code nwchem --method ccsdtq --basis aug-cc-pvdz --timeout 14400 --threads 28
+--code nwchem --method response --basis cc-pvtz --timeout 14400 --threads 28
+--code ccpy --method ccsdt --basis cc-pvqz --max-iter 2 --timeout 10800
+--code pyscf --method ccsdt --basis aug-cc-pvqz --max-iter 2 --timeout 10800
+--code pyscf-highm --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --timeout 10800
+--code nwchem --method ccsdt --basis aug-cc-pvqz --max-iter 3 --timeout 10800 --threads 28
+--code nwchem --method eom-ccsdt --basis cc-pvtz --roots 3 --irrep 2 --irrep-name b2 --timeout 10800 --threads 28
+--code pyscf-highm --method ccsdt --basis aug-cc-pvqz --max-iter 3 --timeout 10800
+--code nwchem --method ccsdt --basis cc-pvqz --timeout 10800 --threads 28
+--code pyscf --method ccsdt --basis cc-pvqz --max-iter 3 --timeout 10800
+--code pyscf-highm --method ccsdt --basis cc-pvqz --timeout 10800
+--code ccpy --method ccsdtq --basis cc-pvdz --max-iter 2 --timeout 7200
+--code pyscf --method ccsdtq --basis cc-pvdz --max-iter 3 --timeout 7200
+--code ccpy --method ccsdt --basis aug-cc-pvtz --timeout 10800
+--code nwchem --method response --basis aug-cc-pvdz --timeout 7200 --threads 28
+
+# ---- CCSDT
+--code itercc --method ccsdt --basis aug-cc-pvqz
+--code itercc-nosym --method ccsdt --basis aug-cc-pvqz --max-iter 3
+--code nwchem --method response --basis cc-pvdz --timeout 7200 --threads 14
+--code ccpy --method eom-ccsdt --basis aug-cc-pvdz --roots 3 --irrep 2 --timeout 7200
+--code ccpy --method eom-ccsdt --basis cc-pvdz --roots 3 --irrep 2 --timeout 7200
+--code nwchem --method eom-ccsdt --basis aug-cc-pvdz --roots 3 --irrep 2 --irrep-name b2 --timeout 7200 --threads 28
+--code nwchem --method eom-ccsdt --basis cc-pvdz --roots 3 --irrep 2 --irrep-name b2 --timeout 7200 --threads 14
+--code pyscf --method ccsdt --basis aug-cc-pvtz --timeout 7200
+--code pyscf-highm --method ccsdt --basis aug-cc-pvtz --timeout 7200
+--code nwchem --method ccsdt --basis aug-cc-pvtz --timeout 7200 --threads 28
+--code ccpy --method ccsdt --basis cc-pvtz --timeout 7200
+--code pyscf --method ccsdt --basis cc-pvtz --timeout 7200
+--code pyscf-highm --method ccsdt --basis cc-pvtz --timeout 7200
+--code nwchem --method ccsdt --basis cc-pvtz --timeout 7200 --threads 28
+--code ccpy --method ccsdt --basis aug-cc-pvdz
+--code pyscf --method ccsdt --basis aug-cc-pvdz
+--code pyscf-highm --method ccsdt --basis aug-cc-pvdz
+--code nwchem --method ccsdt --basis aug-cc-pvdz --threads 28
+--code ccpy --method ccsdt --basis cc-pvdz
+--code pyscf --method ccsdt --basis cc-pvdz
+--code pyscf-highm --method ccsdt --basis cc-pvdz
+--code nwchem --method ccsdt --basis cc-pvdz --threads 14
+--code ccpy --method ccsdt --basis 6-31g
+--code pyscf --method ccsdt --basis 6-31g
+--code pyscf-highm --method ccsdt --basis 6-31g
+--code nwchem --method ccsdt --basis 6-31g --threads 14
+
+# ---- CCSDTQ
+--code ccpy --method ccsdtq --basis 6-31g*
+--code pyscf --method ccsdtq --basis 6-31g*
+--code pyscf-highm --method ccsdtq --basis 6-31g*
+--code nwchem --method ccsdtq --basis 6-31g* --threads 14
+--code pyscf-highm --method ccsdtq --basis cc-pvdz --timeout 7200
+--code nwchem --method ccsdtq --basis cc-pvdz --timeout 7200 --threads 14
+--code ccpy --method ccsdtq --basis 6-31g
+--code pyscf --method ccsdtq --basis 6-31g
+--code pyscf-highm --method ccsdtq --basis 6-31g
+--code nwchem --method ccsdtq --basis 6-31g --threads 14
+
+# ---- CCSD
+--code ccpy --method ccsd --basis aug-cc-pvqz --timeout 7200
+--code nwchem --method ccsd --basis aug-cc-pvqz --timeout 7200 --threads 28
+--code psi4 --method ccsd --basis aug-cc-pvqz --timeout 7200
+--code pyscf --method ccsd --basis aug-cc-pvqz --timeout 7200
+--code ccpy --method ccsd --basis cc-pvqz
+--code nwchem --method ccsd --basis cc-pvqz --threads 28
+--code psi4 --method ccsd --basis cc-pvqz
+--code pyscf --method ccsd --basis cc-pvqz
+--code ccpy --method ccsd --basis aug-cc-pvtz
+--code nwchem --method ccsd --basis aug-cc-pvtz --threads 28
+--code psi4 --method ccsd --basis aug-cc-pvtz
+--code pyscf --method ccsd --basis aug-cc-pvtz
+--code ccpy --method ccsd --basis cc-pvtz
+--code nwchem --method ccsd --basis cc-pvtz --threads 28
+--code psi4 --method ccsd --basis cc-pvtz
+--code pyscf --method ccsd --basis cc-pvtz
+--code ccpy --method ccsd --basis aug-cc-pvdz
+--code nwchem --method ccsd --basis aug-cc-pvdz --threads 28
+--code psi4 --method ccsd --basis aug-cc-pvdz
+--code pyscf --method ccsd --basis aug-cc-pvdz
+--code ccpy --method ccsd --basis cc-pvdz
+--code nwchem --method ccsd --basis cc-pvdz --threads 14
+--code psi4 --method ccsd --basis cc-pvdz
+--code pyscf --method ccsd --basis cc-pvdz
+--code ccpy --method ccsd --basis 6-31g
+--code nwchem --method ccsd --basis 6-31g --threads 14
+--code psi4 --method ccsd --basis 6-31g
+--code pyscf --method ccsd --basis 6-31g
+
+# ---- polarizabilities (CCSD)
+--code nwchem --method response-ccsd --basis aug-cc-pvtz --timeout 7200 --threads 28
+--code psi4 --method response-ccsd --basis aug-cc-pvtz --timeout 7200
+--code nwchem --method response-ccsd --basis cc-pvtz --threads 28
+--code psi4 --method response-ccsd --basis cc-pvtz
+--code nwchem --method response-ccsd --basis aug-cc-pvdz --threads 28
+--code psi4 --method response-ccsd --basis aug-cc-pvdz
+--code nwchem --method response-ccsd --basis cc-pvdz --threads 14
+--code psi4 --method response-ccsd --basis cc-pvdz
+
+# ---- IterCC (short; last so they run on a node with nothing else heavy on the other socket for long)
+--code itercc --method ccsdtq --basis cc-pvtz --timeout 7200
+--code itercc --method ccsdtq --basis aug-cc-pvdz
+--code itercc-nosym --method ccsdtq --basis aug-cc-pvdz --max-iter 3
+--code itercc --method response --basis cc-pvtz --timeout 7200
+--code itercc --method eom-ccsdt --basis cc-pvtz --roots 3 --irrep 2 --timeout 7200
+--code itercc --method response --basis aug-cc-pvdz
+--code itercc --method response --basis cc-pvdz
+--code itercc --method eom-ccsdt --basis aug-cc-pvdz --roots 3 --irrep 2
+--code itercc --method eom-ccsdt --basis cc-pvdz --roots 3 --irrep 2
+--code itercc --method response-ccsd --basis aug-cc-pvtz
+--code itercc --method response-ccsd --basis cc-pvtz
+--code itercc --method response-ccsd --basis aug-cc-pvdz
+--code itercc --method response-ccsd --basis cc-pvdz
+--code itercc --method ccsdt --basis cc-pvqz
+--code itercc-nosym --method ccsdt --basis cc-pvqz
+--code itercc --method ccsdtq --basis cc-pvdz
+--code itercc-nosym --method ccsdtq --basis cc-pvdz
+--code itercc --method ccsdtq --basis 6-31g*
+--code itercc-nosym --method ccsdtq --basis 6-31g*
+--code itercc --method ccsdtq --basis 6-31g
+--code itercc-nosym --method ccsdtq --basis 6-31g
+--code itercc --method ccsdt --basis aug-cc-pvtz
+--code itercc-nosym --method ccsdt --basis aug-cc-pvtz
+--code itercc --method ccsdt --basis cc-pvtz
+--code itercc-nosym --method ccsdt --basis cc-pvtz
+--code itercc --method ccsdt --basis aug-cc-pvdz
+--code itercc-nosym --method ccsdt --basis aug-cc-pvdz
+--code itercc --method ccsdt --basis cc-pvdz
+--code itercc-nosym --method ccsdt --basis cc-pvdz
+--code itercc --method ccsdt --basis 6-31g
+--code itercc-nosym --method ccsdt --basis 6-31g
+--code itercc --method ccsd --basis aug-cc-pvqz
+--code itercc-nosym --method ccsd --basis aug-cc-pvqz
+--code itercc --method ccsd --basis cc-pvqz
+--code itercc-nosym --method ccsd --basis cc-pvqz
+--code itercc --method ccsd --basis aug-cc-pvtz
+--code itercc-nosym --method ccsd --basis aug-cc-pvtz
+--code itercc --method ccsd --basis cc-pvtz
+--code itercc-nosym --method ccsd --basis cc-pvtz
+--code itercc --method ccsd --basis aug-cc-pvdz
+--code itercc-nosym --method ccsd --basis aug-cc-pvdz
+--code itercc --method ccsd --basis cc-pvdz
+--code itercc-nosym --method ccsd --basis cc-pvdz
+--code itercc --method ccsd --basis 6-31g
+--code itercc-nosym --method ccsd --basis 6-31g
+
+# ---- IterCC thread scaling on one socket (a few iterations each), then the whole node
+@scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 1 --timeout 10800
+@scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 1
+@scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 1
+@scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 2 --timeout 7200
+@scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 2
+@scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 2
+@scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 4
+@scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 4
+@scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 4
+@scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 8
+@scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 8
+@scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 8
+@scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 14
+@scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 14
+@scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 14
+@scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 28
+@scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 28
+@scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 28
+@scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 56
+@scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 56
+@scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 56
+@node --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 112
+@node --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 112
+@node --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 112

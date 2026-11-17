@@ -40,7 +40,7 @@ def from_rhf(mf, *, frozen=0):
     # RKS subclasses RHF; its get_veff would put the XC potential in a frozen core.
     if not isinstance(mf, scf.hf.RHF) or isinstance(mf, KohnShamDFT) or not mf.converged:
         raise ValueError("Expected converged RHF (or scalar-X2C RHF)")
-    if getattr(mf, "with_df", None) is not None:
+    if _attribute(mf, "with_df") is not None:
         raise ValueError("Density fitting is outside this exact-integral adapter")
     coeff = np.asarray(mf.mo_coeff)
     occ = np.asarray(mf.mo_occ)
@@ -61,9 +61,39 @@ def from_rhf(mf, *, frozen=0):
         h = hcore + potential
         constant += np.einsum("pq,qp->", hcore + 0.5 * potential, dm)
     source = mf._eri if mf._eri is not None else mf.mol
-    eri = ao2mo.restore(1, ao2mo.kernel(source, active), active.shape[1])
+    eri = _full_eri(ao2mo.kernel(source, active), active.shape[1])
     return SpatialIntegrals(active.T @ h @ active, eri, nocc - frozen, float(constant), active,
                             _orbital_irreps(mf, frozen))
+
+
+def _attribute(obj, name):
+    """obj.name, or None, without PySCF's lazy `__getattr__`: a missing
+    attribute of a mean-field object imports every PySCF module first (about
+    0.25 s, most of `from_rhf` for a small molecule)."""
+    try:
+        return object.__getattribute__(obj, name)
+    except AttributeError:
+        return None
+
+
+def _full_eri(packed, n):
+    """The n^4 (pq|rs) from PySCF's 4-fold packed MO integrals: unpacked on all
+    threads by the compiled core (ao2mo.restore runs on one)."""
+    from pyscf import ao2mo
+
+    from . import _cpu_kernels
+
+    library = _cpu_kernels.library()
+    packed = np.asarray(packed)
+    npair = n * (n + 1) // 2
+    if library is None or packed.shape != (npair, npair) or packed.dtype != np.float64:
+        return ao2mo.restore(1, packed, n)
+    from ._cpu_triples import cpu_threads
+
+    packed = np.ascontiguousarray(packed)
+    full = np.empty((n,) * 4)
+    library.unpack_s4(full.ctypes.data, packed.ctypes.data, n, cpu_threads(None))
+    return full
 
 
 def _orbital_irreps(mf, frozen):
