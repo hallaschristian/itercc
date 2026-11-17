@@ -16,7 +16,7 @@ polarizabilities converged to tight thresholds.
 ## Highlights
 
 - **Fast where it counts.** On one 56-core cluster CPU socket, water CCSDT in
-  aug-cc-pVTZ converges in 2.6 s with IterCC, against 30 s for NWChem, 136 s
+  aug-cc-pVTZ converges in 2.7 s with IterCC, against 30 s for NWChem, 136 s
   for PySCF and 383 s for ccpy. An aug-cc-pVDZ CCSDTQ iteration is 33 times
   faster than NWChem's and 340 times faster than PySCF's, and an aug-cc-pVQZ
   CCSD iteration 11 to 99 times faster than those of NWChem, PySCF, Psi4 and

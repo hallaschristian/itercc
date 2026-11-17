@@ -444,6 +444,7 @@ class RestrictedCC:
         self._labels = labels if orbital_irreps is not None else None
         self._blocked_plan = None
         self._integrals_symmetric = self._ladder_structure = self._bare_ladder = None
+        self._ladder_bare = None                # sector blocks of the bare g(vvvv), `_ladder_g`
         self._dressing_buffer, self._hold_dressing = None, False
         self._cpu_blocked = os.environ.get("ITERCC_BLOCKED", "1") != "0"
         self._contract = partial(eq.contract, xp=self._xp)
@@ -478,16 +479,17 @@ class RestrictedCC:
                 raise ValueError("T3 repeated occupied slots must have matching virtual symmetry")
         return arrays
 
-    def _dressed(self, t1, ccsd=False):
+    def _dressed(self, t1, ccsd=False, open=False):
         """(f, g) dressed with T1; `ccsd`: only what the CCSD residual reads
-        (`_cpu.dressed_integrals`), for `_bare_ladder_for`."""
+        (`_cpu.dressed_integrals`), for `_bare_ladder_for`; `open`: all but
+        g~(vvvv), for `_open_dressing`."""
         o, v = self.o, self.v
         xp = self._xp
         h = xp.array(self.h, copy=True)
         _dress_axis(h, 0, v, o, -t1.T, xp)
         _dress_axis(h, 1, o, v, t1, xp)
         if xp is np and self._t1_dressing is None:
-            g = _cpu.dressed_integrals(self.g, t1, self._cpu_threads, ccsd=ccsd,
+            g = _cpu.dressed_integrals(self.g, t1, self._cpu_threads, ccsd=ccsd, open=open,
                                        out=self._dressing_output())
             if g is not None:
                 return _fock(h, g, o, xp=xp), g
@@ -602,15 +604,23 @@ class RestrictedCC:
         xp, contract = self._xp, self._contract
         t1, t2, t3 = amplitudes
         o, v = self.o, self.v
+        threaded = (xp is np and self._cpu_fast and triples is None
+                    and tangent_feedback is None)
         bare = self._bare_ladder_for(t1, t2, t3)
+        blocked, open_ = None, False
         if bare is not None:
             # CCSD: g(vvvv) stays undressed and unread (`_cpu.BareLadder`).
             f, g = self._dressed(t1, ccsd=True)
             ladder_g = None
             ladder = lambda _, t2: bare(t1, t2)                  # noqa: E731
         else:
-            f, g = self._dressed(t1)
-            ladder_g = self._ladder_g(g, t1) if xp is np and self._cpu_fast else None
+            if threaded and len(t3):
+                blocked = self._blocked_t3(t1, t2, t3, _cpu.cpu_threads(self._cpu_threads))
+            # CCSDT on blocked T3 reads g~(vvvv) only through the ladder sectors,
+            # formed from the bare ones and T1: the dressing leaves it out.
+            open_ = blocked is not None and self._open_dressing(t1)
+            f, g = self._dressed(t1, open=True) if open_ else self._dressed(t1)
+            ladder_g = self._ladder_g(g, t1, bare=open_) if xp is np and self._cpu_fast else None
             ladder = (partial(_cpu.doubles_ladder, virtual_irreps=self._virtual_irreps, sectors=ladder_g)
                       if xp is np and self._cpu_fast else None)
             if ladder is None and self._tangent_ladder is not None:
@@ -620,11 +630,8 @@ class RestrictedCC:
         if not len(t3):
             return r1, r2 + r2.transpose(1, 0, 3, 2), xp.zeros(self.layout.shape)
         vooo, vvvo = eq.triples_sources(f, g, t2, c2, o, v, contract)
-        threaded = (xp is np and self._cpu_fast and triples is None
-                    and tangent_feedback is None)
         with (_cpu.ThreadPool(_cpu.cpu_threads(self._cpu_threads)) if threaded
               else nullcontext()) as pool:
-            blocked = self._blocked_t3(t1, t2, t3, pool.workers) if threaded else None
             if have_t3:
                 if blocked is not None:
                     _blocked.feedback(*blocked[:2], r1, r2, vooo, vvvo, f, g, blocked[2], o, v,
@@ -646,11 +653,15 @@ class RestrictedCC:
             if blocked is not None:
                 layout, tables, t3b = blocked
                 try:
+                    # ladder_g was built for this evaluation: the T3 ladder matrix
+                    # may take its blocks over.
                     r3 = _blocked.triples(layout, tables, t2, t3b, have_t3, intermediates, vooo,
-                                          vvvo, g, o, v, pool.workers, ladder_g=ladder_g)
+                                          vvvo, g, o, v, pool.workers, ladder_g=ladder_g, ladder_owned=True)
                     return r1, r2, layout.unpack(r3, threads=pool.workers)
                 except _blocked.NotBlockable:
                     self._cpu_blocked = False       # an operator couples irreps: stay dense
+                    if open_:                       # the dense path reads g~(vvvv)
+                        g = _cpu.dressed_integrals(self.g, t1, self._cpu_threads, out=g)
             if threaded:
                 return r1, r2, _cpu.triples(self.layout, t2, t3, have_t3, intermediates, vooo,
                                             vvvo, g, o, v, pool, ph_irreps=self._ph_irreps,
@@ -742,14 +753,30 @@ class RestrictedCC:
                                                 virtual_irreps=self._virtual_irreps, threads=self._cpu_threads)
         return self._bare_ladder
 
-    def _ladder_g(self, g, t1):
+    def _ladder_g(self, g, t1, bare=False):
         """(LadderSectors, even, odd): the sector blocks of the dressed g(vvvv), for
         the doubles and triples ladders, or None. With symmetric integrals and a
         T1 that is zero in every forbidden entry the dressed Hamiltonian is
-        exactly block-diagonal in pair irreps, so its blocks are all of it."""
+        exactly block-diagonal in pair irreps, so its blocks are all of it.
+        From the dressed `g`, or with `bare` from the blocks of the bare
+        g(vvvv) (built once) and T1 (`LadderSectors.dressed`)."""
+        if not isinstance(g, np.ndarray) or g.dtype != np.float64:
+            return None
+        structure = self._sector_structure(t1)
+        if structure is None:
+            return None
+        v = self.v
+        if not bare:
+            return (structure, *structure.build(g[v, v, v, v]))
+        if self._ladder_bare is None:
+            self._ladder_bare = structure.build(self.g[v, v, v, v])
+        return (structure, *structure.dressed(self._ladder_bare, self.g, self.layout.no, t1))
+
+    def _sector_structure(self, t1):
+        """The LadderSectors of `_ladder_g` when the sector blocks are all of the
+        dressed g(vvvv) for this T1, else None."""
         if (self._labels is None or not self._cpu_blocked or self._virtual_irreps is None
-                or _cpu._kernels.library() is None or not isinstance(g, np.ndarray)
-                or g.dtype != np.float64):
+                or _cpu._kernels.library() is None):
             return None
         no = self.layout.no
         occupied, virtual = self._labels[:no], self._labels[no:]
@@ -759,8 +786,22 @@ class RestrictedCC:
             from ._blocked import irrep_groups
 
             self._ladder_structure = _cpu.LadderSectors(virtual, irrep_groups(self._labels))
-        v = self.v
-        return (self._ladder_structure, *self._ladder_structure.build(g[v, v, v, v]))
+        return self._ladder_structure
+
+    def _open_dressing(self, t1):
+        """Whether a CCSDT evaluation on blocked T3 may dress without g~(vvvv):
+        its ladders take g~(vvvv) only as sector blocks, which come from those
+        of the bare g(vvvv) and T1, and every other block it reads has an
+        occupied index. Water aug-cc-pVQZ: the dressing and the sector build
+        moved about 34 GB per iteration, now about 9. ITERCC_OPEN_DRESSING=0
+        turns it off."""
+        g = self.g
+        if (os.environ.get("ITERCC_OPEN_DRESSING", "1") == "0" or self._t1_dressing is not None
+                or "_dressed" in vars(self) or type(self)._dressed is not RestrictedCC._dressed
+                or not hasattr(_cpu._kernels.library(), "ladder_sectors_t1")
+                or not isinstance(g, np.ndarray) or g.dtype != np.float64 or any(x % 8 for x in g.strides)):
+            return False
+        return self._sector_structure(t1) is not None
 
     def _blocked_t3(self, t1, t2, t3, threads):
         """(layout, plane tables, blocked T3) when the blocked CPU path applies, else None.

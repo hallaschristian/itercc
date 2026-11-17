@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 18
+#define ITERCC_CORE_ABI 19
 
 /* Library identity. */
 int itercc_core_abi(void);
@@ -319,6 +319,11 @@ void itercc_dress_integrals(double *dst, const double *src, const int64_t *ss, i
  * sum_ef t1(i,e) t1(j,f) g(p,q,e,f). Other entries are left as they were. */
 void itercc_dress_integrals_ccsd(double *dst, const double *src, const int64_t *ss, int64_t n, int64_t no,
                                  const double *t1, int threads);
+/* Every entry of itercc_dress_integrals with an occupied index, the same
+ * values; the virtual-virtual block of the planes with p and q virtual is not
+ * written (the ladder sectors come from itercc_ladder_sectors_t1). */
+void itercc_dress_integrals_open(double *dst, const double *src, const int64_t *ss, int64_t n, int64_t no,
+                                 const double *t1, int threads);
 /* out (n^4) = the first-order change of the T1-dressed g (C order) along d
  * (no x nv): -d^T times the occupied rows added to the virtual rows of legs 0
  * and 1, d times the virtual rows added to the occupied rows of legs 2 and 3,
@@ -349,6 +354,15 @@ void itercc_ladder_sectors(const double *w, const int64_t *ws, const double *vv,
                            const int64_t *even_off, const int64_t *r, const int64_t *s,
                            const int64_t *odd_start, const int64_t *odd_off, double *even, double *odd,
                            int accumulate, int threads);
+/* The sector blocks (as itercc_ladder_sectors) of the T1-dressed g(vvvv)
+ * from those of the bare g(vvvv) (base_*) and the bare g (n^4, element
+ * strides gs): g~(abcd) = g(abcd) - sum_k t(k,a) Q(k,b,c,d) - sum_k t(k,b)
+ * Q(k,a,d,c), Q(k,b,c,d) = g(k,b,c,d) - 0.5 sum_l t(l,b) g(k,l,c,d). */
+void itercc_ladder_sectors_t1(const double *g, const int64_t *gs, int64_t n, int64_t no, const double *t1,
+                              int64_t groups, const int64_t *p, const int64_t *q, const int64_t *even_start,
+                              const int64_t *even_off, const int64_t *r, const int64_t *s,
+                              const int64_t *odd_start, const int64_t *odd_off, const double *base_even,
+                              const double *base_odd, double *even, double *odd, int threads);
 /* r3[i,j,k,a,b,c] /= (eia[i,a] + eia[j,b]) + eia[k,c] (dense no^3 nv^3). */
 void itercc_t3_divide(double *r3, int64_t no, int64_t nv, const double *eia, int threads);
 

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- CCSDT no longer dresses the all-virtual block of the integrals. On the
+  symmetry-blocked path g~(vvvv) enters only through the sector blocks of the
+  ladders, which now come from those of the bare g(vvvv), built once, and
+  the rank-o T1 terms (`LadderSectors.dressed`, `itercc_ladder_sectors_t1`);
+  the dressing (`itercc_dress_integrals_open`) writes every other entry with
+  the same values as before and reads g(vvvv) once. The T3 ladder matrix
+  takes the sector blocks over instead of copying them. Water on one 56-core
+  socket: aug-cc-pVQZ 0.99 instead of 1.25 s per iteration (dressing 89
+  instead of 245 ms, sectors 23 instead of 45 ms; 24x from 56 threads instead
+  of 22x), cc-pVQZ 0.24 instead of 0.29 s. `ITERCC_OPEN_DRESSING=0` restores
+  the full dressing. Core ABI 19.
 - Iterations no longer fault their memory in anew (Linux, glibc). glibc
   maps large blocks on their own and unmaps them when freed, and returns
   freed heap to the kernel at thresholds it moves at run time, so every

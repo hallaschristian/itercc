@@ -839,6 +839,26 @@ class LadderSectors:
             cpu_threads(threads))
         return even, odd
 
+    def dressed(self, bare, g, no, t1, *, out=None, threads=None):
+        """(even, odd) sector blocks of the T1-dressed g(vvvv) from `bare`, those
+        of the bare g(vvvv) (`build`), and the bare integrals `g` (a float64
+        n^4 view): g~(abcd) = g(abcd) - sum_k t(k,a) Q(k,b,c,d)
+        - sum_k t(k,b) Q(k,a,d,c), Q(k,b,c,d) = g(k,b,c,d) - 0.5 sum_l t(l,b)
+        g(k,l,c,d) (`itercc_ladder_sectors_t1`): one pass over the sectors and
+        o v^3 terms instead of dressing g(vvvv) and reading it again."""
+        if g.dtype != np.float64 or g.ndim != 4 or any(x % 8 for x in g.strides):
+            raise ValueError("expected a float64 n^4 view of the integrals")
+        even, odd = self.empty() if out is None else out
+        strides = np.asarray([x // 8 for x in g.strides], dtype=np.int64)
+        t1 = np.ascontiguousarray(t1, dtype=np.float64)
+        (p, q, es, eo, _), (r, s, os_, oo, _) = self.even, self.odd
+        _kernels.library().ladder_sectors_t1(
+            g.ctypes.data, strides.ctypes.data, g.shape[0], int(no), t1.ctypes.data, self.groups,
+            p.ctypes.data, q.ctypes.data, es.ctypes.data, eo.ctypes.data, r.ctypes.data, s.ctypes.data,
+            os_.ctypes.data, oo.ctypes.data, bare[0].ctypes.data, bare[1].ctypes.data, even.ctypes.data,
+            odd.ctypes.data, cpu_threads(threads))
+        return even, odd
+
     def blocks(self, matrices, which):
         """[(rows, rows, block)] views of packed blocks, for `_product`."""
         _, _, start, offset, _ = self.even if which == "even" else self.odd
@@ -851,13 +871,14 @@ class LadderSectors:
                               matrices[offset[g]:offset[g] + n * n].reshape(n, n)))
         return found
 
-    def ladder_matrix(self, g_sectors, vv, t2, g_oovv, threads=None):
+    def ladder_matrix(self, g_sectors, vv, t2, g_oovv, threads=None, *, inplace=False):
         """Sector blocks of W(ab,de) = g(ab,de) + sum_lm g(lm,de) t2(lm,ab)
         + 0.5 (vv x 1 + 1 x vv) (`_ladder_matrix`) from the blocks of g: the
-        t2 term as one small GEMM per sector, ranked by the occupied pairs."""
+        t2 term as one small GEMM per sector, ranked by the occupied pairs.
+        `inplace` adds the terms to `g_sectors` instead of a copy."""
         from ._cpu_quadruples import copy
 
-        even, odd = (copy(x) for x in g_sectors)
+        even, odd = g_sectors if inplace else (copy(x) for x in g_sectors)
         self.build(None, vv=vv, out=(even, odd), accumulate=True, threads=threads)
         no = t2.shape[0]
         for (x, y, start, offset, _), matrices, sign in ((self.even, even, 1.0), (self.odd, odd, -1.0)):
@@ -1167,7 +1188,7 @@ def _feedback_terms(m, q, x_plane, r1, r2, vooo, vvvo, f, g, o, v):
     subtract_reversed(vvvo, y6.reshape(no, nv, nv, nv))
 
 
-def dressed_integrals(g0, t1, threads=None, *, ccsd=False, out=None):
+def dressed_integrals(g0, t1, threads=None, *, ccsd=False, open=False, out=None):
     """A C-ordered copy of the integrals g0 dressed with T1 along all four axes
     (`solver._dress_axis` in turn: axes 0 and 1 add -t1.T times the occupied
     rows to the virtual ones, axes 2 and 3 t1 times the virtual rows to the
@@ -1178,7 +1199,10 @@ def dressed_integrals(g0, t1, threads=None, *, ccsd=False, out=None):
     g(vvvv) (`itercc_dress_integrals_ccsd`): in the planes g(a, b, ., .) of two
     virtual indices only the occupied-occupied block, and that without
     sum_ef t1(i,e) t1(j,f) g(abef), which `BareLadder` adds; the rest of those
-    planes is left unset. `out` (a C-ordered float64 n^4 array) receives the
+    planes is left unset. With `open` every entry with an occupied index,
+    exactly as the full dressing (`itercc_dress_integrals_open`); g~(vvvv) is
+    left unset, for a caller that takes the ladder sectors from
+    `LadderSectors.dressed`. `out` (a C-ordered float64 n^4 array) receives the
     fused dressing when given."""
     library = _kernels.library()
     if (library is None or not all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in (g0, t1))
@@ -1192,6 +1216,8 @@ def dressed_integrals(g0, t1, threads=None, *, ccsd=False, out=None):
         return None
     if ccsd and (not hasattr(library, "dress_integrals_ccsd") or any(s % 8 for s in g0.strides)):
         raise ValueError("the CCSD dressing needs the compiled kernel and a float64 g0")
+    if open and (ccsd or not hasattr(library, "dress_integrals_open") or any(s % 8 for s in g0.strides)):
+        raise ValueError("the open dressing needs the compiled kernel and a float64 g0")
     threads = cpu_threads(threads)
     up = np.ascontiguousarray(t1, dtype=np.float64)            # (no, nv)
     if all(stride % 8 == 0 for stride in g0.strides):
@@ -1200,7 +1226,8 @@ def dressed_integrals(g0, t1, threads=None, *, ccsd=False, out=None):
         g = (out if out is not None and out.shape == (n,) * 4 and out.dtype == np.float64
              and out.flags.c_contiguous and out is not g0 else np.empty((n,) * 4))
         strides = np.asarray([stride // 8 for stride in g0.strides], dtype=np.int64)
-        kernel = library.dress_integrals_ccsd if ccsd else library.dress_integrals
+        kernel = (library.dress_integrals_ccsd if ccsd else library.dress_integrals_open if open
+                  else library.dress_integrals)
         kernel(g.ctypes.data, g0.ctypes.data, strides.ctypes.data, n, no, up.ctypes.data, threads)
         return g
     g = _cpu_quadruples.copy(g0)

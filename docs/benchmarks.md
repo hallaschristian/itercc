@@ -11,16 +11,17 @@ states, EOM-CCSDT excited states and CCSD and CCSDT polarizabilities.
   faster than NWChem, 16x faster than PySCF, 42x faster than Psi4 and 99x
   faster than ccpy. The whole calculation takes 4.3 s, against 6.9 s for
   NWChem, 12.6 s for PySCF, 29 s for Psi4 and 101 s for ccpy.
-- **CCSDT**: in aug-cc-pVTZ an iteration takes 0.15 s: 10x faster than NWChem,
-  61x faster than PySCF and 195x faster than ccpy. The whole calculation takes
-  2.6 s, against 30 s for NWChem, 136 s for PySCF and 383 s for ccpy. IterCC
-  converges aug-cc-pVQZ CCSDT in 23 s; there NWChem's iteration takes 8.6 s.
+- **CCSDT**: in aug-cc-pVTZ an iteration takes 0.14 s: 11x faster than NWChem,
+  64x faster than PySCF and 210x faster than ccpy. The whole calculation takes
+  2.7 s, against 30 s for NWChem, 136 s for PySCF and 383 s for ccpy. IterCC
+  converges aug-cc-pVQZ CCSDT in 19 s (0.99 s per iteration); there NWChem's
+  iteration takes 8.6 s.
 - **CCSDTQ**: in aug-cc-pVDZ an IterCC iteration takes 0.50 s: 33x faster than
   NWChem, 340x faster than PySCF's fastest variant and 1800x faster than ccpy.
   IterCC converges it in 11.1 s and 4.4 GiB, NWChem in 335 s and 66 GiB.
-- **EOM-CCSDT**: three excited states take 17x to 86x less time than in
+- **EOM-CCSDT**: three excited states take 15x to 89x less time than in
   NWChem and about 50x less than in ccpy.
-- **Polarizabilities**: CCSDT linear response takes 9x to 27x less time than
+- **Polarizabilities**: CCSDT linear response takes 10x to 27x less time than
   in NWChem, the one other program here that has it. For CCSD, IterCC and Psi4
   give the same values to every digit shown; IterCC is faster in three of the
   four basis sets.
@@ -102,14 +103,14 @@ IterCC's 13 iterations take 0.8 s of its 4.3 s.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/ccsdt-scaling-dark.svg">
-  <img alt="CCSDT seconds per iteration from 6-31G to aug-cc-pVQZ: IterCC is the fastest at every basis set, at 0.15 s in aug-cc-pVTZ against 1.5 s for NWChem, 9.1 s for PySCF and 29 s for ccpy, and 1.2 s in aug-cc-pVQZ against 8.6 s for NWChem" src="images/ccsdt-scaling-light.svg">
+  <img alt="CCSDT seconds per iteration from 6-31G to aug-cc-pVQZ: IterCC is the fastest at every basis set, at 0.14 s in aug-cc-pVTZ against 1.5 s for NWChem, 9.1 s for PySCF and 29 s for ccpy, and 0.99 s in aug-cc-pVQZ against 8.6 s for NWChem" src="images/ccsdt-scaling-light.svg">
 </picture>
 
 Seconds per iteration:
 
 | | 6-31G (8) | cc-pVDZ (19) | aug-cc-pVDZ (36) | cc-pVTZ (53) | aug-cc-pVTZ (87) | cc-pVQZ (110) | aug-cc-pVQZ (167) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| IterCC | 5 ms | 8 ms | 16 ms | 33 ms | 0.15 s | 0.29 s | 1.2 s |
+| IterCC | 5 ms | 8 ms | 15 ms | 30 ms | 0.14 s | 0.24 s | 0.99 s |
 | IterCC, no symmetry | 5 ms | 9 ms | 23 ms | 65 ms | 0.38 s | 1.00 s | 5.7 s* |
 | PySCF 2.14, `_highm` | 0.21 s | 0.40 s | 0.77 s | 1.8 s | 9.1 s | 19.5 s | 75.4 s* |
 | PySCF 2.14, default | 0.42 s | 1.2 s | 2.6 s | 5.2 s | 24.9 s | 56.1 s* | 217 s* |
@@ -120,7 +121,7 @@ Time from RHF to the converged CCSDT energy (iterations, peak memory):
 
 | | 6-31G (8) | cc-pVDZ (19) | aug-cc-pVDZ (36) | cc-pVTZ (53) | aug-cc-pVTZ (87) | cc-pVQZ (110) | aug-cc-pVQZ (167) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| IterCC | 0.13 s (13 it., 0.1 GiB) | 0.18 s (13 it., 0.2 GiB) | 0.39 s (15 it., 0.4 GiB) | 0.78 s (16 it., 0.7 GiB) | 2.6 s (16 it., 2.7 GiB) | 5.6 s (16 it., 5.8 GiB) | 22.8 s (16 it., 25.9 GiB) |
+| IterCC | 0.13 s (13 it., 0.1 GiB) | 0.20 s (13 it., 0.3 GiB) | 0.35 s (15 it., 0.5 GiB) | 0.72 s (16 it., 0.8 GiB) | 2.7 s (16 it., 2.7 GiB) | 4.7 s (16 it., 5.8 GiB) | 18.9 s (16 it., 25.9 GiB) |
 | IterCC, no symmetry | 0.14 s (13 it., 0.2 GiB) | 0.22 s (13 it., 0.3 GiB) | 0.49 s (15 it., 0.4 GiB) | 1.3 s (16 it., 0.8 GiB) | 6.4 s (16 it., 3.3 GiB) | 16.0 s (16 it., 7.0 GiB) | - |
 | PySCF 2.14, `_highm` | 2.6 s (12 it., 0.2 GiB) | 4.9 s (12 it., 0.5 GiB) | 10.7 s (14 it., 1.3 GiB) | 21.4 s (12 it., 2.0 GiB) | 136 s (15 it., 4.8 GiB) | 272 s (14 it., 9.6 GiB) | - |
 | PySCF 2.14, default | 4.9 s (12 it., 0.2 GiB) | 13.7 s (12 it., 0.6 GiB) | 37.2 s (14 it., 1.1 GiB) | 62.8 s (12 it., 1.7 GiB) | 374 s (15 it., 4.3 GiB) | - | - |
@@ -128,9 +129,9 @@ Time from RHF to the converged CCSDT energy (iterations, peak memory):
 | NWChem 7.3.1 (TCE) | 4.8 s (14 it., 3.9 GiB) | 7.7 s (16 it., 4.0 GiB) | 12.0 s (17 it., 6.9 GiB) | 12.4 s (16 it., 8.9 GiB) | 29.8 s (18 it., 34.1 GiB) | 48.4 s (17 it., 73.2 GiB) | - |
 
 IterCC's lead over PySCF's faster variant grows from about 45x in the
-smallest basis set to 60x-70x from aug-cc-pVTZ on. NWChem's iteration has a
+smallest basis set to 65x-80x from aug-cc-pVTZ on. NWChem's iteration has a
 fixed cost of a few tenths of a second, so its gap to IterCC narrows from 60x
-in the small basis sets to 7x in aug-cc-pVQZ,
+in the small basis sets to 9x in aug-cc-pVQZ,
 where NWChem's 28 ranks held 300 GiB of memory.
 
 ## CCSDTQ
@@ -177,7 +178,7 @@ each root converged to a residual norm of 1e-5.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/eom-ccsdt-dark.svg">
-  <img alt="EOM-CCSDT time for three roots: cc-pVDZ IterCC 1.9 s, ccpy 96 s, NWChem 167 s; aug-cc-pVDZ IterCC 5.3 s, ccpy 289 s, NWChem 198 s; cc-pVTZ IterCC 13.2 s, NWChem 223 s" src="images/eom-ccsdt-light.svg">
+  <img alt="EOM-CCSDT time for three roots: cc-pVDZ IterCC 1.9 s, ccpy 96 s, NWChem 167 s; aug-cc-pVDZ IterCC 5.3 s, ccpy 289 s, NWChem 198 s; cc-pVTZ IterCC 15.1 s, NWChem 223 s" src="images/eom-ccsdt-light.svg">
 </picture>
 
 | | Basis | Seconds | Roots (eV) |
@@ -188,7 +189,7 @@ each root converged to a residual norm of 1e-5.
 | IterCC | aug-cc-pVDZ | 5.3 s | 7.510, 11.162, 11.973 |
 | ccpy 0.0.5 | aug-cc-pVDZ | 289 s | 7.510, 11.162, 11.973 |
 | NWChem 7.3.1 (TCE) | aug-cc-pVDZ | 198 s | 7.510, 11.163, 11.973 |
-| IterCC | cc-pVTZ | 13.2 s | 8.121, 18.477, 20.448 |
+| IterCC | cc-pVTZ | 15.1 s | 8.121, 18.477, 20.448 |
 | NWChem 7.3.1 (TCE) | cc-pVTZ | 223 s | 8.121, 18.477, 20.448 |
 
 ccpy follows its CIS guesses root by root; in cc-pVDZ it converged to a
@@ -218,9 +219,9 @@ coupled-cluster work after SCF: the ground state and both frequencies.
 | CCSD | NWChem 7.3.1 | aug-cc-pVTZ | 9.4775 | 9.7243 | 85.9 s |
 | CCSDT | IterCC | cc-pVDZ | 5.1482 | 5.2534 | 10.1 s |
 | CCSDT | NWChem 7.3.1 | cc-pVDZ | 5.1472 | 5.2523 | 273 s |
-| CCSDT | IterCC | aug-cc-pVDZ | 9.1576 | 9.4013 | 23.8 s |
+| CCSDT | IterCC | aug-cc-pVDZ | 9.1576 | 9.4013 | 22.4 s |
 | CCSDT | NWChem 7.3.1 | aug-cc-pVDZ | 9.1549 | 9.3984 | 414 s |
-| CCSDT | IterCC | cc-pVTZ | 6.9522 | 7.0909 | 43.1 s |
+| CCSDT | IterCC | cc-pVTZ | 6.9522 | 7.0909 | 42.1 s |
 | CCSDT | NWChem 7.3.1 | cc-pVTZ | 6.9514 | 7.0900 | 402 s |
 
 IterCC and Psi4 agree to every digit shown. NWChem's values are lower in the
@@ -239,10 +240,10 @@ over both sockets).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/thread-scaling-dark.svg">
-  <img alt="IterCC speedup over one thread: CCSDT aug-cc-pVQZ 22x on 56 threads and 20x on 112, CCSDTQ aug-cc-pVDZ 15x on 56 and 13x on 112, CCSD aug-cc-pVQZ 15x on 56 and 12x on 112" src="images/thread-scaling-light.svg">
+  <img alt="IterCC speedup over one thread: CCSDT aug-cc-pVQZ 24x on 56 threads and 17x on 112, CCSDTQ aug-cc-pVDZ 15x on 56 and 13x on 112, CCSD aug-cc-pVQZ 15x on 56 and 12x on 112" src="images/thread-scaling-light.svg">
 </picture>
 
-On one socket CCSDT gains 22x from 56 threads, CCSD and CCSDTQ 15x. The
+On one socket CCSDT gains 24x from 56 threads, CCSD and CCSDTQ 15x. The
 second socket makes every case slower, so one socket per calculation is the
 best use of a node. EOM and response solves gain less from many cores: three
 aug-cc-pVDZ EOM-CCSDT roots take 5.3 s here and 7.4 s on the 12-core desktop

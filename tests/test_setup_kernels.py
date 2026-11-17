@@ -109,6 +109,82 @@ def test_ccsd_dressing_matches_the_full_dressing_where_ccsd_reads(transposed, mo
     assert np.isnan(ccsd[v, v, v]).all() and np.isnan(ccsd[v, v, o, v]).all()   # never written
 
 
+@pytest.mark.parametrize("transposed", [False, True])
+def test_open_dressing_matches_the_full_dressing_outside_vvvv(transposed, monkeypatch):
+    from itercc._cpu_triples import dressed_integrals
+
+    if not hasattr(_cpu_kernels.library(), "dress_integrals_open"):
+        pytest.skip("core without dress_integrals_open")
+    rng = np.random.default_rng(12)
+    n, no = 13, 4
+    g0, _, t1 = _pair_symmetric(rng, n, no)
+    if transposed:
+        g0 = g0.transpose(0, 2, 1, 3)                         # read through strides
+    full = dressed_integrals(g0, t1, 3)
+    o, v = slice(0, no), slice(no, n)
+    for slabs in ("1", "0"):                                  # slab by slab, plane by plane
+        for threads in (1, 3):
+            monkeypatch.setenv("ITERCC_DRESS_SLABS", slabs)
+            part = dressed_integrals(g0, t1, threads, open=True, out=np.full((n,) * 4, np.nan))
+            np.testing.assert_array_equal(part[o], full[o])       # the same values exactly
+            np.testing.assert_array_equal(part[v, o], full[v, o])
+            np.testing.assert_array_equal(part[v, v, o], full[v, v, o])
+            np.testing.assert_array_equal(part[v, v, v, o], full[v, v, v, o])
+            assert np.isnan(part[v, v, v, v]).all()              # never written
+
+
+@pytest.mark.parametrize("labelled", [False, True])
+def test_dressed_ladder_sectors_from_the_bare_ones(labelled):
+    from itercc._blocked import irrep_groups
+    from itercc._cpu_triples import LadderSectors, dressed_integrals
+
+    if not hasattr(_cpu_kernels.library(), "ladder_sectors_t1"):
+        pytest.skip("core without ladder_sectors_t1")
+    rng = np.random.default_rng(13)
+    labels = np.array([0, 1, 0, 2, 3, 0, 1, 2, 0, 3, 1, 0]) if labelled else np.zeros(12, dtype=np.int64)
+    n, no = len(labels), 3
+    g, _, t1 = _pair_symmetric(rng, n, no)
+    total = labels[:, None, None, None] ^ labels[None, :, None, None] ^ labels[None, None, :, None]         ^ labels[None, None, None, :]
+    g[total != 0] = 0.0                                       # symmetric integrals and T1
+    t1[labels[:no, None] != labels[None, no:]] = 0.0
+    g = g.transpose(0, 2, 1, 3).copy().transpose(0, 2, 1, 3)  # a strided view
+    structure = LadderSectors(labels[no:], irrep_groups(labels))
+    v = slice(no, n)
+    bare = structure.build(g[v, v, v, v])
+    expected = structure.build(dressed_integrals(g, t1, 2)[v, v, v, v])
+    for threads in (1, 3):
+        found = structure.dressed(bare, g, no, t1, threads=threads)
+        for a, b in zip(found, expected):
+            np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
+
+
+def test_ccsdt_with_and_without_the_open_dressing(monkeypatch):
+    pytest.importorskip("pyscf")
+    from pyscf import gto, scf
+
+    from itercc import RestrictedCC
+    from itercc.pyscf_interface import from_rhf
+
+    mol = gto.M(atom="O 0 0 0.117; H 0 0.757 -0.469; H 0 -0.757 -0.469", basis="6-31g", symmetry=True,
+                verbose=0)
+    m = from_rhf(scf.RHF(mol).run(conv_tol=1e-12), frozen=1)
+    results = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv("ITERCC_OPEN_DRESSING", flag)
+        cc = RestrictedCC(m.h, m.eri, m.nocc, m.constant, orbital_irreps=m.orbital_irreps,
+                          symmetry_tolerance=1e-8, rank=3)
+        t1 = 0.01 * np.random.default_rng(3).standard_normal(cc.shapes[0])
+        t1[m.orbital_irreps[:m.nocc, None] != m.orbital_irreps[None, m.nocc:]] = 0.0
+        opened = cc._open_dressing(t1)
+        assert opened == (flag == "1")
+        results[flag] = cc.solve(energy_tol=1e-10, residual_tol=1e-8, max_iter=60)
+        assert results[flag].converged
+        assert (cc._ladder_bare is not None) == opened            # the bare sectors were used
+    assert abs(results["0"].energy - results["1"].energy) < 1e-10
+    for a, b in zip(results["0"].amplitudes, results["1"].amplitudes):
+        np.testing.assert_allclose(a, b, atol=1e-9)
+
+
 def test_bare_ladder_adds_what_the_ccsd_dressing_leaves_out():
     from itercc._cpu_triples import BareLadder, doubles_ladder, dressed_integrals
 

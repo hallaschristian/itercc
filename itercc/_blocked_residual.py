@@ -243,11 +243,11 @@ class PlaneTables:
 
 
 def triples(blocked, tables, t2, t3, have_t3, im, vooo, vvvo, g, o, v, threads, *,
-            ladder_budget=LADDER_BUDGET, wvvvv=None, ladder_g=None):
+            ladder_budget=LADDER_BUDGET, wvvvv=None, ladder_g=None, ladder_owned=False):
     """Blocked R3 from T2 and blocked T3, as `_cpu_triples.triples` (`wvvvv`
     replaces the ladder matrix built from g, t2 and im, as there; `ladder_g` =
     (LadderSectors, even, odd), the sector blocks of g(vvvv), builds the ladder
-    matrix in sector form instead).
+    matrix in sector form instead, in those blocks when `ladder_owned`).
 
     Raises NotBlockable when an intermediate is not symmetry-blocked; the
     caller then uses the dense-slot path.
@@ -303,7 +303,7 @@ def triples(blocked, tables, t2, t3, have_t3, im, vooo, vvvo, g, o, v, threads, 
         if wvvvv is None and ladder_g is not None:
             structure, g_even, g_odd = ladder_g
             packed = (structure, *structure.ladder_matrix((g_even, g_odd), im.vv, t2, g[o, o, v, v],
-                                                          threads))
+                                                          threads, inplace=ladder_owned))
             ladder(blocked, residual, t3, None, threads, budget=ladder_budget, packed=packed)
         else:
             if wvvvv is None:

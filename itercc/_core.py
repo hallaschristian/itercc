@@ -16,7 +16,7 @@ from pathlib import Path
 import sys
 import threading
 
-CORE_ABI = 18
+CORE_ABI = 19
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -63,12 +63,15 @@ CPU_FUNCTIONS = {
     "pair_matrices": ([_P, _I, _I, _P, _P, _I, _P, _P, _P, _P, _T], None),
     "dress_integrals": ([_P, _P, _P, _I, _I, _P, _T], None),
     "dress_integrals_ccsd": ([_P, _P, _P, _I, _I, _P, _T], None),
+    "dress_integrals_open": ([_P, _P, _P, _I, _I, _P, _T], None),
     "project_symmetric": ([_P, _P, _I, _P, _D, _P, _T], _T),
     "dress_derivative": ([_P, _P, _I, _I, _P, _T], None),
     "dress_derivative_ccsd": ([_P, _P, _I, _I, _P, _T], None),
     "gemm_narrow": ([_P, _I, _P, _I, _P, _I, _I, _I, _I, _D, _D, _T], None),
     "unpack_s4": ([_P, _P, _I, _T], None),
     "ladder_sectors": ([_P, _P, _P, _I, _I, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _T, _T], None),
+    "ladder_sectors_t1": ([_P, _P, _I, _I, _P, _I, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _T],
+                          None),
     "symmetrize_pairs": ([_P, _I, _P, _P, _T], _T),
     "axpy": ([_P, _P, _D, _I, _T], None),
     "dots": ([_I, _I, _P, _P, _P, _T], None),
