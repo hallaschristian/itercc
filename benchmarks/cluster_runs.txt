@@ -1,7 +1,6 @@
 # Runs of benchmarks/cluster_campaign.sh: water, one 56-core Sapphire Rapids socket
-# per run, one run at a time; longest first (with WORKERS=2 the sockets then finish
-# together). Slow program/basis pairs time a few iterations (--max-iter) instead of
-# converging.
+# (never more cores), one run at a time, longest first. Slow program/basis pairs
+# time a few iterations (--max-iter) instead of converging.
 
 # ---- long
 --code ccpy --method ccsdtq --basis aug-cc-pvdz --max-iter 1 --timeout 10800
@@ -102,7 +101,7 @@
 --code nwchem --method response-ccsd --basis cc-pvdz --threads 14
 --code psi4 --method response-ccsd --basis cc-pvdz
 
-# ---- IterCC (short; last so they run on a node with nothing else heavy on the other socket for long)
+# ---- IterCC (short)
 --code itercc --method ccsdtq --basis cc-pvtz --timeout 7200
 --code itercc --method ccsdtq --basis aug-cc-pvdz
 --code itercc-nosym --method ccsdtq --basis aug-cc-pvdz --max-iter 3
@@ -149,7 +148,7 @@
 --code itercc --method ccsd --basis 6-31g
 --code itercc-nosym --method ccsd --basis 6-31g
 
-# ---- IterCC thread scaling on one socket (a few iterations each), then the whole node
+# ---- IterCC thread scaling on one socket (a few iterations each)
 @scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 1 --timeout 10800
 @scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 1
 @scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 1
@@ -171,6 +170,3 @@
 @scaling --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 56
 @scaling --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 56
 @scaling --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 56
-@node --code itercc --method ccsdt --basis aug-cc-pvqz --max-iter 4 --threads 112
-@node --code itercc --method ccsdtq --basis aug-cc-pvdz --max-iter 3 --threads 112
-@node --code itercc --method ccsd --basis aug-cc-pvqz --max-iter 6 --threads 112

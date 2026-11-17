@@ -392,7 +392,7 @@ def scaling_threads_figure(path, out, theme):
     ax.set_facecolor(colors["surface"])
     top = max(max(times) for times in cases.values())
     wide = top > 16
-    if wide:                                            # 1 .. 112 threads: log-log
+    if wide:                                            # 1 .. 56 threads: log-log
         ax.set_xscale("log", base=2)
         ax.set_yscale("log", base=2)
     ax.plot([1, top], [1, top], color=colors["axis"], linewidth=1, zorder=1)
