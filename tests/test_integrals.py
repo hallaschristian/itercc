@@ -97,3 +97,32 @@ def test_native_rhf_and_ccsd_match_pyscf():
                           symmetry_tolerance=1e-8, rank=2)
         energies.append(cc.solve(energy_tol=1e-11, residual_tol=1e-9).energy)
     assert abs(energies[0] - energies[1]) < 1e-9
+
+
+@pytest.mark.parametrize("basis", ["sto-3g", "cc-pvdz", "aug-cc-pvdz"])
+def test_native_gaussian_integrals_match_libcint(basis):
+    pytest.importorskip("pyscf")
+    from pyscf import gto
+
+    from itercc import integrals
+    from itercc.basis import Basis
+
+    mol = gto.M(atom="O 0 0 0.117; H 0 0.757 -0.469; H 0 -0.757 -0.469", basis=basis, verbose=0)
+    b = Basis.from_pyscf(mol)
+    np.testing.assert_allclose(integrals.overlap(b), mol.intor("int1e_ovlp"), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(integrals.kinetic(b), mol.intor("int1e_kin"), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(integrals.nuclear(b), mol.intor("int1e_nuc"), rtol=0, atol=1e-11)
+    np.testing.assert_allclose(integrals.dipole(b), mol.intor("int1e_r"), rtol=0, atol=1e-12)
+    for threads in (1, 3):
+        np.testing.assert_allclose(integrals.eri_s8(b, threads=threads), mol.intor("int2e", aosym="s8"),
+                                   rtol=0, atol=1e-12)
+
+
+def test_spherical_transform_matches_libcint():
+    pytest.importorskip("pyscf")
+    from pyscf import gto
+
+    from itercc.basis import cart2sph
+
+    for l in range(2, 7):
+        np.testing.assert_allclose(cart2sph(l), gto.cart2sph(l, normalized="sp"), rtol=0, atol=1e-13)

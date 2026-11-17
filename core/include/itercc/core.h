@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 24
+#define ITERCC_CORE_ABI 25
 
 /* Expand a sector vector into a zeroed flat tensor. Indices must be distinct
  * and in [0,size), owned and validated by the caller's immutable layout. */
@@ -58,6 +58,19 @@ void itercc_scatter_pairs(const double *blocks, int64_t items, int64_t first, in
 /* vj = J[dm], vk = K[dm] (nao x nao, either may be NULL) of a symmetric
  * density from 8-fold packed real AO integrals; independent of threads. */
 void itercc_jk_s8(const double *s8, int64_t nao, const double *dm, double *vj, double *vk, int threads);
+/* Gaussian AO integrals (gto_integrals.cpp, itercc.integrals): kind 0
+ * overlap, 1 kinetic, 2 nuclear attraction, 3 dipole of r - origin (three
+ * matrices) over spherical contracted shells (libcint conventions), and the
+ * 8-fold packed two-electron integrals with Schwarz screening. */
+void itercc_int1e(int kind, int64_t nshell, const int32_t *shell_l, const int32_t *shell_atom,
+                  const int32_t *shell_nprim, const int64_t *shell_prim0, const double *exps, const double *coefs,
+                  const double *atom_xyz, const double *charges, int64_t natm, const double *origin,
+                  const double *c2s, const int64_t *c2s_off, const int64_t *ao_off, int64_t nao, double *out,
+                  int threads);
+void itercc_int2e_s8(int64_t nshell, const int32_t *shell_l, const int32_t *shell_atom, const int32_t *shell_nprim,
+                     const int64_t *shell_prim0, const double *exps, const double *coefs, const double *atom_xyz,
+                     const double *c2s, const int64_t *c2s_off, const int64_t *ao_off, int64_t nao, double screen,
+                     double *out, int threads);
 
 /* Library identity. */
 int itercc_core_abi(void);

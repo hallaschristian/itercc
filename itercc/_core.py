@@ -16,7 +16,7 @@ from pathlib import Path
 import sys
 import threading
 
-CORE_ABI = 24
+CORE_ABI = 25
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -26,6 +26,8 @@ CPU_FUNCTIONS = {
     "pack_pairs": ([_P, _I, _I, _P, _I, _T], None),
     "scatter_pairs": ([_P, _I, _I, _I, _P, _P, _T], None),
     "jk_s8": ([_P, _I, _P, _P, _P, _T], None),
+    "int1e": ([_T, _I, _P, _P, _P, _P, _P, _P, _P, _P, _I, _P, _P, _P, _P, _I, _P, _T], None),
+    "int2e_s8": ([_I, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _I, _D, _P, _T], None),
     "sector_unpack": ([_I, _I, _P, _P, _P, _T], None),
     "spin_unpack": ([_I, _T, _I, _I, _P, _P, _T, _P, _P, _P, _T], None),
     "spin_quad_contract": ([_I, _T, _P, _I, _I, _P, _P, _P, _P, _P,

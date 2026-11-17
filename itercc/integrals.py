@@ -1,4 +1,4 @@
-"""Native integral transformations on the compiled core.
+"""Native integrals on the compiled core: Gaussian AO integrals and transformations.
 
 `mo_eri` turns atomic-orbital two-electron integrals into the molecular-orbital
 integrals the solvers take, replacing PySCF's `ao2mo` (and the unpacking of its
@@ -99,4 +99,75 @@ def mo_eri(ao_eri, coeff, *, orbital_irreps=None, threads=None, batch_bytes=256 
                               None if labels is None else labels.ctypes.data, out.ctypes.data, threads)
 
     _half(rows, coeff, coeff_t, nao, nmo, batch, library, threads, scatter)
+    return out
+
+
+def _shell_arrays(basis):
+    """The flat arrays the core's integral kernels take for a `basis.Basis`."""
+    from .basis import cart2sph
+
+    shells = basis.shells
+    lmax = max(s.l for s in shells)
+    l = np.array([s.l for s in shells], dtype=np.int32)
+    atom = np.array([s.atom for s in shells], dtype=np.int32)
+    nprim = np.array([len(s.exponents) for s in shells], dtype=np.int32)
+    prim0 = np.zeros(len(shells), dtype=np.int64)
+    prim0[1:] = np.cumsum(nprim[:-1])
+    exps = np.concatenate([s.exponents for s in shells]).astype(np.float64)
+    coefs = np.concatenate([s.coefficients for s in shells]).astype(np.float64)
+    blocks = [np.ascontiguousarray(cart2sph(k)) for k in range(lmax + 1)]
+    c2s_off = np.zeros(lmax + 1, dtype=np.int64)
+    c2s_off[1:] = np.cumsum([b.size for b in blocks[:-1]])
+    c2s = np.concatenate([b.ravel() for b in blocks])
+    xyz = np.ascontiguousarray(basis.coords, dtype=np.float64)
+    return dict(l=l, atom=atom, nprim=nprim, prim0=prim0, exps=exps, coefs=coefs, xyz=xyz, c2s=c2s,
+                c2s_off=c2s_off, ao_off=basis.ao_offsets(), nao=basis.nao)
+
+
+def _int1e(basis, kind, origin=(0.0, 0.0, 0.0), threads=None):
+    library = _cpu_kernels.library()
+    a = _shell_arrays(basis)
+    nao = a["nao"]
+    out = np.empty((3 if kind == 3 else 1, nao, nao))
+    charges = np.ascontiguousarray(basis.charges, dtype=np.float64)
+    origin = np.ascontiguousarray(origin, dtype=np.float64)
+    library.int1e(kind, len(a["l"]), a["l"].ctypes.data, a["atom"].ctypes.data, a["nprim"].ctypes.data,
+                  a["prim0"].ctypes.data, a["exps"].ctypes.data, a["coefs"].ctypes.data, a["xyz"].ctypes.data,
+                  charges.ctypes.data, len(charges), origin.ctypes.data, a["c2s"].ctypes.data,
+                  a["c2s_off"].ctypes.data, a["ao_off"].ctypes.data, nao, out.ctypes.data, cpu_threads(threads))
+    return out if kind == 3 else out[0]
+
+
+def overlap(basis, threads=None):
+    """<mu|nu> of the spherical AOs of `basis` (a `basis.Basis`)."""
+    return _int1e(basis, 0, threads=threads)
+
+
+def kinetic(basis, threads=None):
+    """<mu|-1/2 nabla^2|nu>."""
+    return _int1e(basis, 1, threads=threads)
+
+
+def nuclear(basis, threads=None):
+    """<mu|-sum_C Z_C / |r - C||nu>."""
+    return _int1e(basis, 2, threads=threads)
+
+
+def dipole(basis, origin=(0.0, 0.0, 0.0), threads=None):
+    """(3, nao, nao) <mu|r - origin|nu> (x, y, z)."""
+    return _int1e(basis, 3, origin, threads=threads)
+
+
+def eri_s8(basis, *, screen=1e-14, threads=None):
+    """(mu nu|la si), 8-fold packed (PySCF's aosym="s8" layout), shell quartets
+    with a Schwarz bound below `screen` zero."""
+    library = _cpu_kernels.library()
+    a = _shell_arrays(basis)
+    nao = a["nao"]
+    npair = nao * (nao + 1) // 2
+    out = np.empty(npair * (npair + 1) // 2)
+    library.int2e_s8(len(a["l"]), a["l"].ctypes.data, a["atom"].ctypes.data, a["nprim"].ctypes.data,
+                     a["prim0"].ctypes.data, a["exps"].ctypes.data, a["coefs"].ctypes.data, a["xyz"].ctypes.data,
+                     a["c2s"].ctypes.data, a["c2s_off"].ctypes.data, a["ao_off"].ctypes.data, nao, float(screen),
+                     out.ctypes.data, cpu_threads(threads))
     return out
