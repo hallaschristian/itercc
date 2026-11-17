@@ -2,6 +2,7 @@
 dipole matrices from an RHF (or scalar-X2C RHF) calculation, and X2C SOC."""
 
 from dataclasses import dataclass
+import os
 
 import numpy as np
 
@@ -60,10 +61,28 @@ def from_rhf(mf, *, frozen=0):
         potential = mf.get_veff(dm=dm)
         h = hcore + potential
         constant += np.einsum("pq,qp->", hcore + 0.5 * potential, dm)
+    labels = _orbital_irreps(mf, frozen)
+    eri = _mo_eri(mf, active, labels)
+    return SpatialIntegrals(active.T @ h @ active, eri, nocc - frozen, float(constant), active, labels)
+
+
+def _mo_eri(mf, active, labels):
+    """The (pq|rs) of the active orbitals: IterCC's own transformation of the
+    in-core AO integrals (`itercc.integrals.mo_eri`; 2-4x faster than ao2mo and
+    its unpacking on 56 cores, symmetry-forbidden entries exact zeros), else
+    PySCF's ao2mo (AO integrals not held in memory, no compiled core, or
+    ITERCC_NATIVE_TRANSFORM=0)."""
+    from pyscf import ao2mo
+
+    from . import _cpu_kernels
+
+    if (mf._eri is not None and os.environ.get("ITERCC_NATIVE_TRANSFORM", "1") != "0"
+            and _cpu_kernels.library() is not None):
+        from .integrals import mo_eri
+
+        return mo_eri(mf._eri, active, orbital_irreps=labels)
     source = mf._eri if mf._eri is not None else mf.mol
-    eri = _full_eri(ao2mo.kernel(source, active), active.shape[1])
-    return SpatialIntegrals(active.T @ h @ active, eri, nocc - frozen, float(constant), active,
-                            _orbital_irreps(mf, frozen))
+    return _full_eri(ao2mo.kernel(source, active), active.shape[1])
 
 
 def _attribute(obj, name):

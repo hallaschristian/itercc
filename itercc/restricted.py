@@ -24,6 +24,17 @@ def _fock(h, g, o, xp=np):
     return h + 2 * xp.einsum("piqi->pq", g[:, o, :, o]) - xp.einsum("piiq->pq", g[:, o, o, :])
 
 
+def _all_finite(x, threads=None):
+    """np.isfinite(x).all() in one compiled pass on all threads for a C-ordered
+    float64 array (NumPy scans n^4 integrals on one thread with an n^4 boolean
+    temporary: 0.6 s of setup for water aug-cc-pVQZ)."""
+    library = _cpu._kernels.library()
+    if (library is not None and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.flags.c_contiguous
+            and x.size):
+        return bool(np.isfinite(library.max_abs(x.ctypes.data, x.size, _cpu.cpu_threads(threads))))
+    return bool(np.isfinite(x).all())
+
+
 def _near_zero_triples_denominator(occupied_sums, virtual_sums):
     if not occupied_sums:
         return False
@@ -281,7 +292,7 @@ class RestrictedCC:
             raise ValueError("Expected nonempty occupied and virtual spatial spaces")
         if not isinstance(ladder_batch, Integral) or ladder_batch < 1:
             raise ValueError("ladder_batch must be a positive integer")
-        if not (np.isfinite(h).all() and np.isfinite(eri).all() and np.isfinite(constant)):
+        if not (np.isfinite(h).all() and _all_finite(eri, cpu_threads) and np.isfinite(constant)):
             raise ValueError("Hamiltonian contains nonfinite data")
         if not np.isfinite(symmetry_tolerance) or symmetry_tolerance < 0:
             raise ValueError("Expected a finite nonnegative symmetry tolerance")
@@ -482,15 +493,19 @@ class RestrictedCC:
     def _dressed(self, t1, ccsd=False, open=False):
         """(f, g) dressed with T1; `ccsd`: only what the CCSD residual reads
         (`_cpu.dressed_integrals`), for `_bare_ladder_for`; `open`: all but
-        g~(vvvv), for `_open_dressing`."""
+        g~(vvvv), for `_open_dressing`, taking g(vvvv) from its sector blocks."""
         o, v = self.o, self.v
         xp = self._xp
         h = xp.array(self.h, copy=True)
         _dress_axis(h, 0, v, o, -t1.T, xp)
         _dress_axis(h, 1, o, v, t1, xp)
         if xp is np and self._t1_dressing is None:
+            contracted = None
+            if open:
+                structure = self._sector_structure(t1)
+                contracted = structure.contract_t1(self._bare_sectors(structure), t1, threads=self._cpu_threads)
             g = _cpu.dressed_integrals(self.g, t1, self._cpu_threads, ccsd=ccsd, open=open,
-                                       out=self._dressing_output())
+                                       contracted=contracted, out=self._dressing_output())
             if g is not None:
                 return _fock(h, g, o, xp=xp), g
         g = xp.array(self.g, order="C", copy=True)
@@ -768,9 +783,14 @@ class RestrictedCC:
         v = self.v
         if not bare:
             return (structure, *structure.build(g[v, v, v, v]))
+        return (structure, *structure.dressed(self._bare_sectors(structure), self.g, self.layout.no, t1))
+
+    def _bare_sectors(self, structure):
+        """The sector blocks of the bare g(vvvv), built once."""
         if self._ladder_bare is None:
+            v = self.v
             self._ladder_bare = structure.build(self.g[v, v, v, v])
-        return (structure, *structure.dressed(self._ladder_bare, self.g, self.layout.no, t1))
+        return self._ladder_bare
 
     def _sector_structure(self, t1):
         """The LadderSectors of `_ladder_g` when the sector blocks are all of the

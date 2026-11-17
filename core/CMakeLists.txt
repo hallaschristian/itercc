@@ -29,7 +29,8 @@ find_package(OpenMP REQUIRED)
 add_library(itercc_core SHARED src/version.cpp src/cpu/triples.cpp
             src/cpu/blocked.cpp src/cpu/blocked_residual.cpp
             src/cpu/symmetry_blocks.cpp src/cpu/quadruples.cpp src/cpu/gemm_kernel.cpp
-            src/cpu/tile_program.cpp src/cpu/array_ops.cpp src/cpu/tensor_scatter.cpp src/cpu/spin_quadruples.cpp)
+            src/cpu/tile_program.cpp src/cpu/array_ops.cpp src/cpu/tensor_scatter.cpp src/cpu/spin_quadruples.cpp
+            src/cpu/integrals.cpp)
 target_include_directories(itercc_core PUBLIC include)
 # No FMA contraction: results do not depend on the target instruction set.
 target_compile_options(itercc_core PRIVATE -O3 -march=${ITERCC_MARCH} -ffp-contract=off

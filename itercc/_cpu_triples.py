@@ -859,6 +859,28 @@ class LadderSectors:
             odd.ctypes.data, cpu_threads(threads))
         return even, odd
 
+    def contract_t1(self, sectors, t1, *, threads=None):
+        """(nv, nv, nv, no) products sum_d g(a,b,c,d) t1(j,d) of the g(vvvv)
+        whose sector blocks are `sectors` (`itercc_sectors_contract_t1`): what
+        the occupied rows and columns of its dressed planes take from it."""
+        t1 = np.ascontiguousarray(t1, dtype=np.float64)
+        no = t1.shape[0]
+        if t1.shape != (no, self.nv):
+            raise ValueError("t1 must be (occupied, virtual)")
+        if getattr(self, "_odd_row", None) is None:
+            (_, _, _, _, _), (r, s, _, _, _) = self.even, self.odd
+            table = np.full((self.nv, self.nv), -1, dtype=np.int64)
+            table[r, s] = np.arange(len(r))
+            self._odd_row = table
+        out = np.empty((self.nv, self.nv, self.nv, no))
+        (p, q, es, eo, _), (r, s, os_, oo, _) = self.even, self.odd
+        _kernels.library().sectors_contract_t1(
+            self.nv, no, t1.ctypes.data, self.groups, p.ctypes.data, q.ctypes.data, es.ctypes.data,
+            eo.ctypes.data, r.ctypes.data, s.ctypes.data, os_.ctypes.data, oo.ctypes.data,
+            self._odd_row.ctypes.data, sectors[0].ctypes.data, sectors[1].ctypes.data, out.ctypes.data,
+            cpu_threads(threads))
+        return out
+
     def blocks(self, matrices, which):
         """[(rows, rows, block)] views of packed blocks, for `_product`."""
         _, _, start, offset, _ = self.even if which == "even" else self.odd
@@ -1188,7 +1210,7 @@ def _feedback_terms(m, q, x_plane, r1, r2, vooo, vvvo, f, g, o, v):
     subtract_reversed(vvvo, y6.reshape(no, nv, nv, nv))
 
 
-def dressed_integrals(g0, t1, threads=None, *, ccsd=False, open=False, out=None):
+def dressed_integrals(g0, t1, threads=None, *, ccsd=False, open=False, contracted=None, out=None):
     """A C-ordered copy of the integrals g0 dressed with T1 along all four axes
     (`solver._dress_axis` in turn: axes 0 and 1 add -t1.T times the occupied
     rows to the virtual ones, axes 2 and 3 t1 times the virtual rows to the
@@ -1202,8 +1224,9 @@ def dressed_integrals(g0, t1, threads=None, *, ccsd=False, open=False, out=None)
     planes is left unset. With `open` every entry with an occupied index,
     exactly as the full dressing (`itercc_dress_integrals_open`); g~(vvvv) is
     left unset, for a caller that takes the ladder sectors from
-    `LadderSectors.dressed`. `out` (a C-ordered float64 n^4 array) receives the
-    fused dressing when given."""
+    `LadderSectors.dressed`; with `contracted` (`LadderSectors.contract_t1`)
+    g(vvvv) is not read either. `out` (a C-ordered float64 n^4 array) receives
+    the fused dressing when given."""
     library = _kernels.library()
     if (library is None or not all(isinstance(x, np.ndarray) and x.dtype == np.float64 for x in (g0, t1))
             or g0.ndim != 4 or t1.ndim != 2):
@@ -1226,8 +1249,14 @@ def dressed_integrals(g0, t1, threads=None, *, ccsd=False, open=False, out=None)
         g = (out if out is not None and out.shape == (n,) * 4 and out.dtype == np.float64
              and out.flags.c_contiguous and out is not g0 else np.empty((n,) * 4))
         strides = np.asarray([stride // 8 for stride in g0.strides], dtype=np.int64)
-        kernel = (library.dress_integrals_ccsd if ccsd else library.dress_integrals_open if open
-                  else library.dress_integrals)
+        if open:
+            if contracted is not None and (contracted.shape != (nv, nv, nv, no) or contracted.dtype != np.float64
+                                           or not contracted.flags.c_contiguous):
+                raise ValueError("contracted must be the C-ordered (nv, nv, nv, no) products")
+            library.dress_integrals_open(g.ctypes.data, g0.ctypes.data, strides.ctypes.data, n, no, up.ctypes.data,
+                                         None if contracted is None else contracted.ctypes.data, threads)
+            return g
+        kernel = library.dress_integrals_ccsd if ccsd else library.dress_integrals
         kernel(g.ctypes.data, g0.ctypes.data, strides.ctypes.data, n, no, up.ctypes.data, threads)
         return g
     g = _cpu_quadruples.copy(g0)

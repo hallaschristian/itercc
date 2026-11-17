@@ -85,7 +85,9 @@ def project_integrals(h, eri, labels, *, tolerance):
 
 def _project_eri(eri, labels, tolerance):
     """`_project` of the ERIs: in one pass on all threads with the compiled core
-    (NumPy's masked copies moved the n^4 tensor several times on one thread)."""
+    (NumPy's masked copies moved the n^4 tensor several times on one thread).
+    Integrals without a nonzero forbidden entry (`itercc.integrals.mo_eri`) are
+    audited and returned as they are, without a copy."""
     from . import _cpu_kernels
 
     library = _cpu_kernels.library()
@@ -93,12 +95,16 @@ def _project_eri(eri, labels, tolerance):
         return _project(eri, _eri_forbidden(labels[:, None] ^ labels), tolerance)
     from ._cpu_triples import cpu_threads
 
-    out = np.empty_like(eri)
     stats = np.zeros(3)
     labels64 = np.ascontiguousarray(labels, dtype=np.int64)
-    if library.project_symmetric(out.ctypes.data, eri.ctypes.data, len(labels), labels64.ctypes.data,
+    if library.project_symmetric(None, eri.ctypes.data, len(labels), labels64.ctypes.data,
                                  float(tolerance), stats.ctypes.data, cpu_threads(None)):
         raise ValueError(f"Symmetry leakage {stats[1]:.6g} exceeds {tolerance:.6g}")
+    if stats[0] == 0:
+        return eri, SymmetryLeakage(0, 0.0, 0.0)
+    out = np.empty_like(eri)
+    library.project_symmetric(out.ctypes.data, eri.ctypes.data, len(labels), labels64.ctypes.data,
+                              float(tolerance), stats.ctypes.data, cpu_threads(None))
     return out, SymmetryLeakage(int(stats[0]), float(stats[1]), float(stats[2]))
 
 

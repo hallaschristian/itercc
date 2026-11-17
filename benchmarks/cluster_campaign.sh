@@ -1,15 +1,17 @@
 #!/bin/bash
 #SBATCH -J itercc-compare
 #SBATCH -N 1
-#SBATCH -c 56
-#SBATCH -m block:block
-#SBATCH --mem=480G
+#SBATCH --exclusive
+#SBATCH --mem=0
 #SBATCH -t 12:00:00
-# The comparison runs behind docs/benchmarks.md on one CPU socket of a
-# cluster node (56 cores, never more: a run that leaves the socket is slower).
-# Each run gets the allocated cores (THREADS, at most 56; NWChem as MPI
-# ranks) unless the line sets --threads, with memory bound to their NUMA node
-# (numactl). A line of RUNS holds compare.py run options. Lines starting with
+# The comparison runs behind docs/benchmarks.md on one 56-core socket of a
+# node held whole (on a shared node Slurm spreads 56 cores over both sockets):
+# every run gets that socket's cores (THREADS, at most 56; NWChem as MPI
+# ranks) unless the line sets --threads, and its memory (numactl). Never more
+# than one socket: more threads only slowed the runs. Submitted with -c 56
+# instead of --exclusive it binds to the allocated cores, interleaving memory
+# with a warning when they span sockets (timings then are not one socket's).
+# A line of RUNS holds compare.py run options. Lines starting with
 # "@scaling" write to scaling.jsonl (thread-scaling records, kept apart from
 # the comparison's). Blank lines and "#" comments are skipped. Resubmitting
 # continues where the last job stopped.
@@ -22,17 +24,25 @@
 set -u
 RUNS=$(realpath "$1")
 OUTDIR=$(realpath "$2")
+# One socket: the first NUMA node whose cores are all allocated, else the
+# allocated cores as they are.
+words() { tr -s ' ' '\n' | sed '/^$/d' | sort; }
 ALLOWED=$(nproc)
-THREADS=${3:-$(( ALLOWED < 56 ? ALLOWED : 56 ))}
-[ "$THREADS" -le 56 ] || { echo "at most 56 threads (one socket)" >&2; exit 1; }
-# The NUMA node of the allocated cores, for their memory.
 NODES=$(numactl --show | sed -n 's/^nodebind: *//p')
-if [ "$(echo "$NODES" | wc -w)" -eq 1 ]; then
-    BIND="--cpunodebind=$NODES --membind=$NODES"
-else
-    echo "warning: the allocated cores span NUMA nodes $NODES" >&2
-    BIND="--interleave=all"
-fi
+PHYS=$(numactl --show | sed -n 's/^physcpubind: *//p' | words)
+CORES=$ALLOWED
+BIND="--interleave=all"
+for node in $NODES; do
+    node_cpus=$(numactl --hardware | sed -n "s/^node $node cpus: *//p" | words)
+    if [ -z "$(comm -23 <(echo "$node_cpus") <(echo "$PHYS"))" ]; then
+        BIND="--cpunodebind=$node --membind=$node"
+        CORES=$(echo "$node_cpus" | wc -l)
+        break
+    fi
+done
+[ "$BIND" != "--interleave=all" ] || echo "warning: no whole NUMA node allocated; memory interleaved" >&2
+THREADS=${3:-$(( CORES < 56 ? CORES : 56 ))}
+[ "$THREADS" -le 56 ] || { echo "at most 56 threads (one socket)" >&2; exit 1; }
 mkdir -p "$OUTDIR"
 QUEUE=$OUTDIR/queue
 [ -e "$QUEUE" ] || echo 0 > "$QUEUE"

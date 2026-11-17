@@ -468,10 +468,43 @@ inline void dress_block_23(double *out, const double *in, const int64_t *ss, i64
 // (the same values), without writing the virtual-virtual block. Each virtual
 // row is read once. `sum` holds (no + 1) n values.
 inline void dress_open_23(double *out, const double *in, const int64_t *ss, i64 n, i64 no, const double *t1,
-                          double *sum)
+                          double *sum, const double *bab = nullptr, const double *bba = nullptr)
 {
     const i64 nv = n - no;
     double *row = sum + no * n;
+    if (bab != nullptr) {
+        // The virtual-virtual block enters only through bab(c, j) =
+        // sum_d g(abcd) t(j,d) and bba(d, i) = sum_c t(i,c) g(abcd)
+        // (itercc_sectors_contract_t1): of the plane only its occupied rows
+        // and columns are read.
+        for (i64 m = 0; m < no * no; ++m) sum[m] = 0.0;
+        for (i64 c = 0; c < nv; ++c) {
+            const double *from = in + (no + c) * ss[2];
+            for (i64 j = 0; j < no; ++j) row[j] = from[j * ss[3]];
+            for (i64 i = 0; i < no; ++i) {
+                const double w = t1[i * nv + c];
+                double *acc = sum + i * no;
+                for (i64 j = 0; j < no; ++j) acc[j] += w * row[j];
+            }
+            double *to = out + (no + c) * n;
+            const double *bc = bab + c * no;
+            for (i64 j = 0; j < no; ++j) to[j] = row[j] + bc[j];
+        }
+        for (i64 i = 0; i < no; ++i) {
+            const double *from = in + i * ss[2];
+            double *to = out + i * n;
+            for (i64 j = 0; j < no; ++j) to[j] = from[j * ss[3]] + sum[i * no + j];
+            for (i64 d = 0; d < nv; ++d) to[no + d] = from[(no + d) * ss[3]] + bba[d * no + i];
+            for (i64 j = 0; j < no; ++j) {
+                const double *t = t1 + j * nv;
+                double total = 0.0;
+                for (i64 d = 0; d < nv; ++d) total += t[d] * to[no + d];
+                row[j] = total;
+            }
+            for (i64 j = 0; j < no; ++j) to[j] += row[j];
+        }
+        return;
+    }
     for (i64 m = 0; m < no * n; ++m) sum[m] = 0.0;
     for (i64 c = 0; c < nv; ++c) {
         const double *from = in + (no + c) * ss[2];
@@ -535,7 +568,7 @@ inline void add_written(double *target, const double *first, i64 step, const dou
 }
 
 void dress_integrals_impl(double *dst, const double *src, const int64_t *ss, i64 n, i64 no, const double *t1,
-                          int threads, DressMode mode)
+                          int threads, DressMode mode, const double *contracted = nullptr)
 {
     const i64 nv = n - no;
     if (n <= 0) return;
@@ -545,6 +578,10 @@ void dress_integrals_impl(double *dst, const double *src, const int64_t *ss, i64
     for (i64 a = 0; a < nv; ++a)
         for (i64 k = 0; k < no; ++k) down[size_t(a * no + k)] = -t1[k * nv + a];
     const size_t scratch = size_t(std::max<i64>((no + 1) * n, kPiece));
+    // The products of itercc_sectors_contract_t1 for the plane (p, q) and (q, p).
+    auto contracted_at = [&](i64 p, i64 q) {
+        return contracted ? contracted + ((p - no) * nv + (q - no)) * nv * no : nullptr;
+    };
     // Partial dressings go plane by plane on more than 3 no threads (one
     // Xeon 8480CL socket, water aug-cc-pVQZ CCSD: 19 instead of 35 ms on 56
     // threads, 28 instead of 36 on 28; on 12 desktop threads slab by slab is
@@ -598,7 +635,8 @@ void dress_integrals_impl(double *dst, const double *src, const int64_t *ss, i64
                     else if (mode == kCcsd)
                         dress_block_23(out, in, ss, n, no, t1, sum.data());
                     else
-                        dress_open_23(out, in, ss, n, no, t1, sum.data());
+                        dress_open_23(out, in, ss, n, no, t1, sum.data(), contracted_at(p, q),
+                                      contracted_at(q, p));
                 }
 #pragma omp for collapse(2) schedule(dynamic, 16)
             for (i64 p = no; p < n; ++p)
@@ -617,7 +655,7 @@ void dress_integrals_impl(double *dst, const double *src, const int64_t *ss, i64
                 if (mode == kCcsd && p >= no && q >= no)
                     dress_block_23(out, in, ss, n, no, t1, sum.data());
                 else if (mode == kOpen && p >= no && q >= no)
-                    dress_open_23(out, in, ss, n, no, t1, sum.data());
+                    dress_open_23(out, in, ss, n, no, t1, sum.data(), contracted_at(p, q), contracted_at(q, p));
                 else
                     dress_plane_23(out, in, ss, n, no, t1, sum.data());
             }
@@ -710,14 +748,16 @@ extern "C" void itercc_dress_integrals_ccsd(double *dst, const double *src, cons
 }
 
 extern "C" void itercc_dress_integrals_open(double *dst, const double *src, const int64_t *ss, int64_t n,
-                                            int64_t no, const double *t1, int threads)
+                                            int64_t no, const double *t1, const double *contracted, int threads)
 {
     // Every entry of itercc_dress_integrals with an occupied index, the same
     // values exactly; the virtual-virtual block of the planes with p and q
     // virtual, g~(vvvv), is neither written nor needed when the ladder takes
     // its sectors from itercc_ladder_sectors_t1. The bare g(vvvv) is read once,
-    // for the occupied rows and columns of those planes.
-    dress_integrals_impl(dst, src, ss, n, no, t1, threads, kOpen);
+    // for the occupied rows and columns of those planes, unless `contracted`
+    // (itercc_sectors_contract_t1 of its sector blocks, may be NULL) gives
+    // the products of it those entries take; then it is not read at all.
+    dress_integrals_impl(dst, src, ss, n, no, t1, threads, kOpen, contracted);
 }
 
 namespace {
@@ -851,7 +891,7 @@ extern "C" int itercc_project_symmetric(double *dst, const double *src, int64_t 
     // of nonzero ones, largest magnitude, norm). The norm sums per-slab partial
     // sums in slab order, so it does not depend on the thread count. Returns 1
     // when an entry exceeds `tolerance` or is not finite (dst is then complete
-    // but must not be used), else 0.
+    // but must not be used), else 0. dst = NULL audits only.
     if (n <= 0) return 0;
     const i64 n2 = n * n, n3 = n2 * n;
     std::vector<double> squares(size_t(n), 0.0), largest(size_t(n), 0.0);
@@ -866,14 +906,14 @@ extern "C" int itercc_project_symmetric(double *dst, const double *src, int64_t 
             for (i64 r = 0; r < n; ++r) {
                 const i64 pqr = labels[p] ^ labels[q] ^ labels[r];
                 const double *in = src + p * n3 + q * n2 + r * n;
-                double *out = dst + p * n3 + q * n2 + r * n;
+                double *out = dst ? dst + p * n3 + q * n2 + r * n : nullptr;
                 for (i64 s = 0; s < n; ++s) {
                     const double value = in[s];
                     if ((pqr ^ labels[s]) == 0) {
-                        out[s] = value;
+                        if (out) out[s] = value;
                         continue;
                     }
-                    out[s] = 0.0;
+                    if (out) out[s] = 0.0;
                     const double magnitude = std::fabs(value);
                     if (!(magnitude <= tolerance)) failed = 1;        // also NaN
                     if (value != 0.0) ++count;
@@ -1071,6 +1111,79 @@ extern "C" void itercc_ladder_sectors_t1(const double *g, const int64_t *gs, int
                 for (i64 c = 0; c < m; ++c) sum[size_t(c)] += wx * sy[c] + wy * sx[c];
             }
             for (i64 c = 0; c < m; ++c) target[c] = base[c] - sum[size_t(c)];
+        }
+    }
+}
+
+extern "C" void itercc_sectors_contract_t1(int64_t nv, int64_t no, const double *t1, int64_t groups,
+                                           const int64_t *p, const int64_t *q, const int64_t *even_start,
+                                           const int64_t *even_off, const int64_t *r, const int64_t *s,
+                                           const int64_t *odd_start, const int64_t *odd_off,
+                                           const int64_t *odd_row, const double *even, const double *odd,
+                                           double *out, int threads)
+{
+    // out(a, b, c, j) = sum_d g(a,b,c,d) t1(j,d) (nv, nv, nv, no) for the
+    // g(vvvv) whose sector blocks are `even` and `odd` (itercc_ladder_sectors;
+    // pair irreps exact): a row (x <= y) of the even blocks holds
+    // g(xy,cd) + g(xy,dc) (c < d) and g(xy,cc), one of the odd blocks
+    // g(xy,cd) - g(xy,dc), and g(yx,cd) = g(xy,dc), so each pair x <= y
+    // gives the planes (x, y) and (y, x) from its two rows: a read of the
+    // sectors instead of g(vvvv). odd_row (nv x nv) is the odd row of a pair
+    // x < y. Each output row has one owner; sums run in column order.
+    const i64 ne = even_start[groups];
+    std::vector<double> tt(size_t(std::max<i64>(nv * no, 1)));        // t1^T: (nv, no)
+    for (i64 j = 0; j < no; ++j)
+        for (i64 d = 0; d < nv; ++d) tt[size_t(d * no + j)] = t1[j * nv + d];
+    const i64 plane = nv * no;
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 4)
+    for (i64 i = 0; i < ne; ++i) {
+        const i64 x = p[i], y = q[i];
+        double *bxy = out + (x * nv + y) * plane, *byx = out + (y * nv + x) * plane;
+        const bool pair = x != y;
+        for (i64 m = 0; m < plane; ++m) bxy[m] = 0.0;
+        if (pair)
+            for (i64 m = 0; m < plane; ++m) byx[m] = 0.0;
+        i64 g = 0;
+        while (even_start[g + 1] <= i) ++g;
+        const i64 first = even_start[g], width = even_start[g + 1] - first;
+        const double *row = even + even_off[g] + (i - first) * width;
+        for (i64 col = 0; col < width; ++col) {
+            const i64 c = p[first + col], d = q[first + col];
+            const double *tc = tt.data() + c * no, *td = tt.data() + d * no;
+            if (c == d) {
+                const double e = row[col];
+                for (i64 j = 0; j < no; ++j) bxy[c * no + j] += e * tc[j];
+                if (pair)
+                    for (i64 j = 0; j < no; ++j) byx[c * no + j] += e * tc[j];
+                continue;
+            }
+            const double h = 0.5 * row[col];
+            for (i64 j = 0; j < no; ++j) {
+                bxy[c * no + j] += h * td[j];
+                bxy[d * no + j] += h * tc[j];
+            }
+            if (pair)
+                for (i64 j = 0; j < no; ++j) {
+                    byx[c * no + j] += h * td[j];
+                    byx[d * no + j] += h * tc[j];
+                }
+        }
+        if (!pair) continue;
+        const i64 k = odd_row[x * nv + y];
+        i64 go = 0;
+        while (odd_start[go + 1] <= k) ++go;
+        const i64 ofirst = odd_start[go], owidth = odd_start[go + 1] - ofirst;
+        const double *orow = odd + odd_off[go] + (k - ofirst) * owidth;
+        for (i64 col = 0; col < owidth; ++col) {
+            const i64 c = r[ofirst + col], d = s[ofirst + col];
+            const double *tc = tt.data() + c * no, *td = tt.data() + d * no;
+            const double h = 0.5 * orow[col];
+            for (i64 j = 0; j < no; ++j) {
+                bxy[c * no + j] += h * td[j];
+                bxy[d * no + j] -= h * tc[j];
+                byx[c * no + j] -= h * td[j];
+                byx[d * no + j] += h * tc[j];
+            }
         }
     }
 }

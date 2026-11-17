@@ -28,6 +28,7 @@
 // into tasks freely: tasks follow the thread count, results do not. No BLAS is
 // called, so there is no second thread pool to contend with.
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -95,6 +96,24 @@ constexpr i64 kChunk = 512;                // long-side entries per skinny task
 constexpr i64 kShallow = 16;               // sums at most this deep (see shallow_block)
 constexpr i64 kTasksPerThread = 4;         // tasks per thread for the dynamic schedule
 constexpr i64 kMinTask = 16;               // rows or columns per task, at least
+// A contraction below kParallelWork multiply-adds runs on one thread, and no
+// task is cut below kMinShare: EOM and response actions make thousands of
+// small contractions, which a 56-thread team made several times slower (each
+// task repacks its operands). Sweep on 56 threads (water EOM-CCSDT aug-cc-pVDZ,
+// CCSD polarizability cc-pVTZ): no limits 5.8-7.0 and 4.3-4.8 s; 64k and 8k
+// 4.7-5.0 and 2.6-2.7 s; 128k and 32k 6.0-6.6 and 4.6-4.7 s. One thread or
+// the whole team, never a smaller team: libgomp would end the surplus threads
+// and start them again.
+constexpr i64 kParallelWork = i64(1) << 16;
+constexpr i64 kMinShare = i64(1) << 13;
+
+// ITERCC_SYM_PARALLEL_WORK and ITERCC_SYM_MIN_SHARE override the two limits
+// (multiply-adds; read once), for tuning on other machines.
+i64 tuned(const char *name, i64 fallback)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? std::max<i64>(1, std::atoll(value)) : fallback;
+}
 
 struct Block {
     i64 rows, cols, depth, r0, c0, k0, a_base, b_base, o_base;
@@ -401,6 +420,11 @@ extern "C" int itercc_sym_contract(int64_t nblocks, const int64_t *table, const 
     if (nblocks <= 0 || alpha == 0.0) return 0;
     const Plan p{a, b, out, a_rows, a_sum, b_sum, b_cols, rpos, cpos, alpha,
                  (flags & 1) != 0, (flags & 2) != 0, (flags & 4) != 0};
+    i64 all = 0;
+    for (i64 g = 0; g < nblocks; ++g) all += block_at(table, g).work();
+    static const i64 parallel_work = tuned("ITERCC_SYM_PARALLEL_WORK", kParallelWork);
+    static const i64 min_share = tuned("ITERCC_SYM_MIN_SHARE", kMinShare);
+    if (all < parallel_work) threads = 1;
     std::vector<i64> blocks;
     std::vector<std::pair<i64, i64>> chunks;   // skinny (block, first long entry)
     for (i64 g = 0; g < nblocks; ++g) {
@@ -443,7 +467,7 @@ extern "C" int itercc_sym_contract(int64_t nblocks, const int64_t *table, const 
     };
     i64 total = 0;
     for (const i64 g : blocks) total += block_at(table, g).work();
-    const i64 share = std::max<i64>(1, total / (kTasksPerThread * std::max(1, threads)));
+    const i64 share = std::max<i64>(min_share, total / (kTasksPerThread * std::max(1, threads)));
     std::vector<Task> tasks;
     for (const i64 g : blocks) {
         const Block block = block_at(table, g);

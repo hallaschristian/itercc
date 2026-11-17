@@ -158,6 +158,34 @@ def test_dressed_ladder_sectors_from_the_bare_ones(labelled):
             np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("labelled", [False, True])
+def test_open_dressing_from_the_ladder_sectors(labelled, monkeypatch):
+    from itercc._blocked import irrep_groups
+    from itercc._cpu_triples import LadderSectors, dressed_integrals
+
+    if not hasattr(_cpu_kernels.library(), "sectors_contract_t1"):
+        pytest.skip("core without sectors_contract_t1")
+    rng = np.random.default_rng(14)
+    labels = np.array([0, 1, 0, 2, 3, 0, 1, 2, 0, 3, 1, 0, 2]) if labelled else np.zeros(13, dtype=np.int64)
+    n, no = len(labels), 4
+    g, _, t1 = _pair_symmetric(rng, n, no)
+    total = labels[:, None, None, None] ^ labels[None, :, None, None] ^ labels[None, None, :, None]         ^ labels[None, None, None, :]
+    g[total != 0] = 0.0
+    t1[labels[:no, None] != labels[None, no:]] = 0.0
+    g = g.transpose(0, 2, 1, 3).copy().transpose(0, 2, 1, 3)  # a strided view
+    structure = LadderSectors(labels[no:], irrep_groups(labels))
+    o, v = slice(0, no), slice(no, n)
+    contracted = structure.contract_t1(structure.build(g[v, v, v, v]), t1, threads=3)
+    np.testing.assert_allclose(contracted, np.einsum("abcd,jd->abcj", g[v, v, v, v], t1), rtol=1e-12, atol=1e-12)
+    full = dressed_integrals(g, t1, 3)
+    for slabs in ("1", "0"):
+        monkeypatch.setenv("ITERCC_DRESS_SLABS", slabs)
+        part = dressed_integrals(g, t1, 3, open=True, contracted=contracted, out=np.full((n,) * 4, np.nan))
+        for block in ((o,), (v, o), (v, v, o), (v, v, v, o)):
+            np.testing.assert_allclose(part[block], full[block], rtol=1e-12, atol=1e-12)
+        assert np.isnan(part[v, v, v, v]).all()
+
+
 def test_ccsdt_with_and_without_the_open_dressing(monkeypatch):
     pytest.importorskip("pyscf")
     from pyscf import gto, scf

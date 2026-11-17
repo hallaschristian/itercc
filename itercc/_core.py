@@ -16,11 +16,16 @@ from pathlib import Path
 import sys
 import threading
 
-CORE_ABI = 22
+CORE_ABI = 24
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
 CPU_FUNCTIONS = {
+    "unpack_s8_s4": ([_P, _I, _P, _T], None),
+    "unpack_pairs": ([_P, _I, _I, _I, _P, _T], None),
+    "pack_pairs": ([_P, _I, _I, _P, _I, _T], None),
+    "scatter_pairs": ([_P, _I, _I, _I, _P, _P, _T], None),
+    "jk_s8": ([_P, _I, _P, _P, _P, _T], None),
     "sector_unpack": ([_I, _I, _P, _P, _P, _T], None),
     "spin_unpack": ([_I, _T, _I, _I, _P, _P, _T, _P, _P, _P, _T], None),
     "spin_quad_contract": ([_I, _T, _P, _I, _I, _P, _P, _P, _P, _P,
@@ -67,7 +72,9 @@ CPU_FUNCTIONS = {
     "pair_matrices": ([_P, _I, _I, _P, _P, _I, _P, _P, _P, _P, _T], None),
     "dress_integrals": ([_P, _P, _P, _I, _I, _P, _T], None),
     "dress_integrals_ccsd": ([_P, _P, _P, _I, _I, _P, _T], None),
-    "dress_integrals_open": ([_P, _P, _P, _I, _I, _P, _T], None),
+    "dress_integrals_open": ([_P, _P, _P, _I, _I, _P, _P, _T], None),
+    "sectors_contract_t1": ([_I, _I, _P, _I, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _T],
+                            None),
     "project_symmetric": ([_P, _P, _I, _P, _D, _P, _T], _T),
     "dress_derivative": ([_P, _P, _I, _I, _P, _T], None),
     "dress_derivative_ccsd": ([_P, _P, _I, _I, _P, _T], None),

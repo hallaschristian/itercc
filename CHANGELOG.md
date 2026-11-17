@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- IterCC transforms the integrals itself: `itercc.integrals.mo_eri` turns
+  AO two-electron integrals (8-fold or 4-fold packed, or full) into the
+  (pq|rs) the solvers take, as two half transformations of large GEMMs on
+  the core's executor (`itercc_unpack_s8_s4`, `itercc_unpack_pairs`,
+  `itercc_pack_pairs`, `itercc_scatter_pairs`), written once and with the
+  symmetry-forbidden entries exact zeros. `from_rhf` uses it for in-core AO
+  integrals instead of PySCF's ao2mo and the unpacking (water aug-cc-pVQZ on
+  56 cores: 0.84 instead of 2.0 s; `ITERCC_NATIVE_TRANSFORM=0` restores
+  ao2mo). Integrals without a nonzero forbidden entry pass the solvers'
+  symmetry projection without a copy, and the solvers check the integrals
+  for nonfinite entries in one compiled pass (NumPy's single-threaded scan
+  was 0.6 s of the 0.83 s setup for water aug-cc-pVQZ). Core ABI 24.
+- Symmetry-blocked contractions below 64k multiply-adds run on one thread,
+  and none is cut into tasks of fewer than 8k: EOM and response actions make
+  thousands of small ones, which a 56-thread team made slower than 14 threads
+  (each task repacks its operands). Water on 56 threads: EOM-CCSDT
+  aug-cc-pVDZ 4.7-5.0 instead of 5.8-7.0 s, CCSD polarizability cc-pVTZ
+  2.6-2.7 instead of 4.3-4.8 s. One thread or the whole team, never a smaller
+  team, which would make libgomp end and restart threads
+  (`ITERCC_SYM_PARALLEL_WORK`, `ITERCC_SYM_MIN_SHARE` override the limits).
+  Same results.
+- The open CCSDT dressing no longer reads g(vvvv) at all: the products of its
+  planes with T1 that the occupied rows and columns take come from the bare
+  ladder sector blocks (`LadderSectors.contract_t1`,
+  `itercc_sectors_contract_t1`). Core ABI 23.
+- Cluster benchmark scripts request at most 56 cores (one socket of the
+  nodes used) and no longer run on whole nodes; the 112-thread points are
+  gone from the thread-scaling records.
 - CCSDT no longer dresses the all-virtual block of the integrals. On the
   symmetry-blocked path g~(vvvv) enters only through the sector blocks of the
   ladders, which now come from those of the bare g(vvvv), built once, and

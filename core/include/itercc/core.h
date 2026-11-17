@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 22
+#define ITERCC_CORE_ABI 24
 
 /* Expand a sector vector into a zeroed flat tensor. Indices must be distinct
  * and in [0,size), owned and validated by the caller's immutable layout. */
@@ -43,6 +43,21 @@ void itercc_spin_quad_contract(int64_t count, int rank, const int32_t *coordinat
     int nexternal, const int32_t *external_axes, const int32_t *external_extents,
     const int32_t *amplitude_axes, const int64_t *starts, const int32_t *internal,
     const double *values, double alpha, double *out, int threads);
+
+/* Integral transformations (integrals.cpp, itercc.integrals.mo_eri). s4 (npair
+ * x npair) from the row-packed lower triangle s8; out[b] (n x n, symmetric)
+ * from packed lower triangles rows[b * ld + P]; out[b * ld + P] = the lower
+ * triangle of blocks[b]; blocks (rs|pq) of the pairs first.. into the
+ * chemists' n^4 out at [r][s] and [s][r], symmetry-forbidden entries zero when
+ * labels is not NULL. P = r(r+1)/2 + s, r >= s. */
+void itercc_unpack_s8_s4(const double *s8, int64_t npair, double *s4, int threads);
+void itercc_unpack_pairs(const double *rows, int64_t items, int64_t ld, int64_t n, double *out, int threads);
+void itercc_pack_pairs(const double *blocks, int64_t items, int64_t n, double *out, int64_t ld, int threads);
+void itercc_scatter_pairs(const double *blocks, int64_t items, int64_t first, int64_t n,
+                          const int64_t *labels, double *out, int threads);
+/* vj = J[dm], vk = K[dm] (nao x nao, either may be NULL) of a symmetric
+ * density from 8-fold packed real AO integrals; independent of threads. */
+void itercc_jk_s8(const double *s8, int64_t nao, const double *dm, double *vj, double *vk, int threads);
 
 /* Library identity. */
 int itercc_core_abi(void);
@@ -347,7 +362,15 @@ void itercc_dress_integrals_ccsd(double *dst, const double *src, const int64_t *
  * values; the virtual-virtual block of the planes with p and q virtual is not
  * written (the ladder sectors come from itercc_ladder_sectors_t1). */
 void itercc_dress_integrals_open(double *dst, const double *src, const int64_t *ss, int64_t n, int64_t no,
-                                 const double *t1, int threads);
+                                 const double *t1, const double *contracted, int threads);
+/* contracted (nv, nv, nv, no) = sum_d g(a,b,c,d) t1(j,d) from the sector
+ * blocks of g(vvvv) (pair irreps exact); odd_row (nv x nv) is the odd row of
+ * a pair x < y. For itercc_dress_integrals_open. */
+void itercc_sectors_contract_t1(int64_t nv, int64_t no, const double *t1, int64_t groups, const int64_t *p,
+                                const int64_t *q, const int64_t *even_start, const int64_t *even_off,
+                                const int64_t *r, const int64_t *s, const int64_t *odd_start,
+                                const int64_t *odd_off, const int64_t *odd_row, const double *even,
+                                const double *odd, double *out, int threads);
 /* out (n^4) = the first-order change of the T1-dressed g (C order) along d
  * (no x nv): -d^T times the occupied rows added to the virtual rows of legs 0
  * and 1, d times the virtual rows added to the occupied rows of legs 2 and 3,
