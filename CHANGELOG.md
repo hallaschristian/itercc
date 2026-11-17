@@ -18,6 +18,9 @@
   hole pair instead of a packed-T4 product per tile), which changes the
   action at round-off. Without `intermediate_cache_gib`, the program's cache
   takes half of what the memory budget leaves free (at least 256 MiB).
+  On a 16-slot CuF sample (56 cores, 8 GiB cache) the fused program takes
+  20.8 s against 43.3 s for the loop; the loop itself is slower there than
+  with the old trees (35.5 s), as the g-T4 intermediates crowd its cache.
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

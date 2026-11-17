@@ -53,7 +53,8 @@ stale prebuilt libraries are rejected.
 
 1. **Batch the CCSDTQ rank-four work across occupied slots.** The compiled
    slot program (Evidence below) now runs every tile of an action in the core,
-   6.1-6.5x faster on water cc-pVDZ; it is not yet measured on CuF. The scalar
+   6.1-6.5x faster on water cc-pVDZ and 2.1x on a 16-slot CuF sample, where
+   intermediates (cache size) and the waits between waves now limit it. The scalar
    occupied-slot loop repeatedly forms raw virtual tiles and projects them
    into canonical output. The earlier benchmark covers eight slots, not a
    full rank-four action. Fast triples and doubles do not establish a
@@ -160,8 +161,29 @@ engine's estimate (at least 256 MiB): with 256 MiB the cc-pVDZ slots took
 
 The CuF layout has 14,235 slots with about 445 tiles each (6.3 million tiles
 per action) and up to 10 million partial sums (79 MB) per slot; slots run in
-waves of at most 256 MiB of partial sums. The program has not been measured
-on CuF yet.
+waves of at most 256 MiB of partial sums.
+
+CuF, the same 16-slot general-input quadruples sample as below (full
+checkpoint, 56 Sapphire Rapids cores, 160 GiB, 8 GiB intermediate cache,
+source `100e276`, one allocation, each case in a fresh worker that runs the
+sample twice; no cProfile):
+
+| Case | First action | Second action | Peak RSS (GiB) | Output against the loop |
+| --- | ---: | ---: | ---: | --- |
+| Slot loop (new trees) | 47.22 | 43.26 | 80.9 | — |
+| Compiled, unfused | 34.43 | 25.21 | 111.1 | bitwise equal |
+| Compiled, fused | 30.58 | 20.80 | 112.2 | 2.3e-17 relative |
+
+The first compiled action includes recording the whole 14,235-slot layout
+(8.1 s: 896 kinds, 28 slot classes, 187,696 plan sets). The loop with the new
+trees agrees with the `42cc1e4` loop (old trees, 35.48 s with cProfile) to
+8.6e-18 relative, but is slower on this sample: its 8 GiB cache fills with the
+g-T4 intermediates (5.6 MB each here) and misses rise from 19,847 to 42,832.
+Thread seconds of the fused second action (56 threads x 20.8 s = 1,165):
+intermediates 327, products into tiles 70, cache waits 33, gathers 3, tile
+zeroing 2. So intermediates dominate (the cache is full: 12,353 hits, 40,885
+misses), and about 60% of the thread time is idle, mostly at the barriers
+between waves of about three slots each (10 million partial sums per slot).
 
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 
