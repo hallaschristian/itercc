@@ -393,7 +393,11 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
     const itercc_slot_template &m = p.templates[job.tmpl];
     {
         const Phase timing(0);
-        if (p.tile_runs == nullptr) {
+        static const bool runs = [] {
+            const char *value = std::getenv("ITERCC_TILE_RUNS");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (p.tile_runs == nullptr || !runs) {
             std::fill(tile, tile + nv4, 0.0);
         } else {
             // Only the symmetry-allowed entries (one run of the last letter per

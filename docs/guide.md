@@ -295,6 +295,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_SLOT_SHARE_WORK` | call | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
 | `ITERCC_SLOT_PROFILE` | core | `1`: slot-program phase timers (`itercc_triplet_profile`) |
 | `ITERCC_SLOT_SORT` | core | `0`: slot-program tiles in slot order (diagnostic) |
+| `ITERCC_TILE_RUNS` | core | `0`: slot-program tiles cleared whole, not only where symmetry allows entries (diagnostic) |
 | `ITERCC_SYM_MIN_SHARE` | core | GEMM executor: least work per thread of a shared block |
 | `ITERCC_SYM_PARALLEL_WORK` | core | GEMM executor: work from which one block runs on all threads |
 | `ITERCC_GEMM_NC` | core | `auto`: narrower GEMM column blocks for deep products (experiment) |

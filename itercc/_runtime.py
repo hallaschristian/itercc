@@ -100,6 +100,8 @@ SWITCHES = {
         "pieces (default 2^22)"),
     "ITERCC_SLOT_PROFILE": Switch("", "core", "`1`: slot-program phase timers (`itercc_triplet_profile`)"),
     "ITERCC_SLOT_SORT": Switch("", "core", "`0`: slot-program tiles in slot order (diagnostic)"),
+    "ITERCC_TILE_RUNS": Switch("", "core", "`0`: slot-program tiles cleared whole, not only where symmetry "
+                               "allows entries (diagnostic)"),
     # The CPU GEMM executor (read once by the core)
     "ITERCC_SYM_MIN_SHARE": Switch("", "core", "GEMM executor: least work per thread of a shared block"),
     "ITERCC_SYM_PARALLEL_WORK": Switch(
