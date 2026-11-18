@@ -30,7 +30,10 @@ single-threaded contraction routes and its raw tile in that thread's caches.
   an antisymmetric subset in increasing spin-orbital order), so they read an
   intermediate only at such entries: an intermediate is formed only where
   every product that reads it, in any kind, reads (`_order_intermediates`;
-  the g T4 products of the rings, read at b < c < d, shrink six-fold).
+  the g T4 products of the rings, read at b < c < d, shrink six-fold), and
+  stores only those entries (`_compact_intermediates`: each chain of
+  ordered letters is one axis of its kept tuples), so the cache holds six
+  times as many of them and their buffers are cleared six times faster.
 * Intermediates and tiles keep their virtual axes in irrep order (orbitals
   sorted by irrep, `PositionedView`), and the packed T4 rows are read through
   copies of their row maps indexed the same way: a symmetry class is a
@@ -55,7 +58,7 @@ from . import _cpu_kernels, _runtime
 from ._spin_quadruples_tiles import (_PACKED_TILE_BYTES, _packed_cuts, ordered_letters, _tree_irrep, contraction_schedule,
                                      external_routes, routes)
 from ._tensor_scatter import SignedRows, _gather_steps
-from .symmetry_blocks import PositionedView
+from .symmetry_blocks import OffsetGroup, PositionedView
 
 DENSE, ROWS, INTER, TILE = range(4)
 _VIRTUAL = frozenset("abcdefgh")      # virtual letters of the diagrams
@@ -196,6 +199,7 @@ class SlotProgram:
         self._plan_sets = []
         self._keep = []
         self._row_pointers, self._positioned_maps = {}, {}
+        self._found_constraints, self._offset_groups, self._inter_sizes = None, {}, {}
         self._prepare(engine)
 
     @staticmethod
@@ -291,12 +295,124 @@ class SlotProgram:
             number = self._contractions[identity] = len(self._contraction_info)
             arrays = tuple(_rows_like(shape, strides, [self._vpos if v else None for v in placed] if placed else None)
                            if rows else
-                           PositionedView(_like(shape, strides), [self._vpos if v else None for v in placed])
+                           PositionedView(_like(shape, strides), [self._placement(v) for v in placed])
                            if placed else _like(shape, strides)
                            for rows, shape, strides, placed in operands)
             self._contraction_info.append([spec, arrays, labels, irreps, None, ordered])
             self._contraction_keys.append(identity)
         return number
+
+    def _placement(self, marker):
+        """An axis's stored positions from its marker in a contraction identity:
+        True: the virtual irrep order; False: none; ("group", identity, g):
+        group g of a compact intermediate."""
+        if isinstance(marker, tuple):
+            return self._offset_groups[marker[1]][marker[2]]
+        return self._vpos if marker else None
+
+    def _compact_intermediates(self, found):
+        """Store each ordered intermediate's kept entries only.
+
+        The constraints an intermediate keeps (`_order_intermediates`) link its
+        letters in chains (b < c < d); every product that writes or reads it
+        holds a chain's letters together in one composite (a chain comes from
+        one half of one operand of the diagram, and its readers take the
+        letters free), so a chain can be one stored axis: the rank of each kept
+        tuple, in the composites' order (irrep, then index). The producer and
+        every reader are recorded again with that layout (`OffsetGroup`); only
+        offsets change, so the action does not."""
+        outputs, sides = {}, {}
+        for kind in self._kinds:
+            for op, _, _, plan, a, b, out, _, _ in kind.code:
+                if op == CONTRACT and out[0] == INTER:
+                    spec = self._contraction_keys[kind.contracts[plan][0]][0]
+                    identity = kind.inters[out[1]][0]
+                    outputs.setdefault(identity, (spec.split("->")[1], tuple(out[2])))
+                    sides.setdefault(identity, []).append(spec.split("->")[0].split(","))
+        labels = self.blocked.labels
+        layouts = {}
+        for identity, constraints in found.items():
+            if identity not in outputs:
+                continue
+            letters, shape = outputs[identity]
+            extent = dict(zip(letters, shape))
+            parent = {c: c for c in letters}
+
+            def root(c):
+                while parent[c] != c:
+                    c = parent[c]
+                return c
+            for x, y in constraints:
+                parent[root(x)] = root(y)
+            chains = {}
+            for c in letters:
+                chains.setdefault(root(c), []).append(c)
+            # A chain is one axis only where every product forming it takes
+            # all its letters from one operand (one composite of its output).
+            chains = [chain for chain in chains.values() if len(chain) > 1
+                      and all(any(set(chain) <= set(side) for side in pair) for pair in sides[identity])]
+            if not chains:
+                continue
+            group_of = {c: g for g, chain in enumerate(chains) for c in chain}
+            tables = []
+            for chain in chains:
+                sizes = [extent[c] for c in chain]
+                values = np.indices(sizes).reshape(len(chain), -1)
+                keep = np.ones(values.shape[1], dtype=bool)
+                for (x, y), strict in constraints.items():
+                    if x in chain and y in chain:
+                        vx, vy = values[chain.index(x)], values[chain.index(y)]
+                        keep &= (vx < vy) if strict else (vx <= vy)
+                irreps = np.zeros(values.shape[1], dtype=np.int64)
+                for row, c in zip(values, chain):
+                    irreps ^= np.asarray(labels[c], dtype=np.int64)[row]
+                kept = np.flatnonzero(keep)
+                kept = kept[np.argsort(irreps[kept], kind="stable")]
+                table = np.full(values.shape[1], -1, dtype=np.int64)
+                table[kept] = np.arange(len(kept))
+                tables.append((chain, sizes, table, len(kept)))
+            # Stored axes in the output's order, a chain where its first letter is.
+            axes, placed = [], set()
+            for c in letters:
+                g = group_of.get(c)
+                if g is None:
+                    axes.append((c, extent[c]))
+                elif g not in placed:
+                    placed.add(g)
+                    axes.append((g, tables[g][3]))
+            steps, step = {}, 1
+            for axis, size in reversed(axes):
+                steps[axis] = step
+                step *= size
+            groups = [OffsetGroup(chain, sizes, table, steps[g]) for g, (chain, sizes, table, _) in enumerate(tables)]
+            strides = tuple(8 * steps[group_of.get(c, c)] for c in letters)
+            layouts[identity] = (strides, step, group_of)
+            self._offset_groups[identity] = groups
+            self._inter_sizes[identity] = step
+        if not layouts:
+            return
+        for kind in self._kinds:
+            for index, (op, _, _, plan, a, b, out, _, _) in enumerate(kind.code):
+                if op != CONTRACT:
+                    continue
+                touched = [x for x in (a, b, out) if x[0] == INTER and kind.inters[x[1]][0] in layouts]
+                if not touched:
+                    continue
+                number, positions = kind.contracts[plan]
+                spec, operands, labels_, irreps, ordered = self._contraction_keys[number]
+                sides = spec.replace("->", ",").split(",")
+                new = []
+                for x, side, operand in zip((a, b, out), sides, operands):
+                    if x[0] == INTER and kind.inters[x[1]][0] in layouts:
+                        identity = kind.inters[x[1]][0]
+                        strides, _, group_of = layouts[identity]
+                        marks = tuple(("group", identity, group_of[c]) if c in group_of else
+                                      bool(self._vpos is not None and c in _VIRTUAL and n == self.nv)
+                                      for c, n in zip(side, x[2]))
+                        new.append((False, operand[1], strides, marks))
+                    else:
+                        new.append(operand)
+                kind.contracts[plan] = (self._number((spec, tuple(new), labels_, irreps, ordered)), positions)
 
     def _order_intermediates(self):
         """Form each intermediate only where every product reading it reads.
@@ -350,6 +466,7 @@ class SlotProgram:
             return                      # no fixed point: keep every entry
         if not found:
             return
+        self._found_constraints = found
         for kind in self._kinds:
             for op, _, _, plan, a, b, out, _, _ in kind.code:
                 if op != CONTRACT or out[0] != INTER:
@@ -555,6 +672,8 @@ class SlotProgram:
         self.nslots = len(layout.slots)
         if _runtime.enabled("ITERCC_ORDERED_INTERMEDIATES"):
             self._order_intermediates()
+            if self._found_constraints and _runtime.enabled("ITERCC_COMPACT_INTERMEDIATES"):
+                self._compact_intermediates(self._found_constraints)
         # Plans for every (kind, irrep pattern) the slots need.
         plan_id = np.full((max(1, len(self._kinds)), n**4), -1, dtype=np.int64)
         templates, parts, class_start, class_count = [], [], [], []
@@ -657,7 +776,7 @@ class SlotProgram:
             inter_start.append(len(intermediates))
             inter_count.append(len(kind.inters))
             for identity, positions, shape in kind.inters:
-                intermediates.append((identity, prod(shape), len(positions),
+                intermediates.append((identity, self._inter_sizes.get(identity, prod(shape)), len(positions),
                                       tuple(positions) + (0,) * (4 - len(positions))))
             fusion, ngroups = self._fusion(kind)
             fuse_start.append(len(fuse_groups))

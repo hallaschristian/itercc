@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Triplet slot-program intermediates store only the entries they form.
+  The ordering constraints an intermediate keeps link its letters in chains
+  (b < c < d for the ring g T4 products); a chain comes from one half of one
+  operand and its readers take its letters free, so every product that
+  writes or reads the intermediate holds a chain in one composite. Each chain
+  is now one stored axis, the rank of each kept tuple in the composites'
+  order (`symmetry_blocks.OffsetGroup`, recorded by
+  `SlotProgram._compact_intermediates`); only offsets change. The ring
+  intermediates take a sixth of their bytes, so the cache holds about six
+  times as many and their buffers are cleared six times faster. 6o/24v
+  synthetic model, 12 threads, 4 GiB cache: rank four 41.6 -> 22.8 s (cache
+  misses 250k -> 109k; intermediates 149 -> 45 thread-s, their allocation
+  45 -> 5), the same action bit for bit. `ITERCC_COMPACT_INTERMEDIATES=0`
+  stores them whole. On one Sapphire Rapids socket (CuF, first 1500 slots,
+  192 GiB cache) ordered intermediates took the slots from 117 to 66 s and
+  irrep-ordered program arrays to 64 s, before this change.
 - Triplet slot-program intermediates and tiles keep their virtual axes in
   irrep order (`symmetry_blocks.PositionedView`: an operand whose axes store
   index i at positions[i]; the planner uses the positions only in offsets,

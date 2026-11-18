@@ -405,18 +405,52 @@ def _composite(letters, extent, labels, nirrep, ordered=()):
 
 def _offsets(letters, extent, strides, flat, positions=None):
     """Element offsets (with `strides` per letter) of row-major flat indices
-    over `letters`; a letter with `positions` stores index i at positions[i]."""
+    over `letters`; a letter with `positions` stores index i at positions[i],
+    and the letters of an `OffsetGroup` (all of them in `letters`) together
+    add table[their flat index] * stride."""
     if not letters:
         return np.zeros(len(flat), dtype=np.int64)
     positions = positions or {}
-    digits = np.unravel_index(flat, [extent[c] for c in letters])
-    return sum((positions[c][d] if positions.get(c) is not None else d).astype(np.int64) * strides[c]
-               for d, c in zip(digits, letters))
+    digits = dict(zip(letters, np.unravel_index(flat, [extent[c] for c in letters])))
+    total = np.zeros(len(flat), dtype=np.int64)
+    groups = {}
+    for c in letters:
+        p = positions.get(c)
+        if isinstance(p, OffsetGroup):
+            groups[id(p)] = p
+        elif p is not None:
+            total += p[digits[c]].astype(np.int64) * strides[c]
+        else:
+            total += digits[c].astype(np.int64) * strides[c]
+    for group in groups.values():
+        members = [c for c in letters if positions.get(c) is group]
+        if len(members) != len(group.extents):
+            raise ValueError("An offset group is split between composites")
+        members.sort(key=lambda c: group.letters.index(c))
+        index = np.ravel_multi_index(tuple(digits[c] for c in members), group.extents)
+        rank = group.table[index]
+        if np.any(rank < 0):
+            raise ValueError("A composite holds tuples outside its offset group")
+        total += rank * group.stride
+    return total
+
+
+class OffsetGroup:
+    """Letters stored together as one axis: their tuples kept in `table` (a
+    rank for each flat tuple over `extents` in the order of `letters`, -1 for
+    tuples never stored) times `stride`. A slot program keeps the letters of
+    an intermediate that every reader takes in order this way, each kept tuple
+    once (b < c < d: a sixth of the dense entries)."""
+
+    def __init__(self, letters, extents, table, stride):
+        self.letters, self.extents = tuple(letters), tuple(int(n) for n in extents)
+        self.table, self.stride = np.ascontiguousarray(table, dtype=np.int64), int(stride)
 
 
 class PositionedView(np.ndarray):
     """An operand whose axes store their indices in another order: axis k
-    keeps index i at positions[k][i] (None: at i). The composites and every
+    keeps index i at positions[k][i] (None: at i), or belongs to an
+    `OffsetGroup` (axes that share one stored axis). The composites and every
     sum are those of the plain operand; only its offsets differ (a slot
     program keeps the virtual axes of its intermediates and tiles in irrep
     order, so a symmetry class is a contiguous run)."""

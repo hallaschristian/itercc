@@ -281,6 +281,24 @@ def test_intermediates_are_formed_only_where_read(monkeypatch):
     assert any(info[5] for info in producers)
 
 
+def test_compact_intermediates_keep_the_action(monkeypatch):
+    """Ordered intermediates store only their kept entries (each chain of
+    ordered letters one axis of ranks, `OffsetGroup`): smaller buffers, the
+    action of whole buffers bit for bit."""
+    engine = _split_engine()
+    vector = np.random.default_rng(761).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_COMPACT_INTERMEDIATES", "0")
+    engine._slot_programs = {}
+    whole = engine.sigma(vector)
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    dense = program.intermediates["size"].sum()
+    monkeypatch.setenv("ITERCC_COMPACT_INTERMEDIATES", "1")
+    engine._slot_programs = {}
+    np.testing.assert_array_equal(engine.sigma(vector), whole)
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    assert program._offset_groups and program.intermediates["size"].sum() < dense
+
+
 def test_irrep_ordered_program_arrays_keep_the_action(monkeypatch):
     """Intermediates and tiles with virtual axes in irrep order (positions),
     tiles cleared only where symmetry allows entries: the action of the plain

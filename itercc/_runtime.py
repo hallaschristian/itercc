@@ -87,6 +87,8 @@ SWITCHES = {
     "ITERCC_SLOT_POSITIONS": Switch(
         "1", "call", "`0`: triplet slot-program intermediates and tiles keep virtual axes in orbital "
         "order, not irrep order"),
+    "ITERCC_COMPACT_INTERMEDIATES": Switch(
+        "1", "call", "`0`: triplet slot-program intermediates stored whole, not only their ordered entries"),
     "ITERCC_ORDERED_INTERMEDIATES": Switch(
         "1", "call", "`0`: triplet slot-program intermediates formed at every entry, not only where "
         "their readers read"),
