@@ -253,6 +253,29 @@ the thread time of intermediates rose about 14% (3,287 -> 3,749 thread s at
 400 slots, 8 GiB). `ITERCC_SLOT_SHARE_WORK` raises the threshold (a very
 large value turns sharing off).
 
+The phases that sharing does not touch were about 16% slower in that job as
+well (products into tiles 848 -> 1,004 thread s, gathers 98 -> 114), and its
+first worker loaded the checkpoint in 365 s instead of about 80: allocations
+of 56 cores without the whole node land on different cores (here and below
+cores 0-47 and 56-63, both sockets). So the comparison was repeated in one
+allocation, with `0b7c008` (a producer whose last pieces are with helpers,
+and a tile whose intermediate has no pieces left, run pieces of other
+intermediates in production), sharing off (`ITERCC_SLOT_SHARE_WORK=10^18`)
+and on, every output equal to the earlier jobs' bit for bit:
+
+| Case | Sharing off | Sharing on | Cache waits (thread s) |
+| --- | ---: | ---: | --- |
+| 16 slots fused, 8 GiB (second action) | 10.29 | 10.26 | 37 -> 0.02 |
+| 400 slots fused, 8 GiB (first action) | 151.83 | 136.40 | 1,470 -> 1.3 |
+
+Sharing is neutral on the 16-slot sample and 10% faster on 400 slots. With
+it the other phases run slower (products into tiles 902 -> 1,052 thread s,
+intermediates 3,122 -> 3,535), as threads that slept now compete for memory
+bandwidth. The program's phases account for about two thirds of the 400-slot
+time (4,951 of 7,638 thread s) and less than half of the 16-slot time; the
+rest is outside the slot program, most likely the direct packed terms, which
+these runs do not time.
+
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 
 The blocked GEMMs now read packed T4 in place: a T4 operand is `SignedRows`

@@ -47,7 +47,8 @@
   most of that difference was the allocation. A producer whose last pieces
   are with helpers now runs pieces of other intermediates being produced
   instead of waiting, and so does a tile whose intermediate has no pieces
-  left.
+  left. In one allocation, sharing is neutral on the 16-slot sample
+  (10.3 s either way) and takes the first 400 slots from 151.8 s to 136.4 s.
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of
