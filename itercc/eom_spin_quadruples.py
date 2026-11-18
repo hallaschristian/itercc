@@ -374,7 +374,7 @@ class TripletEOMCCSDTQ:
                     coordinates = np.empty((len(particles), 8), dtype=np.int32)
                     coordinates[:, :4], coordinates[:, 4:] = particles, holes
                     pending.append((rows.start, rows.stop, coordinates))
-                    if rows.stop - pending[0][0] >= 1 << 18:
+                    if rows.stop - pending[0][0] >= 1 << 22:
                         flush()
                 done = index + 1
                 if slot_finished is not None and (done in (1, 4, 16, total) or done % 64 == 0):
@@ -464,12 +464,14 @@ class TripletEOMCCSDTQ:
                                           threads=cpu_threads(), slot_limit=done, fused=fused, share_work=share)
         if packed_action is not None and done:
             # The direct packed terms of consecutive slots (windows follow each
-            # other), at least 2^18 rows per call as in the loop.
+            # other), at least 2^22 rows per call: the dense kernel runs a
+            # call's slots in parallel (2^18 rows were 12 CuF slots for 56
+            # threads), and each row's sums do not depend on the chunks.
             slots = list(layout.slots.items())[:done]
             start = 0
             while start < done:
                 stop, count = start, 0
-                while stop < done and count < 1 << 18:
+                while stop < done and count < 1 << 22:
                     count += len(layout.groups[slots[stop][1][0]])
                     stop += 1
                 parts = []
