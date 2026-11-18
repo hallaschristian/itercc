@@ -71,10 +71,26 @@ def run_solve(engine, args, signature):
         arrays = {f"vector_{root}": vector for root, vector in enumerate(vectors)}
         write_array_archive(args.output, dict(identity=identity, **arrays))
 
+    partners = None
+    if args.sockets > 1:
+        # One process per socket shares every action's rank-four slots: this
+        # one (bound to node 0 by its launcher) and workers bound to nodes 1...
+        from itercc._slot_split import Partners
+
+        kwargs = dict(ground=str(args.ground), memory_gib=args.memory_gib, cache_gib=args.cache_gib,
+                      occupied_slab=args.occupied_slab, irrep=args.irrep, monitored=False)
+        partners = Partners(engine, f"{Path(__file__).resolve()}:build_engine", kwargs, parts=args.sockets,
+                            threads=args.socket_threads,
+                            log=open(args.output.with_name(args.output.stem + "-workers.log"), "a"))
+        print(json.dumps(dict(event="split_action", sockets=args.sockets,
+                              slots_here=len(engine.rank_four_slots),
+                              slots_total=len(engine._direction_t4.slots))), flush=True)
     result = engine.solve(
         args.roots, residual_tol=1e-6, max_iter=args.max_iter, max_space=2 * args.roots + 5,
         guesses=guesses, callback=lambda info: print(json.dumps(info), flush=True),
         checkpoint_callback=checkpoint)
+    if partners is not None:
+        partners.close()
     spin_defects = [float(np.linalg.norm(vector - engine.space.project(vector)))
                     for vector in result.vectors] if result.converged else []
     if any(not (0 <= defect <= 1e-9) for defect in spin_defects):
@@ -94,6 +110,39 @@ def run_solve(engine, args, signature):
         raise RuntimeError("The triplet roots did not converge within the iteration limit")
 
 
+def build_engine(ground, memory_gib, cache_gib, occupied_slab, irrep, *, solve=True, monitored=True):
+    """The audited CuF triplet engine (also a slot worker's builder, see
+    itercc._slot_split): (engine, ground receipt, setup seconds)."""
+    ground_dir = Path(ground)
+    receipt = ground_dir / "ground.json"
+    model_path = ground_dir / "zero.npz"
+    if digest(receipt) != GROUND_SHA256:
+        raise ValueError("Expected the audited bare ANO-RCC-VDZP ground state")
+    receipt_values = json.loads(receipt.read_text())
+    if (not receipt_values["converged"] or max(receipt_values["residual_max_Eh"]) > 3e-11
+            or digest(model_path) != receipt_values["input_sha256"]):
+        raise ValueError("Ground state or Hamiltonian audit failed")
+    with np.load(model_path, allow_pickle=False) as model:
+        h, eri = model["h"], model["eri"]
+        nocc, constant = int(model["nocc"]), float(model["constant"])
+        labels = model["orbital_irreps"]
+    if (nocc, len(h) - nocc) != (13, 29):
+        raise ValueError("Expected 26 correlated electrons and 29 virtual orbitals")
+    start = perf_counter()
+    solver = RestrictedCCSDTQ(h, eri, nocc, constant, backend="cpu")
+    amplitudes = tuple(np.load(ground_dir / "checkpoint" / f"t{rank}.npy",
+                               mmap_mode="r", allow_pickle=False) for rank in range(1, 5))
+    engine = (MonitoredTriplet if monitored else TripletEOMCCSDTQ)(
+        solver, amplitudes, labels, irrep, backend="cpu", occupied_tiles=True, action_only=not solve,
+        packed_spin=solve, memory_budget_gib=memory_gib, intermediate_cache_gib=cache_gib,
+        occupied_slab=occupied_slab)
+    if abs(engine.ground_energy - receipt_values["energy_Eh"]) > 2e-10:
+        raise ValueError("Ground-state energy changed on reload")
+    if engine._symmetry_engine is None:
+        raise RuntimeError("The CuF pilot requires the compiled symmetry executor")
+    return engine if not monitored else (engine, receipt_values, perf_counter() - start)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ground", type=Path)
@@ -107,42 +156,23 @@ def main():
     parser.add_argument("--roots", type=int, default=1)
     parser.add_argument("--max-iter", type=int, default=60)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--sockets", type=int, default=1,
+                        help="Processes (one per NUMA node) that share each action's rank-four slots")
+    parser.add_argument("--socket-threads", type=int,
+                        help="Threads of each worker process (default: ITERCC_CPU_THREADS)")
     args = parser.parse_args()
     solve = args.mode == "solve"
     if solve and (args.output is None or args.roots < 1 or args.max_iter < 1):
         parser.error("An eigensolve requires an output checkpoint and positive root and iteration counts")
-    receipt = args.ground / "ground.json"
-    model_path = args.ground / "zero.npz"
-    if digest(receipt) != GROUND_SHA256:
-        raise ValueError("Expected the audited bare ANO-RCC-VDZP ground state")
-    ground = json.loads(receipt.read_text())
-    if (not ground["converged"] or max(ground["residual_max_Eh"]) > 3e-11
-            or digest(model_path) != ground["input_sha256"]):
-        raise ValueError("Ground state or Hamiltonian audit failed")
-    with np.load(model_path, allow_pickle=False) as model:
-        h, eri = model["h"], model["eri"]
-        nocc, constant = int(model["nocc"]), float(model["constant"])
-        labels = model["orbital_irreps"]
-    if (nocc, len(h) - nocc) != (13, 29):
-        raise ValueError("Expected 26 correlated electrons and 29 virtual orbitals")
-
-    start = perf_counter()
-    solver = RestrictedCCSDTQ(h, eri, nocc, constant, backend="cpu")
-    amplitudes = tuple(np.load(args.ground / "checkpoint" / f"t{rank}.npy",
-                               mmap_mode="r", allow_pickle=False) for rank in range(1, 5))
-    engine = MonitoredTriplet(solver, amplitudes, labels, args.irrep, backend="cpu",
-                              occupied_tiles=True, action_only=not solve, packed_spin=solve,
-                              memory_budget_gib=args.memory_gib, intermediate_cache_gib=args.cache_gib,
-                              occupied_slab=args.occupied_slab)
-    if abs(engine.ground_energy - ground["energy_Eh"]) > 2e-10:
-        raise ValueError("Ground-state energy changed on reload")
-    if engine._symmetry_engine is None:
-        raise RuntimeError("The CuF pilot requires the compiled symmetry executor")
+    if args.sockets < 1 or (args.sockets > 1 and not solve):
+        parser.error("--sockets splits the actions of an eigensolve")
+    engine, ground, setup_seconds = build_engine(args.ground, args.memory_gib, args.cache_gib,
+                                                 args.occupied_slab, args.irrep, solve=solve)
     dimensions = [part.stop - part.start for part in engine.space.slices]
     signature = dict(basis=ground["basis"], input_sha256=ground["input_sha256"],
                      ground_sha256=GROUND_SHA256, irrep=args.irrep, dimensions=dimensions,
                      roots=args.roots)
-    print(json.dumps(dict(event="ready", **signature, setup_seconds=perf_counter() - start,
+    print(json.dumps(dict(event="ready", **signature, setup_seconds=setup_seconds,
                           packed_contractions=engine.packed_contractions, cache_gib=args.cache_gib,
                           occupied_slab=engine.occupied_slab)),
           flush=True)

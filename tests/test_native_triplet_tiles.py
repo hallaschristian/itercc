@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -128,3 +130,53 @@ def test_dense_direct_terms_match_the_sparse_lookups(monkeypatch):
     for threads in (1, 3):
         with thread_scope(threads):
             np.testing.assert_array_equal(engine._action(vector), sparse)
+
+
+def _split_engine():
+    """The engine of the split-action tests (a slot worker's builder)."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    return _triplet_engine(packed_spin=True, intermediate_cache_gib=0.0001)
+
+
+@pytest.mark.parametrize("program", [True, False])
+def test_rank_four_slot_parts_add_up_to_the_action(program):
+    """Each slot writes its own rows with values that do not depend on the
+    other slots of the process: the parts of a split action add up to the
+    whole action bit for bit (compiled program and Python loop)."""
+    from itercc._slot_split import split_slots
+
+    engine = _split_engine()
+    engine.slot_program = program
+    vector = np.random.default_rng(745).normal(size=engine.space.size)
+    whole = engine.sigma(vector)
+    total = len(engine._direction_t4.slots)
+    parts = [split_slots(total, k, 3, block=2) for k in range(3)]
+    assert np.array_equal(np.sort(np.concatenate(parts)), np.arange(total))
+    summed = np.zeros(engine.space.slices[3].stop - engine.space.slices[3].start)
+    for part in parts:
+        engine.rank_four_slots = part
+        summed += engine._action(vector, ranks=(4,))
+    engine.rank_four_slots = None
+    assert np.array_equal(summed, whole[engine.space.slices[3]])
+
+
+def test_split_action_with_a_worker_process(tmp_path):
+    """`Partners` runs part of every action in a worker process that builds
+    the same engine; the solver's sigma is the one-process action."""
+    from itercc._slot_split import Partners
+
+    engine = _split_engine()
+    vectors = np.random.default_rng(747).normal(size=(2, engine.space.size))
+    whole = [engine.sigma(v) for v in vectors]
+    partners = Partners(engine, f"{Path(__file__).resolve()}:_split_engine", {}, parts=2,
+                        exchange=tmp_path / "exchange", bind=False, threads=2, block=2)
+    try:
+        split = [engine.sigma(v) for v in vectors]
+        assert len(engine.rank_four_slots) < len(engine._direction_t4.slots)
+    finally:
+        partners.close()
+    assert engine.rank_four_partner is None and not (tmp_path / "exchange").exists()
+    for one, two in zip(whole, split):
+        np.testing.assert_allclose(two, one, rtol=1e-12, atol=1e-12 * np.abs(one).max())

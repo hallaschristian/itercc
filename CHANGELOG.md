@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Triplet EOM-CCSDTQ actions split over processes (`itercc/_slot_split.py`):
+  every rank-four slot writes only its own rows with values that do not
+  depend on the other slots of the process, so `Partners` deals the slots
+  out in blocks of 16 to workers (one per NUMA node, bound with numactl)
+  that build the same engine, and `sigma` adds their rows: the action of
+  one process bit for bit. The slot program runs any table of slots
+  (`SlotProgram.run(slots=...)`, no core change); the CuF triplet driver
+  takes `--sockets N`.
 - One runtime layer for every method (`itercc/_runtime.py`, documented in
   docs/design.md "Canonical machinery"). Threads: `RestrictedCCSDTQ`,
   `EOMSinglet`, `DipoleResponse` and `TripletEOMCCSDTQ` take a `cpu_threads`

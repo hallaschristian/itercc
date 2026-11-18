@@ -34,8 +34,9 @@ def test_every_switch_the_package_or_core_reads_is_registered():
     for path, text in _python_sources().items():
         named |= set(re.findall(r"ITERCC_[A-Z0-9_]+", text))
         if path.name != "_runtime.py":
-            # Only the registry reads the environment for an ITERCC_* switch.
-            assert not re.search(r"""(environ|getenv)[^\n]*["']ITERCC_""", text), path.name
+            # Only the registry reads the environment for an ITERCC_* switch
+            # (setting one for a child process is fine).
+            assert not re.search(r"""(os\.environ(\.get\()?|getenv\()\[?\s*["']ITERCC_""", text), path.name
     assert named - NOT_SWITCHES <= set(_runtime.SWITCHES)
     core = _core_reads()
     assert core <= set(_runtime.SWITCHES)

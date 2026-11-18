@@ -137,6 +137,12 @@ half of what `memory_budget_gib` leaves beside the engine's estimate (which
 counts the program's tiles and buffers). Progress callbacks arrive after each
 wave. The action agrees with the earlier Python slot loop to round-off, and
 bit for bit with `ITERCC_TRIPLET_FUSED=0`; the switches below fall back.
+An action can also be shared by processes, one per socket (or node):
+`itercc._slot_split.Partners(engine, builder, kwargs, parts=2)` starts
+workers that build the same engine, deals the rank-four slots out in blocks,
+and adds the workers' rows to each `sigma`, bit for bit the one-process
+action (the CuF triplet driver's `--sockets 2`, its launcher binding itself
+to NUMA node 0).
 Packed T4 is read in place, so by default (`occupied_slab=None`) its summed
 occupied letters stay whole. A positive `occupied_slab`, for example 2, still
 cuts them into slabs of at most that width, which with packed T4 only repeats

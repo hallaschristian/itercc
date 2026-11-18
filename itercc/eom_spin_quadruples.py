@@ -189,6 +189,11 @@ class TripletEOMCCSDTQ:
         self.fused_tiles = True
         self.share_work = None
         self._slot_programs = {}
+        # Rank-four slots this process computes (increasing indices; None: all)
+        # and the partner that computes the others at the same time (see
+        # `_slot_split`): one action split over sockets or nodes.
+        self.rank_four_slots = None
+        self.rank_four_partner = None
         if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
         self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
@@ -368,9 +373,15 @@ class TripletEOMCCSDTQ:
             spin_groups = {}
             started = perf_counter() if slot_finished is not None else 0.
             total = len(self._direction_t4.slots)
+            selected = None
+            if slot_limit is None and self.rank_four_slots is not None:
+                selected = np.zeros(total, dtype=bool)
+                selected[np.asarray(self.rank_four_slots, dtype=np.int64)] = True
             for index, (holes, (key, rows)) in enumerate(self._direction_t4.slots.items()):
                 if slot_limit is not None and index >= slot_limit:
                     break
+                if selected is not None and not selected[index]:
+                    continue        # pending direct terms flush at the gap in rows
                 if key not in spin_groups:
                     particles = self._direction_t4.groups[key]
                     signatures = particles % 2
@@ -460,6 +471,10 @@ class TripletEOMCCSDTQ:
         layout = self._direction_t4
         total = len(layout.slots)
         done = total if slot_limit is None else min(int(slot_limit), total)
+        chosen = None
+        if slot_limit is None and self.rank_four_slots is not None:
+            chosen = np.asarray(self.rank_four_slots, dtype=np.int64)
+            done = total = len(chosen)
         # Shared intermediates: the configured budget, else half of what the
         # memory budget leaves beside the estimate (which counts the program's
         # tiles and direct-term buffers): the waves' partial sums take as much
@@ -480,17 +495,20 @@ class TripletEOMCCSDTQ:
                 slot_finished(slots, total, perf_counter() - started)
         self._program_cache = program.run(blocks, self.amplitudes[3], direction, result, cache_bytes=cache,
                                           threads=cpu_threads(), slot_limit=done, fused=fused, share_work=share,
-                                          progress=report)
+                                          progress=report, slots=chosen)
         if packed_action is not None and done:
             # The direct packed terms of consecutive slots (windows follow each
             # other), at least 2^22 rows per call: the dense kernel runs a
             # call's slots in parallel (2^18 rows were 12 CuF slots for 56
             # threads), and each row's sums do not depend on the chunks.
-            slots = list(layout.slots.items())[:done]
+            items = list(layout.slots.items())
+            slots = items[:done] if chosen is None else [items[i] for i in chosen]
+            following = (np.ones(done, dtype=bool) if chosen is None else
+                         np.r_[True, np.diff(chosen) == 1])        # rows follow the previous slot's
             start = 0
             while start < done:
                 stop, count = start, 0
-                while stop < done and count < 1 << 22:
+                while stop < done and count < 1 << 22 and (stop == start or following[stop]):
                     count += len(layout.groups[slots[stop][1][0]])
                     stop += 1
                 parts = []
@@ -710,7 +728,14 @@ class TripletEOMCCSDTQ:
         if self.xp.iscomplexobj(vector):
             return self.sigma(vector.real) + 1j * self.sigma(vector.imag)
         start = perf_counter()
+        partner = self.rank_four_partner
+        if partner is not None:
+            partner.start(vector)           # the other processes' rank-four slots, meanwhile
         result = self._action(vector)
+        if partner is not None:
+            from ._cpu_quadruples import add_
+
+            add_(result[self.space.slices[3]], partner.finish())
         if not bool(self.xp.isfinite(result).all()):
             raise FloatingPointError("Nonfinite spin-flip Jacobian action")
         self.matvec_count += 1

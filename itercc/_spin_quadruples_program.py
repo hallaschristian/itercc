@@ -620,10 +620,13 @@ class SlotProgram:
         self._arrays = arrays
 
     def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,
-            share_work=0, progress=None):
+            share_work=0, progress=None, slots=None):
         """Add the projected rank-four slots into `result` (zero on entry: the
-        slots' rows get the Python loop's values). `progress(done)` is called
-        after each wave of slots. Returns the intermediate cache statistics."""
+        slots' rows get the Python loop's values). `slots` (increasing slot
+        indices) runs only those slots, `slot_limit` the first ones; each slot
+        writes only its own rows, with the same values whichever slots run with
+        it. `progress(done)` is called after each wave of slots. Returns the
+        intermediate cache statistics."""
         pointers = np.zeros(max(1, len(self._bases)), dtype=np.int64)
         for name, pair in blocks.items():
             for side, array in enumerate((pair.value, pair.tangent)):
@@ -636,7 +639,15 @@ class SlotProgram:
             raise ValueError("The program reads a missing T4 vector")
         if not (result.dtype == np.float64 and result.flags.c_contiguous):
             raise ValueError("The rank-four result must be a contiguous float64 array")
-        nslots = self.nslots if slot_limit is None else min(int(slot_limit), self.nslots)
+        struct = self.struct
+        if slots is not None:
+            # The program walks the slot records it is given: a table of the chosen ones.
+            chosen = np.ascontiguousarray(self.slots[np.asarray(slots, dtype=np.int64)])
+            struct = ProgramStruct.from_buffer_copy(self.struct)
+            struct.slots = chosen.ctypes.data
+            nslots = len(chosen)
+        else:
+            nslots = self.nslots if slot_limit is None else min(int(slot_limit), self.nslots)
         stats = np.zeros(8, dtype=np.int64)
         callback = None if progress is None else _PROGRESS(lambda done, total: progress(int(done)))
         # Waves hold as many partial sums as the intermediate cache holds
@@ -644,7 +655,7 @@ class SlotProgram:
         # intermediates run together.
         partial = max(_PARTIAL_DOUBLES, int(cache_bytes) // 8)
         status = self.library.triplet_slots(
-            ctypes.byref(self.struct), nslots, partial, pointers.ctypes.data,
+            ctypes.byref(struct), nslots, partial, pointers.ctypes.data,
             None if ground is None else ground.ctypes.data,
             None if direction is None else direction.ctypes.data,
             result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads), int(bool(fused)),
