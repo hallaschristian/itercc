@@ -11,7 +11,8 @@ projection keeps it without a copy.
 import numpy as np
 
 from . import _cpu_kernels
-from ._cpu_triples import cpu_threads, matmul, product_into
+from ._cpu_triples import matmul, product_into
+from ._runtime import cpu_threads
 
 
 def _pairs(n):
@@ -63,7 +64,7 @@ def mo_eri(ao_eri, coeff, *, orbital_irreps=None, threads=None, batch_bytes=256 
     each orbital) the symmetry-forbidden entries are exact zeros. About
     2 N^5 multiply-adds for N basis functions and orbitals, on all threads."""
     library = _cpu_kernels.library()
-    if library is None or not hasattr(library, "scatter_pairs"):
+    if library is None:
         raise RuntimeError("the native integral transformation needs the compiled core")
     coeff = np.ascontiguousarray(coeff, dtype=np.float64)
     if coeff.ndim != 2:

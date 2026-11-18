@@ -23,15 +23,11 @@ import numpy as np
 from threadpoolctl import threadpool_limits
 
 from itercc import RestrictedCC
+from itercc.restricted import cuda_options
 from itercc.spatial_symmetry import project_amplitudes, project_integrals
 
 # The production settings of the CUDA CCSDT solver (all fused CUDA paths on).
-PRODUCTION_GPU = dict(residual_backend="cuda", ladder_batch=16,
-                      cuda_pair_fusion=True, cuda_layout_fusion=True, cuda_ph_columns=True,
-                      cuda_ladder_columns=True, cuda_occupied_columns=True, cuda_t1_dressing=True,
-                      cuda_jacobi=True, cuda_crossed_fusion=True, cuda_feedback_columns=True,
-                      cuda_assembly_columns=True, cuda_ph_fusion=True, cuda_pool_cache=True,
-                      host_diis_columns=True)
+PRODUCTION_GPU = cuda_options()
 # name: (pass orbital symmetry labels, solver options). The "-reference"
 # variants use the generic per-(j, k) triples loop instead of _cpu_triples.
 VARIANTS = {
@@ -39,9 +35,7 @@ VARIANTS = {
     "cpu-sym": (True, dict(ladder_batch=4)),
     "cpu-reference": (False, dict(ladder_batch=4)),
     "cpu-sym-reference": (True, dict(ladder_batch=4)),
-    "gpu-dense": (False, dict(residual_backend="cuda", ladder_batch=4, cuda_pair_fusion=True,
-                              cuda_layout_fusion=True, cuda_crossed_fusion=True,
-                              cuda_pool_cache=True)),
+    "gpu-dense": (False, cuda_options(labelled=False)),
     "gpu": (True, PRODUCTION_GPU),
 }
 CONTROLS = dict(energy_tol=1e-12, residual_tol=1e-10, diis_size=3, diis_triples=True)

@@ -16,7 +16,7 @@ from functools import reduce
 import numpy as np
 
 from . import _cpu_kernels
-from ._cpu_triples import cpu_threads
+from ._runtime import cpu_threads
 from ._tensor_scatter import SignedRows
 from .symmetry_blocks import SymmetryBlocks, _offsets
 
@@ -56,8 +56,6 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         """Free the kernels' per-thread scratch buffers (they keep their pages
         between calls, so a phase of many products faults them in once)."""
         if self._library is not None:
-            from ._cpu_triples import cpu_threads
-
             self._library.scratch_release(cpu_threads(self.threads))
 
     def _offsets(self, letters, extent, strides, composite):
@@ -139,8 +137,9 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         return (int(bool(structure["ta"])) | 2 * int(bool(structure["tb"]))
                 | 4 * int(bool(structure["rfast"])))
 
-    def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0)):
-        """out = beta * out + alpha * einsum(spec, a, b) (see `SymmetryBlocks.einsum`)."""
+    def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0), threads=None):
+        """out = beta * out + alpha * einsum(spec, a, b) (see `SymmetryBlocks.einsum`)
+        on `threads` (default: the engine's count, else `cpu_threads`)."""
         if isinstance(a, SignedRows):
             if isinstance(b, SignedRows):
                 a = a.dense()
@@ -154,7 +153,7 @@ class CpuSymmetryBlocks(SymmetryBlocks):
                 raise ValueError(f"No symmetry-blocked plan for {spec}")
             b = b.dense() if isinstance(b, SignedRows) else b
             return self.fallback(spec, a, b, out=out, alpha=alpha, beta=beta)
-        threads = cpu_threads(self.threads)
+        threads = cpu_threads(self.threads if threads is None else threads)
         library = self._library
         if beta != 1.0:
             if out.flags.c_contiguous:

@@ -17,6 +17,7 @@ from .eom import EOMSinglet
 from .hamiltonian import Hamiltonian
 from .solver import TensorCC
 from .spatial_symmetry import orbital_labels, project_integrals
+from . import _runtime
 
 
 def _antisymmetrize(xp, tensor):
@@ -173,8 +174,12 @@ class TripletEOMCCSDTQ:
     def __init__(self, solver, amplitudes, orbital_irreps=None, irrep=0, *,
                  backend="cpu", memory_budget_gib=4, occupied_tiles=False, action_only=False,
                  packed_spin=False, packed_contractions=None, intermediate_cache_gib=0,
-                 occupied_slab=None):
+                 occupied_slab=None, cpu_threads=None):
         no, nv = solver.nocc, solver.nvir
+        # Kernel threads of every action and solve: the option, else the
+        # ground-state solver's.
+        self.cpu_threads = _runtime.thread_option(
+            cpu_threads if cpu_threads is not None else getattr(solver, "cpu_threads", None))
         if occupied_slab is not None and (isinstance(occupied_slab, (bool, np.bool_)) or
                 not isinstance(occupied_slab, (int, np.integer)) or occupied_slab < 1):
             raise ValueError("Occupied slab must be a positive integer or None")
@@ -238,7 +243,7 @@ class TripletEOMCCSDTQ:
             if xp is not np:
                 from . import symmetry_blocks
                 from ._quadruples_cuda import einsum as cuda_einsum
-                if symmetry_blocks.available():
+                if symmetry_blocks.engine_available():
                     self._symmetry_engine = symmetry_blocks.SymmetryBlocks(
                         by_letter, "ijkl", nirrep, fallback=cuda_einsum)
             else:
@@ -268,10 +273,8 @@ class TripletEOMCCSDTQ:
             # 16 contexts per row at most), and the waves' partial sums, as
             # large as an explicit intermediate cache (a default cache takes
             # half of what remains, the partial sums the other half).
-            from ._cpu_triples import cpu_threads
-
             rows = max((len(p) for p in self._direction_t4.groups.values()), default=0)
-            self.estimated_dense_bytes += (cpu_threads() * (8 * nv**4 + rows * (72 * 8 + 16 * 24))
+            self.estimated_dense_bytes += (_runtime.cpu_threads(self.cpu_threads) * (8 * nv**4 + rows * (72 * 8 + 16 * 24))
                                            + self.intermediate_cache_bytes)
             if self.estimated_dense_bytes > self.memory_budget_bytes:
                 raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
@@ -430,15 +433,13 @@ class TripletEOMCCSDTQ:
         apply (GPU, no symmetry engine, no direct packed terms, the reference
         expansion or projection, a product without a blocked plan, or
         ITERCC_TRIPLET_PROGRAM=0): the loop runs."""
-        import os
-
         if (not self.slot_program or self.xp is not np or not self.packed_contractions
                 or not self.native_projection or not self._direction_t4.native_expansion
                 or not self._ground_t4.native_expansion
                 or not getattr(self._symmetry_engine, "packed_operands", False)
-                or os.environ.get("ITERCC_TRIPLET_PROGRAM", "1") == "0"):
+                or not _runtime.enabled("ITERCC_TRIPLET_PROGRAM")):
             return False
-        from ._cpu_triples import cpu_threads
+        from ._runtime import cpu_threads
         from ._spin_quadruples_program import SlotProgram, Unsupported
 
         presence = {name: pair.tangent is not None for name, pair in blocks.items()}
@@ -469,10 +470,10 @@ class TripletEOMCCSDTQ:
         cache = max(cache, 2**28)
         # Fused tile products (other rounding); ITERCC_TRIPLET_FUSED=0 keeps
         # the loop's products, bit for bit.
-        fused = self.fused_tiles and os.environ.get("ITERCC_TRIPLET_FUSED", "1") != "0"
+        fused = self.fused_tiles and _runtime.enabled("ITERCC_TRIPLET_FUSED")
         # Intermediates of at least this many multiply-adds are computed in
         # pieces that waiting tiles help with (0: the core's default, 2^22).
-        share = int(os.environ.get("ITERCC_SLOT_SHARE_WORK", self.share_work or 0))
+        share = _runtime.integer("ITERCC_SLOT_SHARE_WORK") or int(self.share_work or 0)
         report = None
         if slot_finished is not None:
             def report(slots):
@@ -667,12 +668,14 @@ class TripletEOMCCSDTQ:
         self._gather_plans = {}
         return xp.concatenate(outputs)
 
+    @_runtime.threaded
     def probe_rank_four(self, vector, slots):
         """Measure a bounded prefix of occupied rank-four slots."""
         if not self.action_only or slots < 1:
             raise ValueError("Rank-four probing needs the action-only packed layout and positive slots")
         return self._action(vector, ranks=(4,), slot_limit=slots)
 
+    @_runtime.threaded
     def probe_lower_ranks(self, vector):
         """Apply the full Jacobian into ranks one through three, including R4 feedback.
 
@@ -683,6 +686,7 @@ class TripletEOMCCSDTQ:
             raise ValueError("The feedback probe needs the action-only packed layout")
         return self._action(vector, ranks=range(1, 4))
 
+    @_runtime.threaded
     def solve(self, *args, **options):
         if self.action_only:
             raise ValueError("The action-only layout has no large-system triplet spin projector")
@@ -699,21 +703,20 @@ class TripletEOMCCSDTQ:
             estimate += 7 * sum(int(np.prod(shape)) for shape in self.space.shapes) * 8
         return estimate
 
+    @_runtime.threaded
     def sigma(self, vector):
         if self.action_only:
             raise ValueError("Use probe_rank_four for the action-only layout")
         if self.xp.iscomplexobj(vector):
             return self.sigma(vector.real) + 1j * self.sigma(vector.imag)
         start = perf_counter()
-        from ._cpu_triples import thread_scope
-
-        with thread_scope(None):                 # one thread count for the whole action
-            result = self._action(vector)
+        result = self._action(vector)
         if not bool(self.xp.isfinite(result).all()):
             raise FloatingPointError("Nonfinite spin-flip Jacobian action")
         self.matvec_count += 1
         self.matvec_seconds += perf_counter() - start
         return result
 
+    @_runtime.threaded
     def full_residual_norm(self, vector, energy):
         return float(self.xp.linalg.norm(self.sigma(vector) - energy * vector))

@@ -13,7 +13,7 @@ from math import prod
 import numpy as np
 
 from . import _cpu_kernels
-from ._cpu_triples import cpu_threads
+from ._runtime import cpu_threads
 
 
 def signed_gather_rows(vector, bases, maps, width, *, threads=None):

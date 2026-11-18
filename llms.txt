@@ -116,7 +116,7 @@ occupied orbitals first, `eri[p,q,r,s] = (pq|rs)`.
 - `Result`: `energy` (total), `correlation_energy`, `amplitudes` = (t1[i,a], t2[i,j,a,b], t3[slot,a,b,c]), `converged`, `iterations` (records with `energy`, `delta_energy`, `residual_max`), `residual_max`.
 - Convergence trouble: increase `max_iter`, use `diis_size=8`, `damping=0.2`, or `diis_triples=True`.
 
-### RestrictedCCSDTQ(h, eri, nocc, constant=0.0, *, orbital_irreps=None, symmetry_tolerance=1e-9, backend="cuda", precision="double", block_size=None, host_r4=False)
+### RestrictedCCSDTQ(h, eri, nocc, constant=0.0, *, orbital_irreps=None, symmetry_tolerance=1e-9, backend="cuda", precision="double", block_size=None, host_r4=False, cpu_threads=None)
 - `.solve(*, initial=None, max_iter=100, energy_tol=1e-11, residual_tol=1e-9, damping=0.0, diis_size=6, diis_quadruples="auto", callback=None, checkpoint=None, resume=None) -> Result` with amplitudes (t1, t2, t3, t4).
 - `initial=(t1, t2, solver.expand_triples(t3))` starts from CCSDT (T4 = 0); None starts from zero.
 - DIIS includes T4 by default on the CPU backend (`diis_quadruples="auto"` = "host": a compact history in host
@@ -128,7 +128,7 @@ occupied orbitals first, `eri[p,q,r,s] = (pq|rs)`.
   `state, _ = solver.load_state("ccsdtq_state")`, then `solver.solve(resume=state, ...)`.
 - GPU memory estimate: `solver.device_bytes(diis_size=..., diis_quadruples=...)`; if R4 does not fit, `host_r4=True, block_size=2`.
 
-### EOMSinglet(solver, amplitudes, *, orbital_irreps=None, irrep=0, backend="cpu", method="ccsdt")
+### EOMSinglet(solver, amplitudes, *, orbital_irreps=None, irrep=0, backend="cpu", method="ccsdt", cpu_threads=None)
 Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
 `RestrictedCC` that produced `amplitudes`.
 - `.solve(nroots=3, *, residual_tol=1e-8, max_iter=100, max_space=20, guesses=None) -> EOMResult`
@@ -136,7 +136,7 @@ Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
 - `residual_tol=1e-6` puts excitation energies within about 3e-8 Eh (1 micro-eV) of tightly
   converged roots and needs about 30% fewer Jacobian actions than 1e-9 (measured on water).
 
-### DipoleResponse(solver, amplitudes, dipoles, *, orbital_irreps=None, dipole_irreps=None, backend="cpu", method="ccsdt")
+### DipoleResponse(solver, amplitudes, dipoles, *, orbital_irreps=None, dipole_irreps=None, backend="cpu", method="ccsdt", cpu_threads=None)
 - `.polarizability(wavelength_nm, *, damping_Eh=0.0, tol=1e-8) -> Polarizability`
 - `float("inf")` = static. `damping_Eh > 0` gives the complex damped tensor (absorption in the imaginary part).
 - `Polarizability`: `tensor_au` (complex 3x3), `wavelength_nm`, `frequency_Eh`, `damping_Eh`.
@@ -160,9 +160,9 @@ docs/guide.md (`ITERCC_TRIPLET_PROGRAM=0` and others).
 ## GPU
 
 ```python
-cc = RestrictedCC(model.h, model.eri, model.nocc, model.constant, residual_backend="cuda",
-                  cuda_pair_fusion=True, cuda_layout_fusion=True, cuda_crossed_fusion=True,
-                  cuda_pool_cache=True)
+from itercc.restricted import cuda_options   # the production CUDA CCSDT options
+cc = RestrictedCC(model.h, model.eri, model.nocc, model.constant,
+                  orbital_irreps=model.orbital_irreps, **cuda_options())  # labelled=False without labels
 eom = EOMSinglet(cc, ground.amplitudes, backend="cuda", orbital_irreps=model.orbital_irreps, irrep=2)
 solver = RestrictedCCSDTQ(..., backend="cuda")
 ```
@@ -172,7 +172,8 @@ the CPU path is usually faster there.
 ## Performance and limits
 
 - Threads: one per physical core by default; set `ITERCC_CPU_THREADS=<cores>`
-  on clusters. `OMP_NUM_THREADS` is ignored by the kernels. On multi-socket
+  on clusters, or pass `cpu_threads=` to a solver (EOM, response and triplet
+  engines inherit the ground-state solver's count). `OMP_NUM_THREADS` is ignored by the kernels. On multi-socket
   nodes run one calculation per socket: `numactl --cpunodebind=0 --membind=0 python run.py`.
 - Cost grows as n_occ^3 n_vir^5 per CCSDT iteration and n_occ^4 n_vir^6 per CCSDTQ iteration (less with symmetry).
 - Memory: CCSDT holds a few copies of T3 (8 * n_occ^3/6 * n_vir^3 bytes each);

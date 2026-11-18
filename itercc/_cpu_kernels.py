@@ -22,7 +22,7 @@ import tempfile
 import threading
 import warnings
 
-from . import _core
+from . import _core, _runtime
 
 _PACKAGE = Path(__file__).resolve().parent
 # The core sources: a source checkout's core/, else an installed package's copy.
@@ -43,7 +43,7 @@ _state = {}
 
 
 def _compiler():
-    for name in (os.environ.get("ITERCC_CXX"), "c++", "g++"):
+    for name in (_runtime.switch("ITERCC_CXX"), "c++", "g++"):
         if name and shutil.which(name):
             return shutil.which(name)
     return None
@@ -84,7 +84,7 @@ def _runtime_build(compiler):
     if not all(path.exists() for path in files):
         _state["error"] = f"the core sources are missing ({CORE})"
         return None
-    cache = Path(os.environ.get("ITERCC_KERNEL_CACHE") or Path.home() / ".cache" / "itercc")
+    cache = Path(_runtime.switch("ITERCC_KERNEL_CACHE") or Path.home() / ".cache" / "itercc")
     known = cache / f"known-{_stat_key(compiler, files)}"
     try:
         name = known.read_text(encoding="utf-8").strip()
@@ -130,7 +130,7 @@ def _full_build(compiler, files, cache):
 
 def library():
     """The CPU kernels, or None when disabled or neither prebuilt nor buildable."""
-    if os.environ.get("ITERCC_CPU_KERNELS", "1") == "0":
+    if not _runtime.enabled("ITERCC_CPU_KERNELS"):
         return None
     prebuilt = _core.library()
     if prebuilt is not None:

@@ -148,9 +148,24 @@ def product_directions(*operands):
 
 
 def dress_direction(value, direction, nocc, xp):
-    """Differentiate the exact T1 similarity transform on one or two body legs."""
+    """Differentiate the exact T1 similarity transform on one or two body legs.
+    `direction` is (virtual, occupied). Two-body float64 integrals on the CPU
+    take the core's one-pass derivative (`itercc_dress_derivative`, as the
+    singlet actions do); the leg-by-leg tensordots otherwise."""
     from .solver import _dress_axis
 
+    if (xp is np and value.ndim == 4 and value.dtype == np.float64 and direction.dtype == np.float64
+            and value.flags.c_contiguous and len(set(value.shape)) == 1):
+        from . import _cpu_kernels
+        from ._runtime import cpu_threads
+
+        library = _cpu_kernels.library()
+        if library is not None:
+            result = np.empty_like(value)
+            d = np.ascontiguousarray(direction.T)          # (occupied, virtual)
+            library.dress_derivative(result.ctypes.data, value.ctypes.data, len(value), nocc,
+                                     d.ctypes.data, cpu_threads(None))
+            return result
     occupied, virtual = slice(nocc), slice(nocc, None)
     result = xp.zeros_like(value)
     creators = value.ndim // 2

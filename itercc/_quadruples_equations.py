@@ -23,7 +23,6 @@ device-local occupied tiles and the independent IterCC driver. Arrays are
 allocated with the solver's array module (`mycc.xp`, CuPy or NumPy), and
 the kernels below run in the backend of their operands.
 """
-import os
 
 import numpy as np
 
@@ -31,6 +30,7 @@ from . import _cpu_quadruples, _quadruples_cpu, _quadruples_cuda
 from ._quadruples_cuda import (
     _accumulate_t4_, _unpack_t4_, _unpack_t4_triples_, prange,
 )
+from . import _runtime
 
 
 def _kernels(array):
@@ -189,6 +189,15 @@ def intermediates_t3(mycc, imds, t2):
     return imds
 
 
+def _spin_summed_t3(imds, t3):
+    """P3_201 of T3, formed once per evaluation: r1r2_add_t3_ keeps it on
+    `imds` for the T3 intermediates and r3, and intermediates_t4_tri, its
+    last reader before the large T4 pass, drops it (compute_r4_tri forms it
+    again then, so the peak memory is that of separate copies)."""
+    kept = getattr(imds, "spin_summed_t3", None)
+    return kept[1] if kept is not None and kept[0] is t3 else None
+
+
 def r1r2_add_t3_(mycc, imds, r1, r2, t3):
     '''Add the T3 contributions to r1 and r2. T3 amplitudes are stored in full form.'''
     einsum = _t3_products(mycc, t3)
@@ -203,6 +212,7 @@ def r1r2_add_t3_(mycc, imds, r1, r2, t3):
     einsum('jkbc,kijcab->ia', t1_eris[:nocc, :nocc, nocc:, nocc:], c_t3, out=r1, alpha=0.5, beta=1.0)
 
     t3_spin_summation(t3, c_t3, nocc**3, nvir, "P3_201", 1.0, 0.0)
+    imds.spin_summed_t3 = (t3, c_t3)
     einsum("kc,kijcab->ijab", t1_fock[:nocc, nocc:], c_t3, out=r2, alpha=0.5, beta=1.0)
     einsum("bkcd,kijdac->ijab", t1_eris[nocc:, :nocc, nocc:, nocc:], c_t3, out=r2, alpha=1.0, beta=1.0)
     einsum("kljc,likcab->ijab", t1_eris[:nocc, :nocc, :nocc, nocc:], c_t3, out=r2, alpha=-1.0, beta=1.0)
@@ -219,8 +229,10 @@ def intermediates_t3_add_t3(mycc, imds, t3):
 
     t1_eris, W_vooo, W_vvvo = imds.t1_eris, imds.W_vooo, imds.W_vvvo
 
-    c_t3 = xp.empty_like(t3)
-    t3_spin_summation(t3, c_t3, nocc**3, nvir, "P3_201", 1.0, 0.0)
+    c_t3 = _spin_summed_t3(imds, t3)
+    if c_t3 is None:
+        c_t3 = xp.empty_like(t3)
+        t3_spin_summation(t3, c_t3, nocc**3, nvir, "P3_201", 1.0, 0.0)
     einsum('lmde,mijead->alij', t1_eris[:nocc, :nocc, nocc:, nocc:], c_t3, out=W_vooo, alpha=1.0, beta=1.0)
     einsum('lmde,mjleba->abdj', t1_eris[:nocc, :nocc, nocc:, nocc:], c_t3, out=W_vvvo, alpha=-1.0, beta=1.0)
     c_t3 = None
@@ -241,8 +253,10 @@ def compute_r3(mycc, imds, t2, t3):
     W_oooo, W_ovvo, W_ovov, W_vvvv = imds.W_oooo, imds.W_ovvo, imds.W_ovov, imds.W_vvvv
     W_vooo, W_vvvo = imds.W_vooo, imds.W_vvvo
 
-    c_t3 = xp.empty_like(t3)
-    t3_spin_summation(t3, c_t3, nocc**3, nvir, "P3_201", 1.0, 0.0)
+    c_t3 = _spin_summed_t3(imds, t3)
+    if c_t3 is None:
+        c_t3 = xp.empty_like(t3)
+        t3_spin_summation(t3, c_t3, nocc**3, nvir, "P3_201", 1.0, 0.0)
 
     r3 = xp.empty_like(t3)
     einsum('abdj,ikdc->ijkabc', W_vvvo, t2, out=r3, alpha=1.0, beta=0.0)
@@ -282,8 +296,11 @@ def intermediates_t4_tri(mycc, imds, t2, t3):
     einsum('mafe,jibf->ijeabm', t1_eris[:nocc, nocc:, nocc:, nocc:], t2, out=W_oovvvo, alpha=-1.0, beta=1.0)
     einsum('mnei,njab->ijeabm', t1_eris[:nocc, :nocc, nocc:, :nocc], t2, out=W_oovvvo, alpha=-2.0, beta=1.0)
     einsum('nmei,njab->ijeabm', t1_eris[:nocc, :nocc, nocc:, :nocc], t2, out=W_oovvvo, alpha=1.0, beta=1.0)
-    c_t3 = xp.empty_like(t3)
-    t3_spin_summation(t3, c_t3, nocc**3, nvir, "P3_201", 1.0, 0.0)
+    c_t3 = _spin_summed_t3(imds, t3)
+    imds.spin_summed_t3 = None
+    if c_t3 is None:
+        c_t3 = xp.empty_like(t3)
+        t3_spin_summation(t3, c_t3, nocc**3, nvir, "P3_201", 1.0, 0.0)
     einsum('nmfe,nijfab->ijeabm', t1_eris[:nocc, :nocc, nocc:, nocc:], c_t3, out=W_oovvvo, alpha=0.5, beta=1.0)
     einsum('mnfe,nijfab->ijeabm', t1_eris[:nocc, :nocc, nocc:, nocc:], c_t3, out=W_oovvvo, alpha=-0.25, beta=1.0)
     c_t3 = None
@@ -338,11 +355,11 @@ def t4_into_lower_ranks_(mycc, imds, r2, r3, t4, *, budget=2 * 2**30):
     eris_oovv, eris_vovv = t1_eris[o, o, v, v], t1_eris[v, o, v, v]
     fock_ov = t1_fock[o, v]
     # ITERCC_LOWER_CHUNK (diagnostic) fixes the number of m per chunk.
-    chunk = int(os.environ.get("ITERCC_LOWER_CHUNK", 0)) or max(1, min(nocc, budget // (8 * nocc * nvir**4)))
+    chunk = _runtime.integer("ITERCC_LOWER_CHUNK") or max(1, min(nocc, budget // (8 * nocc * nvir**4)))
     if hasattr(mycc.layout, "add_oooo_pairs") and mycc.layout.symmetric:
         # The compiled CPU layout: packed blocks and box-level plans.
         from . import _cpu_packed
-        from ._cpu_triples import cpu_threads
+        from ._runtime import cpu_threads
 
         _cpu_packed.t4_into_lower_ranks(mycc.layout, r2, r3, t4, eris_oovv, eris_vovv, fock_ov,
                                         t1_eris[o, o, v, o], W_vvoooo, W_vvvvoo, chunk, cpu_threads(None),
@@ -872,7 +889,7 @@ def r4_add_rings_triples_(mycc, r4, t4, F_oo, W_ovov, W_voov):
     if hasattr(layout, "add_oooo_pairs") and layout.symmetric:
         # The compiled CPU layout: packed blocks and box-level plans.
         from . import _cpu_packed
-        from ._cpu_triples import cpu_threads
+        from ._runtime import cpu_threads
 
         return _cpu_packed.add_rings(layout, r4, t4, F_oo, W_ovov, W_voov, cpu_threads(None))
     shape = (nocc,) + (nvir,) * 4

@@ -92,3 +92,21 @@ def test_cuda_direct_gemm_preserves_aliased_operand(monkeypatch):
     np.testing.assert_array_equal(target.get(), expected.get())
     bounded.einsum_into(cp, target, 1.0, "ij,jk->ik", cp.empty((4, 0)), cp.empty((0, 4)))
     np.testing.assert_array_equal(target.get(), expected.get())
+
+
+@pytest.mark.parametrize("budget", [None, 2048])
+def test_new_cpu_products_run_on_the_core(budget):
+    """Two-operand products into a new array take the core's GEMM executor
+    on the CPU (contracted slabs added in place) and agree with NumPy."""
+    from itercc import _cpu_kernels
+
+    if _cpu_kernels.library() is None:
+        pytest.skip("no compiled core")
+    rng = np.random.default_rng(3)
+    a = rng.standard_normal((6, 40, 5))
+    b = rng.standard_normal((40, 7, 6))
+    value = bounded.einsum(np, "iak,ajl->kjli", a, b, budget=budget)
+    np.testing.assert_allclose(value, np.einsum("iak,ajl->kjli", a, b), rtol=1e-13, atol=1e-13)
+    assert value.flags.c_contiguous and value.shape == (5, 7, 6, 6)
+    np.testing.assert_array_equal(bounded.einsum(np, "ia,ia->", a[:, :, 0], a[:, :, 1]),
+                                  np.einsum("ia,ia->", a[:, :, 0], a[:, :, 1]))

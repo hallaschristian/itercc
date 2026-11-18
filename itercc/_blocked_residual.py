@@ -179,7 +179,7 @@ class PlaneTables:
         nv = t2.shape[-1]
         if (library is not None and t2.flags.c_contiguous and t2.dtype == np.float64
                 and vvvo_rows.flags.c_contiguous and vooo_rows.flags.c_contiguous):
-            from ._cpu_triples import cpu_threads
+            from ._runtime import cpu_threads
 
             threads = cpu_threads(threads)
             _, sizes = self.planes[k]
@@ -420,7 +420,7 @@ def _grouped(library, sizes, a_offsets, matrices, operands, bases, out, threads=
     """out[base] = block @ operand[base] for each sector, (m x m) @ (m x n), in one
     call of the core's GEMM executor (the contraction engine of the CPU CCSDTQ
     solver: no BLAS, all OpenMP threads, sectors and tiles in parallel)."""
-    from ._cpu_triples import cpu_threads
+    from ._runtime import cpu_threads
 
     threads = cpu_threads(threads)
     sizes = tuple((int(m), int(n)) for m, n in sizes)

@@ -25,11 +25,11 @@ one-sided sums, repeated indices, an output whose unit-stride index is a
 batch index, or many small GEMMs that would move more data than einsum).
 """
 from dataclasses import dataclass
-import os
 from itertools import product
 from math import prod
 
 import numpy as np
+from . import _runtime
 
 _INT32 = np.iinfo(np.int32).max
 _plans = {}
@@ -300,7 +300,7 @@ def _einsum_update(spec, a, b, out, alpha, beta):
 
 
 # Autotuned route per contraction shape: True for direct GEMMs, False for einsum.
-AUTOTUNE = os.environ.get("ITERCC_GEMM_AUTOTUNE", "1") != "0"
+AUTOTUNE = _runtime.enabled("ITERCC_GEMM_AUTOTUNE")
 _route = {}
 
 

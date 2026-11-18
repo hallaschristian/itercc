@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+from . import _runtime
 
 CORE_ABI = 32
 CUDA_ABI = 2
@@ -227,7 +228,7 @@ def supported_levels():
 
 def _directories():
     """(explicit ITERCC_CORE_DIR entries, package directory, source-checkout build)."""
-    explicit = [Path(p) for p in os.environ.get("ITERCC_CORE_DIR", "").split(os.pathsep) if p]
+    explicit = [Path(p) for p in _runtime.switch("ITERCC_CORE_DIR").split(os.pathsep) if p]
     package = Path(__file__).resolve().parent
     return explicit, package, package.parent / "core" / "build"
 
@@ -251,7 +252,7 @@ def keep_freed_memory():
         if "malloc" in _state:
             return _state["malloc"]
         _state["malloc"] = False
-        if (not sys.platform.startswith("linux") or os.environ.get("ITERCC_MALLOC", "1") == "0"
+        if (not sys.platform.startswith("linux") or not _runtime.enabled("ITERCC_MALLOC")
                 or any(name in os.environ for name in _GLIBC_SETTINGS)):
             return False
         try:

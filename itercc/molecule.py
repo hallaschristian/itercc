@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from .basis import Basis, Shell, normalized_coefficients
+from . import _runtime
 
 BOHR = 0.52917721092                 # Angstrom per Bohr (PySCF's value)
 
@@ -87,7 +88,7 @@ def parse_nwchem(text):
 
 
 def _basis_directories():
-    dirs = [Path(p) for p in os.environ.get("ITERCC_BASIS_PATH", "").split(os.pathsep) if p]
+    dirs = [Path(p) for p in _runtime.switch("ITERCC_BASIS_PATH").split(os.pathsep) if p]
     dirs.append(Path(__file__).resolve().parent / "basis_sets")
     try:
         import importlib.util

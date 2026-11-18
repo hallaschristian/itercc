@@ -2,11 +2,11 @@
 dipole matrices from an RHF (or scalar-X2C RHF) calculation, and X2C SOC."""
 
 from dataclasses import dataclass
-import os
 
 import numpy as np
 
 from .hamiltonian import Hamiltonian
+from . import _runtime
 
 
 @dataclass(frozen=True)
@@ -76,7 +76,7 @@ def _mo_eri(mf, active, labels):
 
     from . import _cpu_kernels
 
-    if (mf._eri is not None and os.environ.get("ITERCC_NATIVE_TRANSFORM", "1") != "0"
+    if (mf._eri is not None and _runtime.enabled("ITERCC_NATIVE_TRANSFORM")
             and _cpu_kernels.library() is not None):
         from .integrals import mo_eri
 
@@ -107,7 +107,7 @@ def _full_eri(packed, n):
     npair = n * (n + 1) // 2
     if library is None or packed.shape != (npair, npair) or packed.dtype != np.float64:
         return ao2mo.restore(1, packed, n)
-    from ._cpu_triples import cpu_threads
+    from ._runtime import cpu_threads
 
     packed = np.ascontiguousarray(packed)
     full = np.empty((n,) * 4)

@@ -49,14 +49,16 @@ def _eri_forbidden(pairs):
     return ((i, row[:, None, None] != pairs) for i, row in enumerate(pairs))
 
 
-def has_integral_leakage(h, eri, labels, *, threads=1):
-    """Test the exact symmetry of validated integrals without copying the ERIs."""
+def has_integral_leakage(h, eri, labels, *, threads=None):
+    """Test the exact symmetry of validated integrals without copying the ERIs
+    (on `threads`, default `cpu_threads`)."""
     if not np.any(labels):
         return False
     pairs = labels[:, None] ^ labels
     if np.any(h[pairs != 0]):
         return True
     from . import _cpu_kernels
+    from ._runtime import cpu_threads
 
     library = _cpu_kernels.library()
     if library is not None and eri.flags.c_contiguous:
@@ -65,7 +67,7 @@ def has_integral_leakage(h, eri, labels, *, threads=1):
         labels64 = np.ascontiguousarray(labels, dtype=np.int64)
         address = labels64.ctypes.data
         return library.t3_leakage(eri.ctypes.data, len(labels), len(labels),
-                                  address, address, threads) != 0.0
+                                  address, address, cpu_threads(threads)) != 0.0
     return any(np.any(eri[i][mask]) for i, mask in _eri_forbidden(pairs))
 
 
@@ -93,7 +95,7 @@ def _project_eri(eri, labels, tolerance):
     library = _cpu_kernels.library()
     if library is None or eri.dtype != np.float64 or not eri.flags.c_contiguous:
         return _project(eri, _eri_forbidden(labels[:, None] ^ labels), tolerance)
-    from ._cpu_triples import cpu_threads
+    from ._runtime import cpu_threads
 
     stats = np.zeros(3)
     labels64 = np.ascontiguousarray(labels, dtype=np.int64)

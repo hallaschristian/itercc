@@ -393,3 +393,21 @@ def test_heap_scope_nests_and_restores_mapping(monkeypatch):
         with _core.heap_scope():
             raise RuntimeError
     assert calls[-2:] == [(-4, 65536), ("trim", 0)] and _core._heap["depth"] == 0
+
+
+@pytest.mark.parametrize("no", [0, 3])
+def test_spin_orbital_dressing_derivative_takes_the_compiled_pass(no, monkeypatch):
+    """The triplet actions' T1-dressing derivative (`dress_direction`) runs
+    the singlet actions' one-pass kernel on the CPU."""
+    if _cpu_kernels.library() is None:
+        pytest.skip("no compiled core")
+    from itercc._directional import dress_direction
+
+    rng = np.random.default_rng(11 + no)
+    n = 9
+    g = rng.standard_normal((n,) * 4)
+    d = rng.standard_normal((n - no, no))
+    compiled = dress_direction(g, d, no, np)
+    monkeypatch.setenv("ITERCC_CPU_KERNELS", "0")
+    reference = dress_direction(g, d, no, np)
+    np.testing.assert_allclose(compiled, reference, rtol=1e-13, atol=1e-12)

@@ -22,12 +22,12 @@ from functools import lru_cache, reduce
 from itertools import product
 from math import prod
 from operator import xor
-import os
 import threading
 
 import numpy as np
 
 from .symmetry_blocks import _parse
+from . import _runtime
 
 
 class PackedRows:
@@ -153,7 +153,7 @@ class PairBlocks:
     def permute(self, array, *, single=False, threads=None):
         """A copy of `array` (C order, last two axes virtual) with every row of
         pairs blocked; float32 with `single`."""
-        from ._cpu_triples import cpu_threads
+        from ._runtime import cpu_threads
         from . import _cpu_kernels
 
         array = np.ascontiguousarray(array, dtype=np.float64)
@@ -597,7 +597,7 @@ def _run_ordered(rounds, keys, run, teams, threads):
         return
     executor = _team_executor(teams)
     team_threads = max(1, threads // teams)
-    if os.environ.get("ITERCC_TEAM_SCHEDULE") == "rounds":
+    if _runtime.switch("ITERCC_TEAM_SCHEDULE") == "rounds":
         for round_ in rounds:
             _finish([executor.submit(run, *task, team_threads) for task in round_])
         return
@@ -639,9 +639,9 @@ def _run_ordered(rounds, keys, run, teams, threads):
 def lower_teams(threads):
     """Pairs of `t4_into_lower_ranks` run at once: ITERCC_LOWER_TEAMS, else one
     team of about 8 threads per pair (at most 7), or 1 below 16 threads."""
-    value = os.environ.get("ITERCC_LOWER_TEAMS")
+    value = _runtime.integer("ITERCC_LOWER_TEAMS")
     if value:
-        return max(1, min(int(value), threads))
+        return max(1, min(value, threads))
     return 1 if threads < 16 else min(7, threads // 8)
 
 

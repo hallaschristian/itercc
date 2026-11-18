@@ -124,3 +124,36 @@ def test_operand_irreps_and_per_call_labels_for_any_letter(cuda, route):
     blocks.einsum("mbxe,maecd->xabcd", w[2:5], t[2:5], out, 1.0, 0.0, labels=dict(m=OCC[2:5]))
     np.testing.assert_allclose(cp.asnumpy(out), cp.asnumpy(cp.einsum("mbxe,maecd->xabcd", w[2:5], t[2:5])),
                                rtol=1e-12, atol=1e-12)
+
+
+def test_fused_plans_run_without_grouped_gemm(cuda, monkeypatch):
+    """Without cuBLAS grouped GEMM (before 12.5) fused and direct plans still
+    run blocked; only a product planned as grouped GEMMs takes the fallback."""
+    cp = cuda
+    monkeypatch.setattr(symmetry_blocks, "_GROUPED", False)
+    assert symmetry_blocks.engine_available() and not symmetry_blocks.available()
+    spec = tile_specs()[0]
+    ranges = dict(i=(0, 2), j=(2, 4), k=(3, 5), l=(5, 7))
+    labels = {c: OCC[slice(*r)] for c, r in ranges.items()}
+    labels.update(m=OCC, n=OCC)
+    labels.update({c: VIR for c in "abcdef"})
+    (sa, sb), so = spec.split("->")[0].split(","), spec.split("->")[1]
+    rng = np.random.default_rng(5)
+    a, b = symmetric(cp, rng, sa, labels), symmetric(cp, rng, sb, labels)
+    for fused, grouped in ((10**9, 0), (0, 0)):
+        monkeypatch.setattr(symmetry_blocks, "_FUSED_DEPTH", fused)
+        monkeypatch.setattr(symmetry_blocks, "_DIRECT_DEPTH", 0)
+        monkeypatch.setattr(symmetry_blocks, "_FUSED_SKINNY", 10**9)
+        calls = []
+
+        def fallback(spec, a, b, out=None, alpha=1.0, beta=0.0):
+            calls.append(spec)
+            out *= beta
+            out += alpha * cp.einsum(spec, a, b)
+            return out
+
+        out = symmetric(cp, rng, so, labels)
+        expected = 0.5 * out - cp.einsum(spec, a, b)
+        symmetry_blocks.SymmetryBlocks(labels, "ijklmn", 4, fallback=fallback).einsum(spec, a, b, out, -1.0, 0.5)
+        np.testing.assert_allclose(cp.asnumpy(out), cp.asnumpy(expected), rtol=1e-12, atol=1e-12)
+        assert bool(calls) == (fused == 0)

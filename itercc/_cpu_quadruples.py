@@ -23,6 +23,7 @@ from . import _core, _cpu_kernels
 from ._tensor_scatter import expand_antisymmetric  # compatibility import
 from . import _quadruples_cpu as _numpy
 from ._cpu_symmetry_blocks import CpuSymmetryBlocks
+from ._runtime import cpu_threads
 from ._quadruples_cpu import NumpyQuadruplesLayout
 from ._quadruples_cuda import _PERMS3, _PERMS4, _SPIN, _SPLITS, _gather_terms, _slot_batch, prange
 from .symmetry_blocks import _parse
@@ -33,8 +34,6 @@ def available():
 
 
 def _threads(threads):
-    from ._cpu_triples import cpu_threads
-
     return cpu_threads(threads)
 
 
@@ -92,7 +91,7 @@ class _DenseProducts:
         self.labels = {}
         self._zeros = {}            # one label array per extent, shared
 
-    def __call__(self, spec, a, b, out, alpha, beta):
+    def __call__(self, spec, a, b, out, alpha, beta, threads=None):
         key = (spec, a.shape, b.shape, out.shape)
         labels = self.labels.get(key)
         if labels is None:
@@ -101,10 +100,20 @@ class _DenseProducts:
                 extent.update(zip(letters, array.shape))
             labels = self.labels[key] = {c: self._zeros.setdefault(n, np.zeros(n, dtype=np.int64))
                                          for c, n in extent.items()}
-        return self.engine.einsum(spec, a, b, out, alpha, beta, labels=labels)
+        return self.engine.einsum(spec, a, b, out, alpha, beta, labels=labels, threads=threads)
 
 
 _DENSE = []
+
+
+def dense_products():
+    """The package's one `_DenseProducts` (its plans shared by every caller;
+    threads from the caller or `cpu_threads`), or None without the core."""
+    if not available():
+        return None
+    if not _DENSE:
+        _DENSE.append(_DenseProducts())
+    return _DENSE[0]
 
 
 def einsum(spec, *operands, out=None, alpha=1.0, beta=0.0):
@@ -112,9 +121,7 @@ def einsum(spec, *operands, out=None, alpha=1.0, beta=0.0):
     products into a separate `out` run on the compiled executor."""
     if (out is not None and len(operands) == 2 and available()
             and not any(np.may_share_memory(out, x) for x in operands)):
-        if not _DENSE:
-            _DENSE.append(_DenseProducts())
-        return _DENSE[0](spec, *operands, out, alpha, beta)
+        return dense_products()(spec, *operands, out, alpha, beta)
     return _numpy.einsum(spec, *operands, out=out, alpha=alpha, beta=beta)
 
 
@@ -487,8 +494,6 @@ class CompiledQuadruplesLayout(NumpyQuadruplesLayout):
         dense GEMM Y[(r, x)] = sum_mn W[m, n, r, x] T4[m, n, p, q] (W is totally
         symmetric, so a class maps onto itself), and the packed rows of Y are
         added to their slots."""
-        from ._cpu_triples import cpu_threads
-
         threads = cpu_threads(None)
         nocc = self.nocc
         occ = np.asarray(self.occupied_irreps, dtype=np.int64)

@@ -6,7 +6,6 @@ from hashlib import sha256
 from itertools import combinations_with_replacement, permutations
 from math import isfinite
 from numbers import Integral
-import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,6 +16,7 @@ from .restricted import RestrictedCC
 from . import _cpu_kernels, _cpu_quadruples
 from .solver import Iteration, Result, _DIIS
 from .spatial_symmetry import orbital_labels, project_integrals
+from . import _runtime
 
 STATE_FORMAT = "itercc-rccsdtq-state-1"
 
@@ -468,8 +468,12 @@ class RestrictedCCSDTQ:
     """
 
     def __init__(self, h, eri, nocc, constant=0.0, *, block_size=None, host_r4=False,
-                 orbital_irreps=None, symmetry_tolerance=1e-9, backend="cuda", precision="double"):
+                 orbital_irreps=None, symmetry_tolerance=1e-9, backend="cuda", precision="double",
+                 cpu_threads=None):
         from . import _quadruples_equations
+
+        # Threads of every CPU kernel of a solve or evaluation (`_runtime.threaded`).
+        self.cpu_threads = _runtime.thread_option(cpu_threads)
 
         if precision not in ("double", "single"):
             raise ValueError("precision must be 'double' or 'single'")
@@ -543,7 +547,7 @@ class RestrictedCCSDTQ:
             from . import symmetry_blocks
             from ._quadruples_cuda import einsum as dense_einsum
 
-            if symmetry_blocks.available():
+            if symmetry_blocks.engine_available():
                 def engine(labels, combinations, nirrep):
                     return symmetry_blocks.SymmetryBlocks(labels, combinations, nirrep,
                                                           fallback=dense_einsum)
@@ -699,6 +703,7 @@ class RestrictedCCSDTQ:
                                         None if np.array_equal(perm, np.arange(self.nvir)) else perm)
         return (*lower, t4)
 
+    @_runtime.threaded
     def residuals(self, amplitudes):
         """Projected raw residuals: R1–R3 in caller order, R4 in `layout` form."""
         if len(amplitudes) != 4:
@@ -871,6 +876,7 @@ class RestrictedCCSDTQ:
         return (*(max(float(r.max()), -float(r.min())) for r in residuals[:3]),
                 self.layout.max_abs(residuals[3]))
 
+    @_runtime.threaded
     def solve(self, *, initial=None, max_iter=100, energy_tol=1e-11,
               residual_tol=1e-9, level_shift=0.0, damping=0.0, diis_size=6,
               diis_quadruples="auto", callback=None, checkpoint=None, resume=None,
@@ -927,8 +933,7 @@ class RestrictedCCSDTQ:
         if float(eia.max()) > 0.0 and float(eia.min()) < 0.0:
             raise ValueError("Occupied and virtual orbital denominators must have one sign")
         full_diis = diis_quadruples is True and diis_size >= 2
-        compact = (host_diis and self._compiled_cpu()
-                   and os.environ.get("ITERCC_DIIS_COMPACT", "1") != "0")
+        compact = host_diis and self._compiled_cpu() and _runtime.enabled("ITERCC_DIIS_COMPACT")
         diis = (_CompactHostDIIS(diis_size, xp, self.nocc) if compact
                 else _HostQuadruplesDIIS(diis_size, xp, self.nocc) if host_diis
                 else _FullRankDIIS(diis_size, xp) if full_diis

@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- One runtime layer for every method (`itercc/_runtime.py`, documented in
+  docs/design.md "Canonical machinery"). Threads: `RestrictedCCSDTQ`,
+  `EOMSinglet`, `DipoleResponse` and `TripletEOMCCSDTQ` take a `cpu_threads`
+  option like `RestrictedCC` (excited-state engines inherit the ground-state
+  solver's), and every solve, action and residual call runs in one thread
+  scope (`_runtime.threaded`); before, CCSDTQ, EOM and response kernels
+  re-read the environment on every call and the EOM's internal solver
+  dropped the option. Switches: every ITERCC_* variable is registered with
+  its default and when it is read; the table in docs/guide.md is generated
+  from the registry (nine switches were undocumented), and a test checks
+  that the package and the core read nothing else. `ITERCC_BARE_LADDER`
+  means the same in ground states and actions (`0` off, `1` on);
+  `ITERCC_CPU_TANGENT` is read once per engine, so the ground-residual
+  audit and the actions take one path. The `_scan_pool` and the
+  ERI-leakage check follow the thread count.
+- Machinery gaps closed: the triplet actions' T1-dressing derivative runs
+  the singlet actions' one-pass kernel (`itercc_dress_derivative`) instead
+  of four NumPy tensordots; two-operand products into new arrays in
+  `bounded_einsum` (triplet coefficient tables, tiles without a symmetry
+  engine) run on the core's GEMM executor; the package has one dense
+  product engine (`_cpu_quadruples.dense_products`) instead of one per
+  thread count plus a CCSDTQ copy; CCSDTQ forms the spin-summed T3 once for
+  its T1-T3 equations and T3 intermediates instead of four times; on CUDA,
+  fused and direct symmetry-block plans run without cuBLAS 12.5 (only
+  grouped-GEMM plans then take the dense fallback) instead of the whole
+  engine falling back.
+- `restricted.cuda_options()` is the production CUDA CCSDT configuration
+  (every fused path; `labelled=False` without orbital labels), used by the
+  guide, llms.txt and benchmarks/ccsdt_backends.py instead of hand-written
+  flag sets (the guide's set lacked the column paths).
+- Measured on water (12 threads, same desktop, before -> after): CCSDTQ
+  aug-cc-pVDZ 2.07 -> 1.75 s per iteration, EOM-CCSDT aug-cc-pVDZ 6.45 ->
+  5.76 s, CCSD response cc-pVTZ 4.00 -> 3.42 s, CCSDT response cc-pVDZ 5.28
+  -> 4.81 s, CCSD aug-cc-pVTZ and CCSDT cc-pVTZ iterations 3-6% faster; a
+  triplet EOM-CCSDTQ action (cc-pVDZ) 3.10 -> 2.98 s. Energies agree to
+  1e-13 with the same iteration counts.
+
 - Triplet slot program, propagated: progress callbacks (`slot_finished`, as
   the CuF drivers print them) arrive after each wave of slots again instead
   of once at the end (`itercc_triplet_slots` takes a progress function, core

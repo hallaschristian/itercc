@@ -29,6 +29,7 @@ import functools
 import numpy as np
 
 from . import _core, _cpu_kernels
+from . import _runtime
 
 
 @functools.lru_cache(maxsize=None)
@@ -50,13 +51,11 @@ def team_size(threads, live_bytes, budget_bytes=None):
     teams only bound the tiles' memory: as many slots run at once as fit
     `budget_bytes` (default: an eighth of the host memory; ITERCC_TILE_MEMORY
     in bytes). ITERCC_TILE_TEAM fixes the team size."""
-    import os
-
-    override = os.environ.get("ITERCC_TILE_TEAM")
+    override = _runtime.integer("ITERCC_TILE_TEAM")
     if override:
-        return max(1, min(threads, int(override)))
+        return max(1, min(threads, override))
     if budget_bytes is None:
-        budget_bytes = int(os.environ.get("ITERCC_TILE_MEMORY", 0))
+        budget_bytes = _runtime.integer("ITERCC_TILE_MEMORY") or 0
         if not budget_bytes:
             available = memory_bytes()
             # When unknown, run only one slot at a time to bound memory.
@@ -95,16 +94,12 @@ def blocked_t3_enabled():
     """Pair-blocked T3 for the tile programs, unless ITERCC_TILE_BLOCKED_T3=0
     (Sapphire Rapids, 13o/47v C2v: tile programs 41.3 -> 37.2 s, the
     evaluation -4.4%; residuals within 1e-12 of the dense pair order)."""
-    import os
-
-    return os.environ.get("ITERCC_TILE_BLOCKED_T3", "1") != "0"
+    return _runtime.enabled("ITERCC_TILE_BLOCKED_T3")
 
 
 def fusion_enabled():
     """Fused tile programs unless ITERCC_TILE_FUSED=0 (then one pass per term)."""
-    import os
-
-    return os.environ.get("ITERCC_TILE_FUSED", "1") != "0"
+    return _runtime.enabled("ITERCC_TILE_FUSED")
 
 
 class TileProgram:
@@ -188,7 +183,7 @@ class TileProgram:
             except Unsupported:
                 fused = False
             recorded.fused[swapped] = fused
-        from ._cpu_triples import cpu_threads
+        from ._runtime import cpu_threads
 
         if not (r4.flags.c_contiguous and r4.dtype == np.float64):
             raise ValueError("The packed residual must be a C-contiguous float64 array")

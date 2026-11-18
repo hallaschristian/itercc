@@ -20,16 +20,16 @@ is `SLAB_BYTES` (environment variable ITERCC_SLAB_MIB, default 256 MiB)
 unless passed per call. Accumulation uses one fused kernel with FMA
 contraction disabled, the same arithmetic as `previous + coefficient*product`.
 """
-import os
 from functools import lru_cache
 from math import ceil
 
 import numpy as np
 
 from .gemm_contract import einsum_into as gemm_into
+from . import _runtime
 
-SLAB_BYTES = int(float(os.environ.get("ITERCC_SLAB_MIB", "256")) * 2**20)
-CUDA_GEMM = os.environ.get("ITERCC_BOUNDED_GEMM", "0") == "1"
+SLAB_BYTES = int(float(_runtime.switch("ITERCC_SLAB_MIB")) * 2**20)
+CUDA_GEMM = _runtime.enabled("ITERCC_BOUNDED_GEMM")
 
 
 def split(spec):
@@ -104,6 +104,18 @@ def einsum(xp, spec, *operands, optimize=True, budget=None):
     shape = [extents[c] for c in output]
     chosen = plan(spec, operands, shape, output_index=False, budget=budget,
                   itemsize=np.result_type(*operands).itemsize)
+    if xp is np and len(operands) == 2 and optimize is True:
+        # The CPU core's GEMM executor, as for products into a target.
+        from ._cpu_triples import product_into
+
+        result = np.empty(shape)
+        slabs = [None] if chosen is None else pieces(chosen[1], chosen[2])
+        for n, piece in enumerate(slabs):
+            parts = operands if piece is None else (take(s, a, chosen[0], piece) for s, a in zip(subscripts, operands))
+            if not product_into(spec, *parts, result, 1.0, 0.0 if n == 0 else 1.0):
+                break           # not applicable (dtype, no core): the same for every slab
+        else:
+            return result
     if chosen is None:
         return xp.einsum(spec, *operands, optimize=optimize)
     char, extent, count = chosen

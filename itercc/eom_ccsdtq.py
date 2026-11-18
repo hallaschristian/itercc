@@ -13,7 +13,7 @@ from time import perf_counter
 
 import numpy as np
 
-from . import _cpu_quadruples
+from . import _cpu_quadruples, _runtime
 
 from itercc.eom import EOMSinglet
 
@@ -131,6 +131,7 @@ class FiniteDifferenceEOM:
         self.xp = xp = solver.xp
         self.method = "ccsdtq"
         self.solver = solver
+        self.cpu_threads = getattr(solver, "cpu_threads", None)
         self.proxy = solver._reference
         self.amplitudes = solver._as_amplitudes(amplitudes)
         self.space = QuadruplesSector(solver, labels, irrep)
@@ -167,6 +168,7 @@ class FiniteDifferenceEOM:
         xp = self.xp
         return float(np.sqrt(sum(float(xp.dot(a.reshape(-1), a.reshape(-1))) for a in plus)))
 
+    @_runtime.threaded
     def sigma(self, vector):
         xp = self.xp
         start = perf_counter()
@@ -183,6 +185,7 @@ class FiniteDifferenceEOM:
         self.matvec_seconds += perf_counter()-start
         return result
 
+    @_runtime.threaded
     def full_residual_norm(self, vector, omega):
         xp = self.xp
         if xp.iscomplexobj(vector) and float(xp.max(xp.abs(vector.imag))) > 1e-10:
@@ -199,6 +202,7 @@ class FiniteDifferenceEOM:
             guess[int(j)] = 1
             yield guess
 
+    @_runtime.threaded
     def solve_one(self, **options):
         guesses = self.singles_guesses()
         # Reuse the response-optimized EOM driver's restarted Davidson loop.

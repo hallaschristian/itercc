@@ -12,8 +12,47 @@ How IterCC gets its speed and how it keeps results exact. For usage see the
 | CCSDTQ | `quadruples.py`, `_quadruples_*.py`, `_cpu_quadruples.py`, `_cpu_tile_program.py`, `symmetry_blocks.py` | Packed T4, tile equations, compiled tile programs, host/device DIIS, checkpoints |
 | EOM and response | `eom.py`, `response.py`, `_directional.py`, `_cpu_tangent.py`, `krylov.py` | Exact Jacobian actions, Davidson, shifted GMRES, CC Lagrangian response |
 | Compiled core | `core/` (C++17/OpenMP, CUDA), `_core.py`, `_cpu_kernels.py` | GEMM executor, element-wise kernels, CUDA kernels, behind a versioned C ABI |
+| Runtime | `_runtime.py` | Threads, host memory and the registry of ITERCC_* switches, shared by every method |
 | GPU | `_cuda_*.py`, `gemm_contract.py` | CuPy/cuBLAS contractions, fused layout kernels, autotuned GEMM routes |
 | References | `solver.py` (`TensorCC`), `tests/oracle` | Independent spin-orbital and determinant-space implementations for tests |
+
+## Canonical machinery
+
+Each concern has one implementation, and every method uses it:
+
+| Concern | The one way | Where |
+| --- | --- | --- |
+| Threads | Every solver and engine takes `cpu_threads` (engines inherit their ground-state solver's) and runs its public calls in `thread_scope(cpu_threads)`; kernels below call `cpu_threads(None)` | `_runtime.threaded`, `cpu_threads`, `thread_scope` |
+| Switches | Each ITERCC_* variable is registered once with its default and when it is read; the guide's table is generated from the registry | `_runtime.SWITCHES`, `switch`, `enabled`, `integer` |
+| Host memory | Physical, cgroup, Slurm and NUMA limits; budgets in bytes, options in `_gib` | `_runtime.host_memory_limit`, `resident_bytes` |
+| Compiled core | Loaded once and checked against the ABI; None without it, and every caller has the NumPy path | `_cpu_kernels.library()`, `_core.cuda()` |
+| CPU products | The core's GEMM executor (`itercc_sym_contract`): symmetry-blocked with orbital labels (`CpuSymmetryBlocks`), else the one dense engine (`dense_products`, behind `product_into`, `CompiledContract` and `bounded_einsum`) | `_cpu_symmetry_blocks.py`, `_cpu_quadruples.py`, `_cpu_triples.py` |
+| CUDA products | Symmetry blocks (fused, direct or grouped-GEMM plans) and autotuned GEMM routes | `symmetry_blocks.py`, `gemm_contract.py` |
+| Long vectors | Scale, add, dots and combinations on all threads (never NumPy BLAS between kernels) | `_cpu_quadruples` array operations |
+| T1 dressing | One pass over g for the dressing and for its derivative, in every method | `itercc_dress_integrals*`, `itercc_dress_derivative` |
+| Amplitudes | Packed, symmetry-blocked storage per rank | `TriplesLayout`/`BlockedTriples`, `QuadruplesLayout`, `PackedSpinQuadruples` |
+| Jacobians | Product-rule tangents of the residual code; the ground-state parts are formed once per engine | `Directional`, `_cpu_tangent.py` |
+| Repeated products | Recorded once per symmetry pattern, replayed by C++ for every occupied slot | `TileProgram` (CCSDTQ), `SlotProgram` (triplet) |
+| Iterative solvers | Davidson with thick restarts and certification; shifted GMRES with recycled solutions | `krylov.davidson` (all EOM engines, through `EOMSinglet.solve`), `krylov.gmres` |
+
+Deliberate exceptions, measured on water cc-pVDZ (12 threads):
+
+- **CCSDTQ's T1-T3 equations** run on full T3 with the PySCF-derived
+  intermediates that its T4 equations share, not on the blocked CCSDT
+  engine: 2% of an evaluation (0.045 of 2.1 s for four), while the T4
+  passes take the rest on the tile programs.
+- **Response right-hand sides** (`DipoleResponse._operator_residual`) loop
+  over occupied pairs in Python: 0.07 of 4.2 s for a CCSDT polarizability.
+- **Triplet ranks 1-3** run the Python-driven tile loop (`contract_tile` on
+  the symmetry engine); only rank four, nearly all of a large action, is the
+  compiled slot program: 0.63 of 2.98 s per action here, a few percent on
+  CuF (13 occupied, 47 virtual).
+- **Finite-difference EOM-CCSDTQ** (`eom_ccsdtq.py`) differentiates the
+  CCSDTQ residual numerically on dense T4: a reference for small systems.
+- **CUDA CCSDT** keeps its dense-slot T3 layout (`CudaTriplesLayout`), and
+  its fused kernels stay options because their support masks are
+  ground-state specific; `restricted.cuda_options()` is the one production
+  set (every fused path) for ground-state solves.
 
 ## Where the speed comes from
 

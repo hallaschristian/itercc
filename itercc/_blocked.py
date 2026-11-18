@@ -107,7 +107,7 @@ class BlockedTriples:
 
     @staticmethod
     def _threads(threads):
-        from ._cpu_triples import cpu_threads
+        from ._runtime import cpu_threads
 
         return cpu_threads(threads)
 

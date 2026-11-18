@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import _cpu_kernels
-from ._cpu_triples import cpu_threads
+from ._runtime import cpu_threads
 
 
 def jk(eri_s8, dm, threads=None):

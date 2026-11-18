@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import _restricted_equations as eq
+from . import _restricted_equations as eq, _runtime
 from .checkpoint_io import read_array_directory, to_device, write_array_directory
 from .eom import EOMSinglet, SingletSpace
 from .hamiltonian import _real64
@@ -121,7 +121,7 @@ class DipoleResponse:
 
     def __init__(self, solver, amplitudes, dipoles, *, orbital_irreps=None,
                  dipole_irreps=None, backend="cpu", method="ccsdt", recycle_gib=None,
-                 symmetry_tolerance=2e-9, host_krylov=False, checkpoint=None):
+                 symmetry_tolerance=2e-9, host_krylov=False, checkpoint=None, cpu_threads=None):
         raw = _real64(dipoles)
         nmo = len(solver.h)
         if (raw.shape != (3, nmo, nmo)
@@ -138,7 +138,8 @@ class DipoleResponse:
         # leakage allows (see EOMSinglet); the energy terms use the same one.
         self.engine = EOMSinglet(solver, amplitudes, orbital_irreps=orbital_irreps,
                                  backend=backend, method=method,
-                                 symmetry_tolerance=symmetry_tolerance)
+                                 symmetry_tolerance=symmetry_tolerance, cpu_threads=cpu_threads)
+        self.cpu_threads = self.engine.cpu_threads
         acting = self.engine._primal
         self.xp, self.sectors = self.engine.xp, sectors
         self.krylov_xp = np if host_krylov else self.xp
@@ -183,7 +184,7 @@ class DipoleResponse:
         if recycle_gib is None:
             recycle_gib = 0.0
             if self.krylov_xp is np:
-                from ._cpu_triples import host_memory_limit, resident_bytes
+                from ._runtime import host_memory_limit, resident_bytes
 
                 limit = host_memory_limit()
                 if limit is not None:
@@ -410,6 +411,7 @@ class DipoleResponse:
         correction = self._solve(0, 0., combined, *controls, reports, ("property", i, j))
         return complex(self._energy_gradient(correction) - direct)
 
+    @_runtime.threaded
     def polarizability(self, wavelength_nm, *, damping_Eh=0., tol=1e-8, restart=16, maxiter=160,
                        callback=None, reuse_guesses=True, deflation=None):
         """Return the Cartesian electronic tensor in au. Use +inf for static.

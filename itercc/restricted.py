@@ -4,13 +4,13 @@ from contextlib import nullcontext
 import ctypes
 from functools import partial
 from numbers import Integral
-import os
 import warnings
 
 import numpy as np
 
 from . import _blocked_residual as _blocked
 from . import _core
+from . import _cpu_kernels, _runtime
 from . import _cpu_triples as _cpu
 from . import _restricted_equations as eq
 from ._pair_symmetry import PairSectors, pair_product
@@ -28,10 +28,10 @@ def _all_finite(x, threads=None):
     """np.isfinite(x).all() in one compiled pass on all threads for a C-ordered
     float64 array (NumPy scans n^4 integrals on one thread with an n^4 boolean
     temporary: 0.6 s of setup for water aug-cc-pVQZ)."""
-    library = _cpu._kernels.library()
+    library = _cpu_kernels.library()
     if (library is not None and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.flags.c_contiguous
             and x.size):
-        return bool(np.isfinite(library.max_abs(x.ctypes.data, x.size, _cpu.cpu_threads(threads))))
+        return bool(np.isfinite(library.max_abs(x.ctypes.data, x.size, _runtime.cpu_threads(threads))))
     return bool(np.isfinite(x).all())
 
 
@@ -180,7 +180,7 @@ class _BlockDIIS(_DIIS):
         for rank, a in enumerate(error):
             others = [e[rank] for e in errors]
             if self._compiled_dots(a, *others):
-                with _cpu.thread_scope(self.threads):
+                with _runtime.thread_scope(self.threads):
                     total += _cpu_quadruples.dots(a.reshape(-1), [b.reshape(-1) for b in others])
             else:
                 flat = a.ravel()
@@ -192,7 +192,7 @@ class _BlockDIIS(_DIIS):
             return a + b
         from . import _cpu_quadruples
 
-        with _cpu.thread_scope(self.threads):
+        with _runtime.thread_scope(self.threads):
             return _cpu_quadruples.permuted_add(np.empty_like(a), a, b, 1.0, 1.0)
 
     def take_step(self, amplitudes, steps):
@@ -210,7 +210,7 @@ class _BlockDIIS(_DIIS):
             if self._threaded(*stored):
                 from . import _cpu_quadruples
 
-                with _cpu.thread_scope(self.threads):
+                with _runtime.thread_scope(self.threads):
                     output = _cpu_quadruples.combine(weights, [a.reshape(-1) for a in stored],
                                                      np.empty(amplitude.size))
                 result.append(output.reshape(amplitude.shape))
@@ -256,6 +256,22 @@ class _SymmetricBlockDIIS(_BlockDIIS):
         compact = (amplitudes[0] + steps[0], amplitudes[1] + steps[1], packed)
         mixed = self.update(compact, (*steps[:2], packed_steps))
         return (*mixed[:2], self.columns.unpack(mixed[-1]))
+
+
+def cuda_options(*, labelled=True):
+    """The production options of the CUDA CCSDT solver, every fused CUDA path
+    on: `RestrictedCC(h, eri, nocc, constant, orbital_irreps=labels,
+    **cuda_options())`. The column paths need orbital labels; without them
+    pass `labelled=False`. They stay options because their support masks are
+    ground-state specific (EOM and response build their own CUDA proxies)."""
+    options = dict(residual_backend="cuda", cuda_pair_fusion=True, cuda_layout_fusion=True,
+                   cuda_crossed_fusion=True, cuda_pool_cache=True, ladder_batch=4)
+    if labelled:
+        options.update(ladder_batch=16, cuda_ph_columns=True, cuda_ladder_columns=True,
+                       cuda_occupied_columns=True, cuda_t1_dressing=True, cuda_jacobi=True,
+                       cuda_feedback_columns=True, cuda_assembly_columns=True, cuda_ph_fusion=True,
+                       host_diis_columns=True)
+    return options
 
 
 class RestrictedCC:
@@ -443,10 +459,8 @@ class RestrictedCC:
         self._ladder = partial(ladder, **options)
         # CPU residuals run on the compiled kernels (_cpu_triples):
         # `cpu_threads` (else ITERCC_CPU_THREADS, else one per core) is the thread
-        # count of every kernel of an evaluation (`_cpu.thread_scope`).
-        if cpu_threads is not None and (not isinstance(cpu_threads, Integral) or cpu_threads < 1):
-            raise ValueError("cpu_threads must be a positive integer")
-        self._cpu_threads = cpu_threads
+        # count of every kernel of a solve or evaluation (`_runtime.threaded`).
+        self.cpu_threads = self._cpu_threads = _runtime.thread_option(cpu_threads)
         # A CUDA ladder (ladder_backend="cuda") needs the generic assembly.
         self._cpu_fast = pair_ladder and ladder_xp is np
         self._virtual_irreps = options.get("virtual_irreps")
@@ -457,9 +471,9 @@ class RestrictedCC:
         self._integrals_symmetric = self._ladder_structure = self._bare_ladder = None
         self._ladder_bare = None                # sector blocks of the bare g(vvvv), `_ladder_g`
         self._dressing_buffer, self._hold_dressing = None, False
-        self._cpu_blocked = os.environ.get("ITERCC_BLOCKED", "1") != "0"
+        self._cpu_blocked = _runtime.enabled("ITERCC_BLOCKED")
         self._contract = partial(eq.contract, xp=self._xp)
-        if self._xp is np and _cpu._kernels.library() is not None:
+        if self._xp is np and _cpu_kernels.library() is not None:
             # CCSD and CCSDT products on the GEMM executor of the CPU CCSDTQ solver.
             self._contract = _cpu.CompiledContract(cpu_threads)
         self.device_pool_reserved_bytes = 0
@@ -611,7 +625,7 @@ class RestrictedCC:
         return residual
 
     def _evaluate(self, amplitudes, have_t3, *, triples=None, tangent_feedback=None):
-        with _cpu.thread_scope(self._cpu_threads):
+        with _runtime.thread_scope(self._cpu_threads):
             return self._evaluate_scoped(amplitudes, have_t3, triples=triples,
                                          tangent_feedback=tangent_feedback)
 
@@ -630,7 +644,7 @@ class RestrictedCC:
             ladder = lambda _, t2: bare(t1, t2)                  # noqa: E731
         else:
             if threaded and len(t3):
-                blocked = self._blocked_t3(t1, t2, t3, _cpu.cpu_threads(self._cpu_threads))
+                blocked = self._blocked_t3(t1, t2, t3, _runtime.cpu_threads(self._cpu_threads))
             # CCSDT on blocked T3 reads g~(vvvv) only through the ladder sectors,
             # formed from the bare ones and T1: the dressing leaves it out.
             open_ = blocked is not None and self._open_dressing(t1)
@@ -645,7 +659,7 @@ class RestrictedCC:
         if not len(t3):
             return r1, r2 + r2.transpose(1, 0, 3, 2), xp.zeros(self.layout.shape)
         vooo, vvvo = eq.triples_sources(f, g, t2, c2, o, v, contract)
-        with (_cpu.ThreadPool(_cpu.cpu_threads(self._cpu_threads)) if threaded
+        with (_cpu.ThreadPool(_runtime.cpu_threads(self._cpu_threads)) if threaded
               else nullcontext()) as pool:
             if have_t3:
                 if blocked is not None:
@@ -725,7 +739,7 @@ class RestrictedCC:
 
             self._integrals_symmetric = bool(self.symmetry_projected or not has_integral_leakage(
                 self.h, self.g.transpose(0, 2, 1, 3), self._labels,
-                threads=_cpu.cpu_threads(threads if threads is not None else self._cpu_threads)))
+                threads=_runtime.cpu_threads(threads if threads is not None else self._cpu_threads)))
         return self._integrals_symmetric
 
     def _dressing_output(self):
@@ -751,8 +765,8 @@ class RestrictedCC:
                 or not self._cpu_fast or self._t1_dressing is not None or "_dressed" in vars(self)
                 or type(self)._dressed is not RestrictedCC._dressed
                 or t1.dtype != np.float64 or t2.dtype != np.float64
-                or not hasattr(_cpu._kernels.library(), "dress_integrals_ccsd")
-                or self.g.dtype != np.float64 or os.environ.get("ITERCC_BARE_LADDER", "1") == "0"):
+                or _cpu_kernels.library() is None
+                or self.g.dtype != np.float64 or _runtime.switch("ITERCC_BARE_LADDER") == "0"):
             return None
         if self._bare_ladder is None:
             structure = None
@@ -796,7 +810,7 @@ class RestrictedCC:
         """The LadderSectors of `_ladder_g` when the sector blocks are all of the
         dressed g(vvvv) for this T1, else None."""
         if (self._labels is None or not self._cpu_blocked or self._virtual_irreps is None
-                or _cpu._kernels.library() is None):
+                or _cpu_kernels.library() is None):
             return None
         no = self.layout.no
         occupied, virtual = self._labels[:no], self._labels[no:]
@@ -816,9 +830,9 @@ class RestrictedCC:
         moved about 34 GB per iteration, now about 9. ITERCC_OPEN_DRESSING=0
         turns it off."""
         g = self.g
-        if (os.environ.get("ITERCC_OPEN_DRESSING", "1") == "0" or self._t1_dressing is not None
+        if (not _runtime.enabled("ITERCC_OPEN_DRESSING") or self._t1_dressing is not None
                 or "_dressed" in vars(self) or type(self)._dressed is not RestrictedCC._dressed
-                or not hasattr(_cpu._kernels.library(), "ladder_sectors_t1")
+                or _cpu_kernels.library() is None
                 or not isinstance(g, np.ndarray) or g.dtype != np.float64 or any(x % 8 for x in g.strides)):
             return False
         return self._sector_structure(t1) is not None
@@ -834,7 +848,7 @@ class RestrictedCC:
         """
         if self._labels is None or not self._cpu_blocked or not len(t3):
             return None
-        if _cpu._kernels.library() is None:
+        if _cpu_kernels.library() is None:
             return None
         if self._blocked_plan is None:
             from ._blocked import BlockedTriples
@@ -880,9 +894,9 @@ class RestrictedCC:
         initial amplitudes (a saved raw-Hamiltonian state, say) have nonzero
         symmetry-forbidden entries: every evaluation would then run dense."""
         if (self._labels is None or self._xp is not np or not self._cpu_fast
-                or not len(amplitudes[2]) or _cpu._kernels.library() is None):
+                or not len(amplitudes[2]) or _cpu_kernels.library() is None):
             return
-        threads = _cpu.cpu_threads(self._cpu_threads)
+        threads = _runtime.cpu_threads(self._cpu_threads)
         if self._blocked_t3(*amplitudes, threads) is None and self._cpu_blocked:
             warnings.warn("The initial amplitudes have nonzero symmetry-forbidden entries, so "
                           "the solve runs on the dense CPU path (symmetry_tolerance > 0 "
@@ -892,14 +906,15 @@ class RestrictedCC:
         """(library, threads) of the CPU kernels for the host passes of a solve
         (residual maxima, Jacobi step, DIIS), or None without the core. GPU
         residuals arrive as host arrays, so their solves use them too."""
-        library = _cpu._kernels.library()
-        return None if library is None else (library, _cpu.cpu_threads(self._cpu_threads))
+        library = _cpu_kernels.library()
+        return None if library is None else (library, _runtime.cpu_threads(self._cpu_threads))
 
     def release_device_memory(self):
         """Release cached free device allocations after a batch of evaluations."""
         if self._xp is not np:
             self._pool.free_all_blocks()
 
+    @_runtime.threaded
     def residuals(self, amplitudes):
         """Unpreconditioned spatial residuals in the amplitude layout."""
         return self._residuals(self._validated(amplitudes))
@@ -916,6 +931,7 @@ class RestrictedCC:
         t1, t2, _ = self._validated(amplitudes)
         return self._energy(t1, t2)
 
+    @_runtime.threaded
     def solve(self, *, initial=None, energy_tol=1e-11, residual_tol=1e-9,
               max_iter=100, diis_size=6, diis_triples=False, level_shift=0.0,
               damping=0.0, callback=None, checkpoint_callback=None):

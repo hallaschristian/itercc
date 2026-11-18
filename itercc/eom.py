@@ -6,7 +6,6 @@ never be used on excitation vectors. Triplet/SF sectors are explicitly absent.
 from copy import copy
 from dataclasses import dataclass
 from functools import cache, partial
-import os
 import sys
 from time import perf_counter
 from types import SimpleNamespace
@@ -20,6 +19,7 @@ from ._directional import Directional, DirectionalBackend, DirectionalCudaLayout
 from ._triples_layout import TriplesLayout
 from .restricted import RestrictedCC, _pair_ladder, _fock
 from ._tensor_scatter import unpack_sector
+from . import _runtime
 
 _BARE_MIN_VIRTUALS = 30     # `EOMSinglet._bare_ladder`: the dense ladder is faster below
 
@@ -179,7 +179,7 @@ def _cpu_dressing_kernel():
     from . import _cpu_kernels
 
     library = _cpu_kernels.library()
-    return library if library is not None and hasattr(library, "dress_axis_from") else None
+    return library
 
 
 class EOMSinglet:
@@ -201,9 +201,13 @@ class EOMSinglet:
                  cache_dressing=None, fused_cuda_layout=True, tangent_triples=True,
                  triples_batch=None, projected_ladder=True, projected_particle_hole=True,
                  compiled_seed=True, fused_seed_fold=None, projected_occupied=None, stream_particle_hole=True, tangent_feedback=None,
-                 packed_triples=True):
+                 packed_triples=True, cpu_threads=None):
         if method not in ("ccsd", "ccsdt") or backend not in ("cpu", "cuda"):
             raise ValueError("Choose CCSD/CCSDT and CPU/CUDA")
+        # Kernel threads of every action and solve: the option, else the
+        # ground-state solver's.
+        self.cpu_threads = _runtime.thread_option(
+            cpu_threads if cpu_threads is not None else getattr(solver, "cpu_threads", None))
         if not np.isfinite(ground_residual_tol) or ground_residual_tol <= 0:
             raise ValueError("Expected a positive ground-state residual tolerance")
         triples = method == "ccsdt"
@@ -213,6 +217,8 @@ class EOMSinglet:
             import cupy as xp
         self.xp, self.method = xp, method
         self.tangent_triples = tangent_triples
+        # Read once: the ground-residual audit and every action take one path.
+        self._cpu_tangent = _runtime.enabled("ITERCC_CPU_TANGENT")
         self.compiled_seed = compiled_seed
         self.fused_seed_fold = fused_seed_fold
         # Whole-plane row grouping helps once the dense plane is large.
@@ -256,7 +262,8 @@ class EOMSinglet:
         # masks cannot silently discard Pi/Delta or other response sectors.
         primal = RestrictedCC(h, eri, solver.layout.no,
                              solver.reference_energy - float(np.trace(
-                                 (solver.h + solver.fock)[solver.o, solver.o])))
+                                 (solver.h + solver.fock)[solver.o, solver.o])),
+                             cpu_threads=self.cpu_threads)
         self.space = SingletSpace(primal, orbital_irreps, irrep, xp=xp, triples=method == "ccsdt")
         self.diagonal = self.space.orbital_diagonal(primal.fock)
         self._primal = primal
@@ -313,7 +320,7 @@ class EOMSinglet:
         from ._directional import DirectionalCudaLayout
 
         if (self.xp is np and self.method == "ccsdt" and type(self.proxy.layout) is TriplesLayout
-                and os.environ.get("ITERCC_CPU_TANGENT", "1") != "0"):
+                and self._cpu_tangent):
             # CPU: the plain (compiled) residual of the original Hamiltonian.
             return self._primal.residuals(self.amplitudes)
         if not isinstance(self.proxy.layout, DirectionalCudaLayout):
@@ -352,7 +359,7 @@ class EOMSinglet:
             if (library is not None and tensor.ndim == 4 and tensor.dtype == np.float64
                     and tensor.flags.c_contiguous and response.dtype == np.float64):
                 # On all threads, each output row formed once (no tensordot copies).
-                from ._cpu_triples import cpu_threads
+                from ._runtime import cpu_threads
 
                 n, no = tensor.shape[0], response.shape[0]
                 nv = n - no
@@ -459,11 +466,12 @@ class EOMSinglet:
         `_BARE_MIN_VIRTUALS` virtual orbitals (water CCSD polarizabilities, 12
         cores: 25 virtuals 1.1 instead of 1.0 s, 36 virtuals 1.9 instead of
         3.7 s) or with ITERCC_BARE_LADDER=0 (=1 forces it)."""
+        from . import _cpu_kernels
         from . import _cpu_triples as _cpu
 
         g = self.proxy.g
-        choice = os.environ.get("ITERCC_BARE_LADDER", "")
-        if (self.xp is not np or _cpu._kernels.library() is None or not isinstance(g, np.ndarray)
+        choice = _runtime.switch("ITERCC_BARE_LADDER")
+        if (self.xp is not np or _cpu_kernels.library() is None or not isinstance(g, np.ndarray)
                 or g.dtype != np.float64 or choice == "0"):
             return None
         no = self.proxy.layout.no
@@ -497,6 +505,7 @@ class EOMSinglet:
 
         return ladder
 
+    @_runtime.threaded
     def sigma(self, vector):
         if self.xp.iscomplexobj(vector):
             value = self.sigma(vector.real)
@@ -546,8 +555,7 @@ class EOMSinglet:
     def _tangent(self, amplitudes, direction, *, irrep=None):
         dual = tuple(Directional(t, r) for t, r in zip(amplitudes, direction))
         if (self.tangent_triples and self.method == "ccsdt" and len(dual[2]) and self.xp is np
-                and type(self.proxy.layout) is TriplesLayout
-                and os.environ.get("ITERCC_CPU_TANGENT", "1") != "0"):
+                and type(self.proxy.layout) is TriplesLayout and self._cpu_tangent):
             # CPU: product-rule actions with the compiled triples and feedback.
             from . import _cpu_tangent
 
@@ -588,6 +596,7 @@ class EOMSinglet:
         return tuple(self.xp.zeros_like(value.value) if value.tangent is None
                      else value.tangent for value in values)
 
+    @_runtime.threaded
     def full_residual_norm(self, vector, energy):
         """Residual norm of the engine's full operator, including components
         outside the target irrep, so leakage is not hidden by packing. With
@@ -613,6 +622,7 @@ class EOMSinglet:
             raise FloatingPointError("Nonfinite full EOM residual audit")
         return float(np.sqrt(squared))
 
+    @_runtime.threaded
     def solve(self, nroots=3, *, residual_tol=1e-8, max_iter=100,
               max_space=20, guesses=None, callback=None, memory_budget_gib=None,
               checkpoint_callback=None, thick_restart=True, olsen=False):
@@ -667,6 +677,7 @@ class HostDavidson:
 
     def __init__(self, engine, *, project=None, audit=None):
         self.engine = engine
+        self.cpu_threads = getattr(engine, "cpu_threads", None)
         self.proxy, self.method = engine.proxy, engine.method
         self.ground_energy = engine.ground_energy
         self.diagonal = engine.diagonal.get()

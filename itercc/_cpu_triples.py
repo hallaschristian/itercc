@@ -22,10 +22,7 @@ output in a fixed order, so the result does not depend on the thread count.
 """
 
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import contextmanager
-from functools import lru_cache, partial
-import os
-from pathlib import Path
+from functools import partial
 import threading
 
 import numpy as np
@@ -37,183 +34,10 @@ _ORIENTATIONS = ((0, 1, 2), (0, 2, 1), (1, 2, 0))
 _SLOT_BATCH = 8         # slots per ladder or purification operation
 
 
-def _cpu_set():
-    try:
-        return set(os.sched_getaffinity(0))
-    except AttributeError:
-        return set(range(os.cpu_count() or 1))
-
-
-def _process_cpus():
-    return len(_cpu_set())
-
-
-# The CPUs of the process, read at import (with OMP_PROC_BIND set, the OpenMP
-# runtime later binds the calling thread to a single core, and an affinity
-# read then would see one CPU).
-_PROCESS_CPU_SET = _cpu_set()
-_PROCESS_CPUS = len(_PROCESS_CPU_SET)
-
-
-def _available_cpus():
-    return max(_process_cpus(), _PROCESS_CPUS)
-
-
-def _id_list(text):
-    """The integers of a Linux list such as "0-3,8,10-11"."""
-    values = set()
-    for part in text.strip().split(","):
-        if part:
-            first, _, last = part.partition("-")
-            values.update(range(int(first), int(last or first) + 1))
-    return values
-
-
-@lru_cache(maxsize=8)
-def _cores(cpus):
-    """Physical cores among the CPUs `cpus` (SMT siblings count once), or
-    len(cpus) where the topology is not exposed."""
-    cores = set()
-    for cpu in cpus:
-        try:
-            siblings = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text()
-            cores.add(min(_id_list(siblings)))
-        except (OSError, ValueError):
-            return len(cpus)
-    return max(1, len(cores))
-
-
-_PROCESS_CORES = _cores(frozenset(_PROCESS_CPU_SET))
-
-
-def _available_cores():
-    # Fewer CPUs than at import: bound to one by the OpenMP runtime.
-    current = _cpu_set()
-    return _PROCESS_CORES if len(current) <= _PROCESS_CPUS else _cores(frozenset(current))
-
-
-def _cgroup_memory_limit():
-    """The smallest memory limit of this process's cgroup and its ancestors
-    (cgroup v2 memory.max or v1 memory.limit_in_bytes), or None."""
-    try:
-        lines = Path("/proc/self/cgroup").read_text().splitlines()
-    except OSError:
-        return None
-    limits = []
-    for line in lines:
-        parts = line.split(":", 2)
-        if len(parts) != 3:
-            continue
-        if parts[1] == "":
-            base, name = Path("/sys/fs/cgroup"), "memory.max"
-        elif "memory" in parts[1].split(","):
-            base, name = Path("/sys/fs/cgroup/memory"), "memory.limit_in_bytes"
-        else:
-            continue
-        group = Path(parts[2])
-        while True:
-            try:
-                text = (base / group.relative_to("/") / name).read_text().strip()
-            except (OSError, ValueError):
-                text = ""
-            if text.isdigit() and int(text) < 2**60:
-                limits.append(int(text))
-            if group == group.parent:
-                break
-            group = group.parent
-    return min(limits, default=None)
-
-
-def _numa_memory():
-    """Memory of the NUMA nodes this process allocates on, or None: the nodes
-    of Mems_allowed_list whose CPUs it may run on. numactl --cpunodebind
-    narrows the affinity (read at import), while --membind leaves
-    Mems_allowed_list (the cpuset) unchanged, so the CPUs decide."""
-    try:
-        status = Path("/proc/self/status").read_text()
-        allowed = _id_list(next(line.split(":", 1)[1] for line in status.splitlines()
-                                if line.startswith("Mems_allowed_list")))
-        nodes = {node for node in allowed
-                 if _id_list(Path(f"/sys/devices/system/node/node{node}/cpulist").read_text())
-                 & _PROCESS_CPU_SET} or allowed
-        total = 0
-        for node in nodes:
-            text = Path(f"/sys/devices/system/node/node{node}/meminfo").read_text()
-            total += next(int(line.split()[-2]) for line in text.splitlines() if "MemTotal" in line) * 1024
-        return total or None
-    except (OSError, StopIteration, ValueError):
-        return None
-
-
-def host_memory_limit():
-    """Bytes of host memory this process may use: the least of physical
-    memory, the cgroup limit, the Slurm allocation (SLURM_MEM_PER_NODE, or
-    SLURM_MEM_PER_CPU per allowed CPU; 0 means the whole node) and the memory
-    of the NUMA nodes it runs on (a point per socket)."""
-    limits = []
-    try:
-        physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (AttributeError, OSError, ValueError):
-        pass
-    else:
-        if physical > 0:
-            limits.append(physical)
-    for value in (_cgroup_memory_limit(), _numa_memory()):
-        if value is not None:
-            limits.append(value)
-    per_node, per_cpu = os.environ.get("SLURM_MEM_PER_NODE"), os.environ.get("SLURM_MEM_PER_CPU")
-    if per_node and per_node.isdigit() and int(per_node) > 0:
-        limits.append(int(per_node) * 2**20)
-    elif per_cpu and per_cpu.isdigit() and int(per_cpu) > 0:
-        limits.append(int(per_cpu) * 2**20 * _PROCESS_CPUS)
-    return min(limits, default=None)
-
-
-def resident_bytes():
-    """Resident host memory of this process in bytes (0 where unknown)."""
-    try:
-        return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError, AttributeError):
-        return 0
-
-
-_SCOPE = threading.local()
-
-
-@contextmanager
-def thread_scope(threads):
-    """Inside the block, `cpu_threads()` without an explicit count returns
-    `threads` in this Python thread: a solver's thread option reaches every
-    kernel it calls. None pins the count in effect when the block starts, so
-    the kernels of the block skip the environment lookup (one triplet
-    EOM-CCSDTQ action makes 300k calls of `cpu_threads`)."""
-    previous = getattr(_SCOPE, "threads", None)
-    _SCOPE.threads = int(threads) if threads is not None else cpu_threads()
-    try:
-        yield
-    finally:
-        _SCOPE.threads = previous
-
-
-def cpu_threads(requested=None):
-    """Threads of the compiled kernels: `requested`, the enclosing
-    `thread_scope`, ITERCC_CPU_THREADS, or one per physical core of the
-    affinity mask (the hot paths call no BLAS, so NumPy's OpenBLAS count,
-    capped at 64, does not bound them). SMT siblings add no arithmetic, and a
-    team on every logical CPU of a shared machine waits at each barrier for
-    CPUs the host is using: in a 24-CPU WSL VM on 12 cores, 24 threads made a
-    CCSDT Jacobian action 4.6x slower than 12. The NumPy fallback is limited
-    by GIL hand-offs between Python threads and overlaps BLAS, so it defaults
-    to 2 workers.
-    """
-    if requested is None:
-        requested = getattr(_SCOPE, "threads", None)
-    if requested is None:
-        requested = os.environ.get("ITERCC_CPU_THREADS") or None     # empty: unset
-    if requested is None:
-        requested = (_available_cores() if _kernels.library() is not None
-                     else min(2, _available_cpus()))
-    return max(1, int(requested))
+# Threads and host memory live in `_runtime` (re-exported for older imports).
+from ._runtime import (_PROCESS_CORES, _PROCESS_CPU_SET, _PROCESS_CPUS, _available_cores,  # noqa: F401,E402
+                       _available_cpus, _cores, _id_list, cpu_threads, host_memory_limit,
+                       resident_bytes, thread_scope)
 
 
 # Products on the core's GEMM executor -------------------------------------
@@ -226,20 +50,12 @@ def cpu_threads(requested=None):
 # gives the same results for any thread count. Without the compiled core the
 # NumPy expressions run instead.
 
-_ENGINES = {}
+def _engine():
+    """The package's dense product engine (`_cpu_quadruples.dense_products`),
+    or None without the core."""
+    from ._cpu_quadruples import dense_products
 
-
-def _engine(threads=None):
-    """The dense product engine for a thread count (cached), or None without the core."""
-    if _kernels.library() is None:
-        return None
-    count = cpu_threads(threads)
-    engine = _ENGINES.get(count)
-    if engine is None:
-        from ._cpu_quadruples import _DenseProducts
-
-        engine = _ENGINES[count] = _DenseProducts(threads=count)
-    return engine
+    return dense_products()
 
 
 def _float64(*arrays):
@@ -252,11 +68,11 @@ def product_into(spec, a, b, out, alpha=1.0, beta=0.0, threads=None):
     Returns False, with `out` untouched, without the compiled core, for other
     dtypes, or when `out` overlaps an operand.
     """
-    engine = _engine(threads)
+    engine = _engine()
     if (engine is None or not _float64(out, a, b) or not out.flags.writeable
             or np.may_share_memory(out, a) or np.may_share_memory(out, b)):
         return False
-    engine(spec, a, b, out, float(alpha), float(beta))
+    engine(spec, a, b, out, float(alpha), float(beta), threads=threads)
     return True
 
 
@@ -282,7 +98,7 @@ def matmul(a, b, out, *, alpha=1.0, beta=0.0, threads=None):
     fifth of the memory bandwidth there)."""
     if _narrow(a, b, out):
         library = _kernels.library()
-        if library is not None and hasattr(library, "gemm_narrow") and out.flags.writeable:
+        if library is not None and out.flags.writeable:
             library.gemm_narrow(a.ctypes.data, a.strides[0] // 8, b.ctypes.data, b.strides[0] // 8,
                                 out.ctypes.data, out.strides[0] // 8, a.shape[0], a.shape[1], b.shape[1],
                                 float(alpha), float(beta), cpu_threads(threads))
@@ -436,7 +252,7 @@ _SCAN_POOL, _SCAN_LOCK = [], threading.Lock()
 def _scan_pool():
     with _SCAN_LOCK:
         if not _SCAN_POOL:
-            _SCAN_POOL.append(ThreadPoolExecutor(max(1, min(16, _PROCESS_CPUS)),
+            _SCAN_POOL.append(ThreadPoolExecutor(max(1, min(16, cpu_threads())),
                                                  thread_name_prefix="itercc-scan"))
     return _SCAN_POOL[0]
 
@@ -729,7 +545,7 @@ def _ladder_matrix(g, o, v, t2, im, nv, threads=None):
 def _ladder_base(g, o, v, t2, nv, threads=None):
     """g(vvvv) + sum_lm g(lm,de) t2(lm,ab): the ladder matrix without its one-body term."""
     wvvvv = None
-    if _engine(threads) is not None and _float64(g, t2):
+    if _engine() is not None and _float64(g, t2):
         wvvvv = CompiledContract(threads).copy(g[v, v, v, v])
         if not product_into("lmde,lmab->abde", g[o, o, v, v], t2, wvvvv, 1.0, 1.0, threads):
             wvvvv = None
@@ -1238,9 +1054,9 @@ def dressed_integrals(g0, t1, threads=None, *, ccsd=False, open=False, contracte
     n = g0.shape[0]
     if g0.shape != (n,) * 4 or n != no + nv:
         return None
-    if ccsd and (not hasattr(library, "dress_integrals_ccsd") or any(s % 8 for s in g0.strides)):
+    if ccsd and any(s % 8 for s in g0.strides):
         raise ValueError("the CCSD dressing needs the compiled kernel and a float64 g0")
-    if open and (ccsd or not hasattr(library, "dress_integrals_open") or any(s % 8 for s in g0.strides)):
+    if open and (ccsd or any(s % 8 for s in g0.strides)):
         raise ValueError("the open dressing needs the compiled kernel and a float64 g0")
     threads = cpu_threads(threads)
     up = np.ascontiguousarray(t1, dtype=np.float64)            # (no, nv)

@@ -27,6 +27,7 @@ import weakref
 
 import numpy as np
 
+from . import _cpu_kernels, _runtime
 from . import _cpu_triples as _cpu
 from ._restricted_equations import Intermediates
 
@@ -78,7 +79,7 @@ def feedback(r1, r2, vooo, vvvo, f, g, layout, t3, o, v, *, threads=None, ground
     f0, df = _parts(f)
     g0, dg = _parts(g)
     irrep = int(irrep or 0)
-    workers = _cpu.cpu_threads(threads)
+    workers = _runtime.cpu_threads(threads)
 
     def blocked_t3(array, shift, key):
         """(layout, tables, blocked array) of a T3 exactly of irrep `shift`, else None."""
@@ -130,7 +131,7 @@ def _blocked_layout(proxy, labels, ground, irrep=0):
     sources (three or one occupied index) and every ground-state operator
     are totally symmetric, so the blocked residual serves them unchanged."""
     if (proxy is None or labels is None or ground is None or ground.get(("blocked off", irrep))
-            or _cpu._kernels.library() is None or not proxy.layout.shape[0]):
+            or _cpu_kernels.library() is None or not proxy.layout.shape[0]):
         return None
     from ._blocked import BlockedTriples
     from ._blocked_residual import PlaneTables
@@ -182,7 +183,7 @@ def _blocked_operands(proxy, labels, t2_0, t3_0, dt2, dt3, ground, threads, irre
     if plan is None or not len(t3_0):
         return None
     layout, tables, t2_forbidden = plan
-    workers = _cpu.cpu_threads(threads)
+    workers = _runtime.cpu_threads(threads)
     if np.any(t2_0[t2_forbidden]) or (not irrep and np.any(dt2[t2_forbidden])):
         return None
     t3_0b = None
@@ -238,7 +239,7 @@ def triples(proxy, t2, t3, have_t3, im, vooo, vvvo, g, *, threads=None, labels=N
         from . import _blocked_residual
 
         layout, tables, t3_0b, dt3b = blocked
-        workers = _cpu.cpu_threads(threads)
+        workers = _runtime.cpu_threads(threads)
         try:
             # Ground operators on dT3 with the derivative sources' seeds.
             shifted = _blocked_residual.triples(layout, tables, t2_0, dt3b, True, im0, dvooo, dvvvo,
@@ -258,7 +259,7 @@ def triples(proxy, t2, t3, have_t3, im, vooo, vvvo, g, *, threads=None, labels=N
         occupied, virtual = labels[:proxy.layout.no], labels[proxy.layout.no:]
         options = dict(ph_irreps=(occupied[:, None] ^ virtual[None, :]).reshape(-1),
                        virtual_irreps=virtual)
-    with _cpu.ThreadPool(_cpu.cpu_threads(threads)) as pool:
+    with _cpu.ThreadPool(_runtime.cpu_threads(threads)) as pool:
         # dT2's seeds with the derivative operators on T3 (the remaining part
         # of a non-A1 direction, or everything without blocked T3).
         r3 = _cpu.triples(proxy.layout, dt2, t3_0, have_t3, dim, vooo_0, vvvo_0, dg, o, v, pool,

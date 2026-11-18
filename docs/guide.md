@@ -203,8 +203,9 @@ directly.
 Every method also runs on NVIDIA GPUs through CuPy (`pip install cupy-cuda12x`):
 
 ```python
-cc = RestrictedCC(..., residual_backend="cuda", cuda_pair_fusion=True,
-                  cuda_layout_fusion=True, cuda_crossed_fusion=True, cuda_pool_cache=True)
+from itercc.restricted import cuda_options
+cc = RestrictedCC(..., orbital_irreps=labels, **cuda_options())   # every fused CUDA path
+# without orbital labels: **cuda_options(labelled=False)
 EOMSinglet(..., backend="cuda");  DipoleResponse(..., backend="cuda");  RestrictedCCSDTQ(..., backend="cuda")
 ```
 
@@ -227,7 +228,10 @@ Packed spin T4/R4 tile expansion and rank-2–4 projection also use shared nativ
 gather kernels; see the [packed-tile measurements](triplet-cpu-audit.md#native-packed-tile-gathers-november-17).
 
 - **Threads**: one per physical core of the process's CPU affinity. Set
-  `ITERCC_CPU_THREADS` to the cores you were allocated (the kernels ignore
+  `ITERCC_CPU_THREADS` to the cores you were allocated, or pass `cpu_threads=`
+  to a solver: `RestrictedCC`, `RestrictedCCSDTQ`, `EOMSinglet`,
+  `DipoleResponse` and `TripletEOMCCSDTQ` all take it, and an excited-state
+  engine inherits its ground-state solver's count (the kernels ignore
   `OMP_NUM_THREADS`; hyperthreads make them slower). Do not set `OMP_PROC_BIND`.
 - **Sockets**: run one calculation per socket with its memory bound to it,
   `numactl --cpunodebind=0 --membind=0`. A second socket gives one calculation
@@ -242,22 +246,49 @@ gather kernels; see the [packed-tile measurements](triplet-cpu-audit.md#native-p
   `~/.cache/itercc`, keyed by CPU model). For clusters, build the portable levels
   once: `bash core/build_levels.sh` (add `ITERCC_CUDA=ON` for the CUDA library).
 
-| Environment variable | Effect |
-| --- | --- |
-| `ITERCC_CPU_THREADS` | kernel threads (default: physical cores in the affinity mask) |
-| `ITERCC_CORE_DIR`, `ITERCC_KERNEL_CACHE`, `ITERCC_CXX` | where prebuilt cores are found, where first-use builds go, which compiler builds them |
-| `ITERCC_CPU_KERNELS=0` | NumPy path only (no compiled core, no warning) |
-| `ITERCC_BLOCKED=0` | CCSDT on dense instead of symmetry-blocked T3 |
-| `ITERCC_CPU_TANGENT=0` | EOM/response actions on the generic path |
-| `ITERCC_TILE_BLOCKED_T3=0`, `ITERCC_TILE_FUSED=0` | CCSDTQ tile programs: dense T3, one pass per term |
-| `ITERCC_TILE_MEMORY`, `ITERCC_TILE_TEAM`, `ITERCC_LOWER_TEAMS` | CCSDTQ tile memory budget (bytes), team size, concurrent teams |
-| `ITERCC_DIIS_COMPACT=0` | float64 instead of compact float32 host T4 DIIS history |
-| `ITERCC_GEMM_AUTOTUNE=0` | CUDA: static GEMM route choice instead of timing both |
-| `ITERCC_TRIPLET_PROGRAM=0` | triplet EOM-CCSDTQ: rank-four slots in the Python loop instead of the compiled program |
-| `ITERCC_TRIPLET_FUSED=0` | triplet slot program: products into a tile one by one (the loop's action bit for bit) |
-| `ITERCC_DIRECT_DENSE=0` | triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
-| `ITERCC_SLOT_SHARE_WORK` | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
-| `ITERCC_SLOT_PROFILE=1`, `ITERCC_SLOT_SORT=0` | slot program diagnostics: phase timers (`itercc_triplet_profile`), tiles in slot order |
+Every switch is registered in `itercc/_runtime.py` (`SWITCHES`); "Read" says when it
+takes effect: on each call, when a solver or engine is built, at import, when the
+core loads, or inside the core (read once by C++).
+
+| Environment variable | Read | Effect |
+| --- | --- | --- |
+| `ITERCC_CPU_THREADS` | call | kernel threads when no `cpu_threads` option is given (default: physical cores in the affinity mask) |
+| `ITERCC_CPU_KERNELS` | call | `0`: NumPy path only (no compiled core, no warning) |
+| `ITERCC_CORE_DIR` | load | directories searched first for a prebuilt core |
+| `ITERCC_KERNEL_CACHE` | load | where first-use core builds go (default `~/.cache/itercc`) |
+| `ITERCC_CXX` | load | the compiler of first-use core builds (default `c++`, then `g++`) |
+| `ITERCC_MALLOC` | load | `0`: leave glibc's malloc thresholds alone |
+| `ITERCC_BASIS_PATH` | call | extra directories of basis-set files |
+| `ITERCC_NATIVE_TRANSFORM` | call | `0`: PySCF's integral transformation in `from_rhf` instead of the core's |
+| `ITERCC_BLOCKED` | construction | `0`: CCSDT on dense instead of symmetry-blocked T3 |
+| `ITERCC_BARE_LADDER` | construction | `0` or `1`: particle-particle ladder without or with the cached bare sectors (default: always in ground states, from 30 virtuals in EOM/response actions) |
+| `ITERCC_OPEN_DRESSING` | call | `0`: CCSDT T1 dressing writes the dressed g(vvvv) instead of ladder sectors |
+| `ITERCC_DRESS_SLABS` | core | `1` or `0`: CCSD T1 dressing by slabs or by plane tasks (default: plane tasks with more than 3 threads per occupied orbital) |
+| `ITERCC_CPU_TANGENT` | construction | `0`: EOM/response actions on the generic path |
+| `ITERCC_TILE_BLOCKED_T3` | call | `0`: CCSDTQ tile programs read dense T3 |
+| `ITERCC_TILE_FUSED` | call | `0`: CCSDTQ tile programs make one pass per term |
+| `ITERCC_TILE_MEMORY` | call | CCSDTQ tile memory budget in bytes (default: host memory / 8) |
+| `ITERCC_TILE_TEAM` | call | CCSDTQ threads per tile-program team |
+| `ITERCC_LOWER_TEAMS` | call | CCSDTQ concurrent teams of the T4-into-lower-rank passes |
+| `ITERCC_TEAM_SCHEDULE` | call | `rounds`: CCSDTQ teams in fixed rounds (diagnostic) |
+| `ITERCC_LOWER_CHUNK` | call | occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB) |
+| `ITERCC_DIIS_COMPACT` | call | `0`: float64 instead of compact float32 host T4 DIIS history |
+| `ITERCC_TRIPLET_PROGRAM` | call | `0`: triplet EOM-CCSDTQ rank-four slots in the Python loop instead of the compiled program |
+| `ITERCC_TRIPLET_FUSED` | call | `0`: triplet slot program adds products into a tile one by one (the loop's action bit for bit) |
+| `ITERCC_DIRECT_DENSE` | call | `0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
+| `ITERCC_SLOT_SHARE_WORK` | call | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
+| `ITERCC_SLOT_PROFILE` | core | `1`: slot-program phase timers (`itercc_triplet_profile`) |
+| `ITERCC_SLOT_SORT` | core | `0`: slot-program tiles in slot order (diagnostic) |
+| `ITERCC_SYM_MIN_SHARE` | core | GEMM executor: least work per thread of a shared block |
+| `ITERCC_SYM_PARALLEL_WORK` | core | GEMM executor: work from which one block runs on all threads |
+| `ITERCC_GEMM_NC` | core | `auto`: narrower GEMM column blocks for deep products (experiment) |
+| `ITERCC_GEMM_KNOCKOUT` | core | GEMM micro-kernel stages to skip (timing diagnostic only) |
+| `ITERCC_GEMM_AUTOTUNE` | import | `0`: CUDA GEMM routes chosen statically instead of timed |
+| `ITERCC_BOUNDED_GEMM` | import | `1`: CUDA slab einsum products through the GEMM router |
+| `ITERCC_SLAB_MIB` | import | `bounded_einsum`: MiB per slab intermediate |
+| `ITERCC_SYMMETRY_FUSED_DEPTH` | import | CUDA symmetry blocks: deepest fused-kernel sum |
+| `ITERCC_SYMMETRY_FUSED_SKINNY` | import | CUDA symmetry blocks: widest skinny fused product |
+| `ITERCC_SYMMETRY_DIRECT_DEPTH` | import | CUDA symmetry blocks: deepest direct-kernel sum |
 
 ## How results are validated
 

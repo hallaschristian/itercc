@@ -36,6 +36,7 @@ from functools import reduce
 from itertools import product
 
 import numpy as np
+from . import _runtime
 
 _GROUPED = None
 _KERNELS = {}
@@ -292,9 +293,9 @@ extern "C" __global__ void __launch_bounds__(256) itercc_sym_direct(
 #   the same with operand tiles staged in shared memory;
 # * otherwise gathers, cuBLAS grouped GEMM and a scatter.
 # ITERCC_SYMMETRY_FUSED_DEPTH=0 puts every plan on cuBLAS.
-_FUSED_DEPTH = int(os.environ.get("ITERCC_SYMMETRY_FUSED_DEPTH", "128"))
-_FUSED_SKINNY = int(os.environ.get("ITERCC_SYMMETRY_FUSED_SKINNY", "16"))
-_DIRECT_DEPTH = int(os.environ.get("ITERCC_SYMMETRY_DIRECT_DEPTH", "16"))
+_FUSED_DEPTH = _runtime.integer("ITERCC_SYMMETRY_FUSED_DEPTH")
+_FUSED_SKINNY = _runtime.integer("ITERCC_SYMMETRY_FUSED_SKINNY")
+_DIRECT_DEPTH = _runtime.integer("ITERCC_SYMMETRY_DIRECT_DEPTH")
 
 
 def _kernel(name):
@@ -354,7 +355,19 @@ def _grouped_gemm():
 
 
 def available():
+    """Whether cuBLAS grouped GEMM (12.5 or later) is loadable."""
     return _grouped_gemm() is not None
+
+
+def engine_available():
+    """Whether the CUDA engine can run: its fused and direct plans need only
+    CuPy; a plan of grouped GEMMs without cuBLAS 12.5 runs that product on
+    the fallback instead (`SymmetryBlocks.einsum`)."""
+    try:
+        import cupy  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _parse(spec):
@@ -699,7 +712,7 @@ class SymmetryBlocks:
         if hit is None:
             hit = self._calls[call] = self._resolve(spec, a, b, out, labels, irreps)
         structure, plan = hit
-        if not structure:
+        if not structure or (plan["count"] and not plan.get("fused") and _grouped_gemm() is None):
             if self.fallback is None:
                 raise ValueError(f"No symmetry-blocked plan for {spec}")
             return self.fallback(spec, a, b, out=out, alpha=alpha, beta=beta)
@@ -757,8 +770,7 @@ class SymmetryBlocks:
         """Whether the operands can use a blocked plan (else the fallback runs)."""
         import cupy as cp
 
-        return (all(isinstance(x, cp.ndarray) and x.dtype == cp.float64 for x in (a, b, out))
-                and _grouped_gemm() is not None)
+        return all(isinstance(x, cp.ndarray) and x.dtype == cp.float64 for x in (a, b, out))
 
     def _plan(self, structure, labels, irreps):
         """The executable plan for one irrep pattern (GEMM list and launch arguments)."""

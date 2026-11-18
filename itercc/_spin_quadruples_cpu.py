@@ -10,10 +10,11 @@ from math import factorial
 import numpy as np
 
 from . import _cpu_kernels
-from ._cpu_triples import cpu_threads
+from ._runtime import cpu_threads
 from ._tensor_symmetry import signed_permutations
 from ._spin_quadruples_tiles import _permutation_pairs, projection_diagrams
 from .bounded_einsum import einsum
+from . import _runtime
 
 
 class PackedLookup:
@@ -139,9 +140,7 @@ def _pair_factor(pairs):
 def dense_enabled():
     """Rank-four direct terms by contexts (itercc_spin_quad_dense) unless
     ITERCC_DIRECT_DENSE=0 (then the sparse per-row lookups)."""
-    import os
-
-    return os.environ.get("ITERCC_DIRECT_DENSE", "1") != "0"
+    return _runtime.enabled("ITERCC_DIRECT_DENSE")
 
 
 def _coefficient_rows(tensor, subscript, amplitude, output, halves):
@@ -369,7 +368,7 @@ class PackedBinaryAction:
             return
         library = _cpu_kernels.library()
         terms = []          # one itercc_spin_quad_term per kernel call, in order
-        dense = (rank == 4 and dense_enabled() and hasattr(library, "spin_quad_dense")
+        dense = (rank == 4 and dense_enabled()
                  and 2 * max(engine.nocc, engine.nvir) < 255)
         if dense:
             self._add_dense(rank, coordinates, result, library)

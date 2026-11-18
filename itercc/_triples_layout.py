@@ -77,7 +77,7 @@ class TriplesLayout:
         if (xp is np and isinstance(triples, np.ndarray) and triples.dtype == np.float64
                 and triples.flags.c_contiguous):
             from . import _cpu_kernels
-            from ._cpu_triples import cpu_threads
+            from ._runtime import cpu_threads
 
             library = _cpu_kernels.library()
             if library is not None:     # the same projection on all threads
