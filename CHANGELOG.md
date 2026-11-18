@@ -11,8 +11,11 @@
   symmetry allows entries (one run of the last letter per first three)
   instead of whole. 6o/24v synthetic model with interleaved irreps, 12
   threads: rank four 42.1 -> 35.3 s (tile products 161 -> 121 thread-s,
-  gathers 44 -> 32), bit for bit the same action. `ITERCC_SLOT_POSITIONS=0`
-  keeps the orbital order. Core ABI 34.
+  gathers 44 -> 32), bit for bit the same action. The packed T4 rows that
+  products read go through the program's own copies of their row maps,
+  indexed by the same positions (rank four about 19% faster than the plain
+  layout in all). `ITERCC_SLOT_POSITIONS=0` keeps the orbital order. Core
+  ABI 34.
 - Triplet slot-program intermediates are formed only where they are read.
   A tile product forms only the entries its projection reads, so it reads an
   operand only where the constraints among the operand's letters that are

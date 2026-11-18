@@ -32,10 +32,11 @@ single-threaded contraction routes and its raw tile in that thread's caches.
   every product that reads it, in any kind, reads (`_order_intermediates`;
   the g T4 products of the rings, read at b < c < d, shrink six-fold).
 * Intermediates and tiles keep their virtual axes in irrep order (orbitals
-  sorted by irrep, `PositionedView`): a symmetry class is a contiguous run,
-  so a product reads whole cache lines of them instead of every fourth value
-  (C2v orbitals in energy order). Composites and sums are those of the plain
-  layout, so the action does not change.
+  sorted by irrep, `PositionedView`), and the packed T4 rows are read through
+  copies of their row maps indexed the same way: a symmetry class is a
+  contiguous run, so a product reads whole cache lines instead of every
+  fourth value (C2v orbitals in energy order). Composites and sums are those
+  of the plain layout, so the action does not change.
 * Each tile's gathers go to partial sums, added to the slot's rows in the
   order of the Python loop and divided by (4!)^2 as it does, so the action is
   the loop's bit for bit, on any number of threads.
@@ -106,9 +107,11 @@ def _like(shape, strides):
     return np.lib.stride_tricks.as_strided(_STORE, shape=tuple(shape), strides=tuple(strides), writeable=True)
 
 
-def _rows_like(shape, strides):
+def _rows_like(shape, strides, positions=None):
     stub = object.__new__(SignedRows)
     stub.shape, stub.strides, stub.ndim = tuple(shape), tuple(strides), len(shape)
+    if positions is not None:
+        stub.positions = tuple(positions)
     return stub
 
 
@@ -192,6 +195,7 @@ class SlotProgram:
         self._plans_of = {}                    # (contraction, irreps of its occupied indices) -> plan
         self._plan_sets = []
         self._keep = []
+        self._row_pointers, self._positioned_maps = {}, {}
         self._prepare(engine)
 
     @staticmethod
@@ -270,7 +274,7 @@ class SlotProgram:
         # in irrep order (see the module docstring).
         sides = spec.replace("->", ",").split(",")
         operands = tuple((x[0] == ROWS, x[2], x[3],
-                          self._vpos is not None and x[0] in (INTER, TILE)
+                          self._vpos is not None and x[0] in (INTER, TILE, ROWS)
                           and tuple(c in _VIRTUAL and n == self.nv for c, n in zip(side, x[2])))
                          for x, side in zip((a, b, out), sides))
         identity = (spec, operands, tuple(labels), irreps, tuple(ordered))
@@ -285,7 +289,8 @@ class SlotProgram:
         if number is None:
             spec, operands, labels, irreps, ordered = identity
             number = self._contractions[identity] = len(self._contraction_info)
-            arrays = tuple(_rows_like(shape, strides) if rows else
+            arrays = tuple(_rows_like(shape, strides, [self._vpos if v else None for v in placed] if placed else None)
+                           if rows else
                            PositionedView(_like(shape, strides), [self._vpos if v else None for v in placed])
                            if placed else _like(shape, strides)
                            for rows, shape, strides, placed in operands)
@@ -628,6 +633,19 @@ class SlotProgram:
             found.append(group)
         return found, len(groups)
 
+    def _positioned_map(self, layout, pspin, sector):
+        """A row map of the packed T4 indexed by stored virtual positions:
+        entry ((p0 nv + p1) nv + p2) nv + p3 is the layout's entry for the
+        orbitals stored at positions p0..p3 (kept for the program's life)."""
+        key = id(layout._cpu_signed_maps), pspin, sector
+        found = self._positioned_maps.get(key)
+        if found is None:
+            order = np.argsort(self._vpos)               # orbital at each position
+            plain = layout._signed_map(pspin, sector).reshape((self.nv,) * 4)
+            found = self._positioned_maps[key] = np.ascontiguousarray(
+                plain[np.ix_(order, order, order, order)].reshape(-1))
+        return found
+
     def _finish(self, engine):
         instructions, intermediates = [], []
         kind_start, kind_count, inter_start, inter_count = [], [], [], []
@@ -688,16 +706,20 @@ class SlotProgram:
             layout = layouts[which]
             bases, keys, sectors = tables[which]
             pspin, hspin = tuple(signature[:4]), tuple(signature[4:])
-            table = layout._map_pointers.get(pspin)
+            # With positions, the program's own copies of the row maps,
+            # indexed by stored virtual positions (see `_positioned_map`).
+            pointers = layout._map_pointers if self._vpos is None else self._row_pointers.setdefault(which, {})
+            table = pointers.get(pspin)
             if table is None:
-                table = layout._map_pointers[pspin] = np.zeros(len(sectors), dtype=np.int64)
+                table = pointers[pspin] = np.zeros(len(sectors), dtype=np.int64)
             axes = [2 * np.arange(self.no, dtype=np.int64) + s for s in hspin]
             every = (((axes[0][:, None, None, None] * n + axes[1][None, :, None, None]) * n
                       + axes[2][None, None, :, None]) * n + axes[3][None, None, None, :]).reshape(-1)
             live = bases[every] != 0
             for owner in np.unique(keys[every][live]):
                 if table[owner] == 0:
-                    table[owner] = layout._signed_map(pspin, sectors[owner]).ctypes.data
+                    table[owner] = (layout._signed_map(pspin, sectors[owner]) if self._vpos is None else
+                                    self._positioned_map(layout, pspin, sectors[owner])).ctypes.data
             row = rows[index]
             row["which"], row["spins"] = which, hspin
             row["fixed"] = [q for q, _, _ in cuts]
