@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 33
+CORE_ABI = 34
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)

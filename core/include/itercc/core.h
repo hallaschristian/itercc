@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 33
+#define ITERCC_CORE_ABI 34
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -797,6 +797,13 @@ typedef struct {
      * each (first, count) of fuse_members (instruction numbers within the
      * kind): products into the tile with equal output offset tables. */
     const int64_t *fuse_start, *fuse_count, *fuse_groups, *fuse_members;
+    /* Stored virtual positions of irrep g in a tile: tile_runs[2g] ..
+     * tile_runs[2g + 1] (one run each: the tile keeps them in irrep order),
+     * or null: every tile is cleared whole. A tile's products write, and its
+     * gathers read, only entries whose particle irreps multiply to its holes'
+     * product times tile_irrep, so only those are cleared. */
+    const int64_t *tile_runs;
+    int64_t tile_irrep;
 } itercc_slot_program;
 
 /* Slots 0 .. nslots - 1 of `result` (zero on entry), in waves whose partial

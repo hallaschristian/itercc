@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Triplet slot-program intermediates and tiles keep their virtual axes in
+  irrep order (`symmetry_blocks.PositionedView`: an operand whose axes store
+  index i at positions[i]; the planner uses the positions only in offsets,
+  so composites and sums are unchanged). With orbitals in energy order (CuF:
+  virtual irreps interleaved) a symmetry class read every fourth value of an
+  intermediate; it is now a contiguous run. Tiles are cleared only where
+  symmetry allows entries (one run of the last letter per first three)
+  instead of whole. 6o/24v synthetic model with interleaved irreps, 12
+  threads: rank four 42.1 -> 35.3 s (tile products 161 -> 121 thread-s,
+  gathers 44 -> 32), bit for bit the same action. `ITERCC_SLOT_POSITIONS=0`
+  keeps the orbital order. Core ABI 34.
 - Triplet slot-program intermediates are formed only where they are read.
   A tile product forms only the entries its projection reads, so it reads an
   operand only where the constraints among the operand's letters that are

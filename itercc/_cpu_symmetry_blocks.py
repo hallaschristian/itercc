@@ -18,7 +18,7 @@ import numpy as np
 from . import _cpu_kernels
 from ._runtime import cpu_threads
 from ._tensor_scatter import SignedRows
-from .symmetry_blocks import SymmetryBlocks, _offsets
+from .symmetry_blocks import SymmetryBlocks, _offsets, positions_key
 
 _COLUMNS = ("a_rows", "a_sum", "b_sum", "b_cols", "rpos", "cpos")
 
@@ -58,12 +58,13 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         if self._library is not None:
             self._library.scratch_release(cpu_threads(self.threads))
 
-    def _offsets(self, letters, extent, strides, composite):
-        key = (composite[0], tuple(strides[c] for c in letters))
+    def _offsets(self, letters, extent, strides, composite, positions=None):
+        positions = {c: p for c, p in (positions or {}).items() if c in letters and p is not None}
+        key = (composite[0], tuple(strides[c] for c in letters), tuple(sorted((c, id(p)) for c, p in positions.items())))
         hit = self._tables.get(key)
         if hit is None:
             hit = self._tables[key] = np.ascontiguousarray(
-                _offsets(letters, extent, strides, composite[1]), dtype=np.int64)
+                _offsets(letters, extent, strides, composite[1], positions), dtype=np.int64)
         return hit
 
     def _supported(self, a, b, out):
@@ -114,7 +115,7 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         """(structure, block table, kernel arguments) of one call signature, cached."""
         call = (spec, a.shape, a.strides, a.dtype.char, b.shape, b.strides, b.dtype.char,
                 out.shape, out.strides, out.dtype.char, int(irreps[0]), int(irreps[1]),
-                self._label_key_of(labels), tuple(ordered))
+                self._label_key_of(labels), tuple(ordered), positions_key(a), positions_key(b), positions_key(out))
         hit = self._calls.get(call)
         if hit is None:
             structure, plan = self._resolve(spec, a, b, out, labels, irreps, ordered)

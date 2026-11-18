@@ -281,6 +281,35 @@ def test_intermediates_are_formed_only_where_read(monkeypatch):
     assert any(info[5] for info in producers)
 
 
+def test_irrep_ordered_program_arrays_keep_the_action(monkeypatch):
+    """Intermediates and tiles with virtual axes in irrep order (positions),
+    tiles cleared only where symmetry allows entries: the action of the plain
+    layout bit for bit (only addresses change)."""
+    from itercc import TripletEOMCCSDTQ
+    from itercc._cpu_symmetry_blocks import CpuSymmetryBlocks
+    from test_quadruples import warm_amplitudes, symmetric_model
+    labels = np.array([0, 1, 2, 3, 0, 2, 1, 3, 0])       # virtual irreps interleaved
+    solver, amplitudes = warm_amplitudes(symmetric_model(labels, no=3), evaluations=2, backend="cpu")
+    engine = TripletEOMCCSDTQ(solver, amplitudes, labels, 2, occupied_tiles=True, packed_spin=True,
+                             intermediate_cache_gib=0.0001)
+    if not isinstance(engine._symmetry_engine, CpuSymmetryBlocks):
+        pytest.skip("compiled core unavailable")
+    vector = np.random.default_rng(759).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_SLOT_POSITIONS", "0")
+    engine._slot_programs = {}
+    plain = engine.sigma(vector)
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    assert program._vpos is None and not program.struct.tile_runs
+    engine.slot_program = False                      # the Python loop: the same action
+    np.testing.assert_allclose(engine.sigma(vector), plain, rtol=1e-12, atol=1e-13 * np.abs(plain).max())
+    engine.slot_program = True
+    monkeypatch.setenv("ITERCC_SLOT_POSITIONS", "1")
+    engine._slot_programs = {}
+    np.testing.assert_array_equal(engine.sigma(vector), plain)
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    assert program._vpos is not None and program.struct.tile_runs
+
+
 def test_ordered_tiles_and_wave_sizes_keep_the_action(monkeypatch):
     """Tile products form only the entries the projection reads (ordered
     letters of antisymmetric subsets): the action equals the one with every

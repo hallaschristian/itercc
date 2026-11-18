@@ -393,7 +393,28 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
     const itercc_slot_template &m = p.templates[job.tmpl];
     {
         const Phase timing(0);
-        std::fill(tile, tile + nv4, 0.0);
+        if (p.tile_runs == nullptr) {
+            std::fill(tile, tile + nv4, 0.0);
+        } else {
+            // Only the symmetry-allowed entries (one run of the last letter per
+            // first three: the tile keeps its virtual axes in irrep order).
+            i64 target = p.tile_irrep;
+            for (int k = 0; k < 4; ++k) target ^= p.occupied_irreps[job.fixed[k]];
+            for (i64 ga = 0; ga < p.nirrep; ++ga)
+                for (i64 gb = 0; gb < p.nirrep; ++gb)
+                    for (i64 gc = 0; gc < p.nirrep; ++gc) {
+                        const i64 gd = target ^ ga ^ gb ^ gc;
+                        if (gd >= p.nirrep) continue;
+                        const i64 d0 = p.tile_runs[2 * gd], d1 = p.tile_runs[2 * gd + 1];
+                        if (d1 <= d0) continue;
+                        for (i64 a = p.tile_runs[2 * ga]; a < p.tile_runs[2 * ga + 1]; ++a)
+                            for (i64 b = p.tile_runs[2 * gb]; b < p.tile_runs[2 * gb + 1]; ++b) {
+                                double *row = tile + (a * nv + b) * nv * nv;
+                                for (i64 c = p.tile_runs[2 * gc]; c < p.tile_runs[2 * gc + 1]; ++c)
+                                    std::fill(row + c * nv + d0, row + c * nv + d1, 0.0);
+                            }
+                    }
+        }
     }
     const itercc_slot_instruction *code = p.instructions + p.kind_start[m.kind];
     const i64 ncode = p.kind_count[m.kind];

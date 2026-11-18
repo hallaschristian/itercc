@@ -403,12 +403,40 @@ def _composite(letters, extent, labels, nirrep, ordered=()):
     return order, np.r_[0, np.cumsum(counts)]
 
 
-def _offsets(letters, extent, strides, flat):
-    """Element offsets (with `strides` per letter) of row-major flat indices over `letters`."""
+def _offsets(letters, extent, strides, flat, positions=None):
+    """Element offsets (with `strides` per letter) of row-major flat indices
+    over `letters`; a letter with `positions` stores index i at positions[i]."""
     if not letters:
         return np.zeros(len(flat), dtype=np.int64)
+    positions = positions or {}
     digits = np.unravel_index(flat, [extent[c] for c in letters])
-    return sum(d.astype(np.int64) * strides[c] for d, c in zip(digits, letters))
+    return sum((positions[c][d] if positions.get(c) is not None else d).astype(np.int64) * strides[c]
+               for d, c in zip(digits, letters))
+
+
+class PositionedView(np.ndarray):
+    """An operand whose axes store their indices in another order: axis k
+    keeps index i at positions[k][i] (None: at i). The composites and every
+    sum are those of the plain operand; only its offsets differ (a slot
+    program keeps the virtual axes of its intermediates and tiles in irrep
+    order, so a symmetry class is a contiguous run)."""
+
+    def __new__(cls, array, positions):
+        view = np.asarray(array).view(cls)
+        view.positions = tuple(positions)
+        return view
+
+    def __array_finalize__(self, obj):
+        self.positions = getattr(obj, "positions", None)
+
+
+def positions_key(array):
+    """A cache key of an operand's positions (ids of the arrays, which the
+    caller keeps alive), or None for a plain operand."""
+    positions = getattr(array, "positions", None)
+    if not positions:
+        return None
+    return tuple(None if p is None else id(p) for p in positions)
 
 
 _POINTERS = None
@@ -486,14 +514,15 @@ class SymmetryBlocks:
             hit = self._composites[key] = (key, *_composite(letters, extent, labels, self.nirrep, local))
         return hit
 
-    def _offsets(self, letters, extent, strides, composite):
+    def _offsets(self, letters, extent, strides, composite, positions=None):
         """Device offsets of a sorted composite, shared between structures."""
         import cupy as cp
 
-        key = (composite[0], tuple(strides[c] for c in letters))
+        positions = {c: p for c, p in (positions or {}).items() if c in letters and p is not None}
+        key = (composite[0], tuple(strides[c] for c in letters), tuple(sorted((c, id(p)) for c, p in positions.items())))
         hit = self._tables.get(key)
         if hit is None:
-            hit = self._tables[key] = cp.asarray(_offsets(letters, extent, strides, composite[1]))
+            hit = self._tables[key] = cp.asarray(_offsets(letters, extent, strides, composite[1], positions))
         return hit
 
     def _structure(self, spec, a, b, out, labels, ordered=()):
@@ -515,6 +544,9 @@ class SymmetryBlocks:
             return None
         sta, stb, sto = (dict(zip(s, (x // 8 for x in arr.strides)))
                          for s, arr in ((sa, a), (sb, b), (so, out)))
+        # Positioned operands (PositionedView): offsets by stored positions.
+        pa, pb, po = ({c: p for c, p in zip(s, getattr(arr, "positions", None) or ()) if p is not None}
+                      for s, arr in ((sa, a), (sb, b), (so, out)))
         enumerated = self.combinations | {c for c in so if extent[c] == 1}
         orow = [c for c in rows if c in enumerated]
         vrow = [c for c in rows if c not in enumerated]
@@ -553,24 +585,24 @@ class SymmetryBlocks:
         combos_r = list(product(*[range(extent[c]) for c in orow]))
         combos_c = list(product(*[range(extent[c]) for c in ocol]))
 
-        def occ(letters, combo, strides):
-            return sum(i * strides[c] for i, c in zip(combo, letters))
+        def occ(letters, combo, strides, positions):
+            return sum(int(positions[c][i] if c in positions else i) * strides[c] for i, c in zip(combo, letters))
 
-        a_rows = self._offsets(vrow, extent, sta, r_sorted)
-        a_sum = self._offsets(summed, extent, sta, k_sorted)
-        b_sum = self._offsets(summed, extent, stb, k_sorted)
-        b_cols = self._offsets(vcol, extent, stb, c_sorted)
+        a_rows = self._offsets(vrow, extent, sta, r_sorted, pa)
+        a_sum = self._offsets(summed, extent, sta, k_sorted, pa)
+        b_sum = self._offsets(summed, extent, stb, k_sorted, pb)
+        b_cols = self._offsets(vcol, extent, stb, c_sorted, pb)
         return dict(
             orow=orow, ocol=ocol, ta=ta, tb=tb, rfast=last(vrow, sto) < last(vcol, sto),
             a_rows=a_rows, a_sum=a_sum, b_sum=b_sum, b_cols=b_cols,
             r_start=r_start, c_start=c_start, k_start=k_start, combos_r=combos_r, combos_c=combos_c,
-            obase=[[occ(orow, o_r, sto) + occ(ocol, o_c, sto) for o_c in combos_c] for o_r in combos_r],
-            a_outer=[occ(orow, o, sta) for o in combos_r],
+            obase=[[occ(orow, o_r, sto, po) + occ(ocol, o_c, sto, po) for o_c in combos_c] for o_r in combos_r],
+            a_outer=[occ(orow, o, sta, pa) for o in combos_r],
             a_middle=a_sum if ta else a_rows, a_inner=a_rows if ta else a_sum,
-            b_outer=[occ(ocol, o, stb) for o in combos_c],
+            b_outer=[occ(ocol, o, stb, pb) for o in combos_c],
             b_middle=b_cols if tb else b_sum, b_inner=b_sum if tb else b_cols,
-            rpos=self._offsets(vrow, extent, sto, r_sorted),
-            cpos=self._offsets(vcol, extent, sto, c_sorted))
+            rpos=self._offsets(vrow, extent, sto, r_sorted, po),
+            cpos=self._offsets(vcol, extent, sto, c_sorted, po))
 
     def _group_plan(self, structure, labels, irreps):
         """GEMMs for one irrep pattern of the combination indices and operand irreps.
@@ -826,7 +858,8 @@ class SymmetryBlocks:
         fixed = () if not labels else tuple(sorted(
             (c, self._labels_key(current[c])) for c in labels
             if c not in enumerated))
-        key = (spec, a.shape, a.strides, b.shape, b.strides, out.shape, out.strides, fixed, tuple(ordered))
+        key = (spec, a.shape, a.strides, b.shape, b.strides, out.shape, out.strides, fixed, tuple(ordered),
+               positions_key(a), positions_key(b), positions_key(out))
         structure = self._structures.get(key)
         if structure is None:
             ok = self._supported(a, b, out)

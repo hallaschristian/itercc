@@ -31,6 +31,11 @@ single-threaded contraction routes and its raw tile in that thread's caches.
   intermediate only at such entries: an intermediate is formed only where
   every product that reads it, in any kind, reads (`_order_intermediates`;
   the g T4 products of the rings, read at b < c < d, shrink six-fold).
+* Intermediates and tiles keep their virtual axes in irrep order (orbitals
+  sorted by irrep, `PositionedView`): a symmetry class is a contiguous run,
+  so a product reads whole cache lines of them instead of every fourth value
+  (C2v orbitals in energy order). Composites and sums are those of the plain
+  layout, so the action does not change.
 * Each tile's gathers go to partial sums, added to the slot's rows in the
   order of the Python loop and divided by (4!)^2 as it does, so the action is
   the loop's bit for bit, on any number of threads.
@@ -49,8 +54,10 @@ from . import _cpu_kernels, _runtime
 from ._spin_quadruples_tiles import (_PACKED_TILE_BYTES, _packed_cuts, ordered_letters, _tree_irrep, contraction_schedule,
                                      external_routes, routes)
 from ._tensor_scatter import SignedRows, _gather_steps
+from .symmetry_blocks import PositionedView
 
 DENSE, ROWS, INTER, TILE = range(4)
+_VIRTUAL = frozenset("abcdefgh")      # virtual letters of the diagrams
 CONTRACT, LOOKUP, PUBLISH = range(3)
 _ALL = (None, None)
 _FIXED = "@"                   # (_FIXED, q): the bounds of the tile's q-th occupied index
@@ -75,13 +82,13 @@ _ARRAYS = ("kind_start", "kind_count", "inter_start", "inter_count", "instructio
            "plan_start", "plan_table", "plan_count", "plan_id", "ground_bases", "ground_keys",
            "direction_bases", "direction_keys", "occupied_irreps", "class_start", "class_count",
            "templates", "parts", "terms", "key_group_start", "groups", "slots", "fuse_start", "fuse_count",
-           "fuse_groups", "fuse_members")
+           "fuse_groups", "fuse_members", "tile_runs")
 
 
 class ProgramStruct(ctypes.Structure):
     """itercc_slot_program of core.h."""
     _fields_ = ([("nv", ctypes.c_int64), ("holes", ctypes.c_int64), ("nirrep", ctypes.c_int64)]
-                + [(name, ctypes.c_void_p) for name in _ARRAYS])
+                + [(name, ctypes.c_void_p) for name in _ARRAYS] + [("tile_irrep", ctypes.c_int64)])
 
 
 _PROGRESS = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64)
@@ -153,6 +160,13 @@ class SlotProgram:
         self.no, self.nv = engine.nocc, engine.nvir
         self.nirrep = int(self.blocked.nirrep)
         self.irrep = engine.space.irrep
+        # Stored position of each virtual orbital in the program's own arrays
+        # (intermediates, tiles): irrep order, stable (ITERCC_SLOT_POSITIONS=0: none).
+        virtual = np.asarray(engine._spatial_labels["v"], dtype=np.int64)
+        self._vpos = None
+        if _runtime.enabled("ITERCC_SLOT_POSITIONS") and np.any(np.diff(virtual) < 0):
+            self._vpos = np.empty(len(virtual), dtype=np.int64)
+            self._vpos[np.argsort(virtual, kind="stable")] = np.arange(len(virtual))
         self.slab = engine.occupied_slab
         self.occupied_irreps = np.ascontiguousarray(engine._spatial_labels["o"], dtype=np.int64)
         if self.occupied_irreps.size and (self.occupied_irreps.min() < 0
@@ -252,7 +266,13 @@ class SlotProgram:
                 bound = (_FIXED, positions.index(bound[1]))
             labels.append((c, bound))
         irreps = (int(irreps[0]), int(irreps[1]))
-        operands = tuple((x[0] == ROWS, x[2], x[3]) for x in (a, b, out))
+        # The program's own arrays (intermediates, the tile) keep virtual axes
+        # in irrep order (see the module docstring).
+        sides = spec.replace("->", ",").split(",")
+        operands = tuple((x[0] == ROWS, x[2], x[3],
+                          self._vpos is not None and x[0] in (INTER, TILE)
+                          and tuple(c in _VIRTUAL and n == self.nv for c, n in zip(side, x[2])))
+                         for x, side in zip((a, b, out), sides))
         identity = (spec, operands, tuple(labels), irreps, tuple(ordered))
         number = self._number(identity)
         kind.code.append((CONTRACT, -1, -1, len(kind.contracts), a, b, out, float(alpha), beta))
@@ -265,8 +285,10 @@ class SlotProgram:
         if number is None:
             spec, operands, labels, irreps, ordered = identity
             number = self._contractions[identity] = len(self._contraction_info)
-            arrays = tuple(_rows_like(shape, strides) if rows else _like(shape, strides)
-                           for rows, shape, strides in operands)
+            arrays = tuple(_rows_like(shape, strides) if rows else
+                           PositionedView(_like(shape, strides), [self._vpos if v else None for v in placed])
+                           if placed else _like(shape, strides)
+                           for rows, shape, strides, placed in operands)
             self._contraction_info.append([spec, arrays, labels, irreps, None, ordered])
             self._contraction_keys.append(identity)
         return number
@@ -474,7 +496,10 @@ class SlotProgram:
             mask = np.flatnonzero(np.all(signatures == pspin, axis=1))
             if mask.size:
                 rows = np.ascontiguousarray(mask, dtype=np.int64)
-                coordinates = np.ascontiguousarray(particles[mask] // 2, dtype=np.int32)
+                coordinates = particles[mask] // 2
+                if self._vpos is not None:           # the tile's stored positions
+                    coordinates = self._vpos[coordinates]
+                coordinates = np.ascontiguousarray(coordinates, dtype=np.int32)
                 self._keep.extend((rows, coordinates))
                 found.append((pspin, rows, coordinates))
         return found
@@ -694,11 +719,27 @@ class SlotProgram:
                       parts=self.parts, terms=self.terms, key_group_start=self.key_group_start,
                       groups=self.groups_table, slots=self.slots, fuse_start=self.fuse_start,
                       fuse_count=self.fuse_count, fuse_groups=self.fuse_groups, fuse_members=self.fuse_members)
+        # The tile's virtual positions of each irrep as one run (irrep order:
+        # its products and gathers touch only the symmetry-allowed entries);
+        # none when an irrep's positions are not contiguous.
+        virtual = np.asarray(engine._spatial_labels["v"], dtype=np.int64)
+        stored = virtual if self._vpos is None else virtual[np.argsort(virtual, kind="stable")]
+        runs = np.zeros((self.nirrep, 2), dtype=np.int64)
+        contiguous = self.nirrep > 1
+        for g in range(self.nirrep):
+            where = np.flatnonzero(stored == g)
+            if len(where):
+                runs[g] = where[0], where[-1] + 1
+                contiguous &= len(where) == where[-1] + 1 - where[0]
+        arrays["tile_runs"] = runs
         for name, array in arrays.items():
             if not array.flags.c_contiguous:
                 raise ValueError(f"{name} is not contiguous")
         self.struct = ProgramStruct(nv=self.nv, holes=n, nirrep=self.nirrep,
-                                    **{name: arrays[name].ctypes.data for name in _ARRAYS})
+                                    **{name: arrays[name].ctypes.data for name in _ARRAYS},
+                                    tile_irrep=int(self.irrep))
+        if not contiguous:
+            self.struct.tile_runs = None
         self._arrays = arrays
 
     def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,
