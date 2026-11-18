@@ -75,6 +75,12 @@ def test_compiled_slots_match_the_loop(active):
     for threads in (1, 3):
         with thread_scope(threads):
             np.testing.assert_array_equal(engine._action(vector), loop)
+    engine.share_work = 1              # every intermediate in pieces that waiting tiles run too
+    for threads in (2, 4):
+        with thread_scope(threads):
+            np.testing.assert_array_equal(engine._action(vector), loop)
+    assert engine.last_intermediate_cache["shared"] > 0
+    engine.share_work = None
     engine.fused_tiles = True
     with thread_scope(1):
         fused = engine._action(vector)

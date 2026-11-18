@@ -3,6 +3,7 @@
 #define ITERCC_CONTRACT_H
 
 #include <cstdint>
+#include <vector>
 
 namespace itercc {
 
@@ -41,6 +42,22 @@ ContractPlan contract_plan(const double *a, const double *b, double *out, const 
 // Every block on the calling thread, each by its size route: the same
 // arithmetic as itercc_sym_contract on any number of threads.
 void contract_serial(const ContractPlan &p, const int64_t *table, int64_t nblocks);
+
+// One piece of a contraction: a block with a deep sum (split into slices,
+// kind 0), a chunk of a skinny block's long side (kind 1), or a piece of a
+// block's rows and columns by its route (kind 2). The pieces of a plan write
+// disjoint entries, and each entry gets the arithmetic of contract_serial.
+struct ContractTask {
+    int64_t kind, route, first;   // first: slices (kind 0) or first long entry (kind 1)
+    int64_t block[9];             // rows, cols, depth, r0, c0, k0, a_base, b_base, o_base
+};
+
+// The pieces of a plan as itercc_sym_contract cuts it for `workers` threads
+// (pieces of about work / (4 workers) multiply-adds), appended to `tasks`.
+void contract_tasks(const int64_t *table, int64_t nblocks, int64_t workers, std::vector<ContractTask> &tasks);
+
+// One piece on the calling thread (split slices also on the calling thread).
+void contract_task(const ContractPlan &p, const ContractTask &t);
 
 }  // namespace itercc
 

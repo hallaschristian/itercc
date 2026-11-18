@@ -22,7 +22,10 @@ single-threaded contraction routes and its raw tile in that thread's caches.
 * Intermediates (the inner products of three- and four-operand diagrams) are
   shared between tiles through one cache keyed by their expression and the
   occupied indices they depend on; a tile waits for one that another thread
-  is computing.
+  is computing, and helps with it when it is large: its producer cuts the
+  contraction into the pieces of the threaded executor, which the waiting
+  tiles run too (the g T4 intermediates at CuF size, about 2e8 multiply-adds
+  each, were computed on one thread while dozens of tiles waited).
 * Each tile's gathers go to partial sums, added to the slot's rows in the
   order of the Python loop and divided by (4!)^2 as it does, so the action is
   the loop's bit for bit, on any number of threads.
@@ -613,7 +616,8 @@ class SlotProgram:
                                     **{name: arrays[name].ctypes.data for name in _ARRAYS})
         self._arrays = arrays
 
-    def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True):
+    def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,
+            share_work=0):
         """Add the projected rank-four slots into `result` (zero on entry: the
         slots' rows get the Python loop's values). Returns the intermediate
         cache statistics."""
@@ -630,7 +634,7 @@ class SlotProgram:
         if not (result.dtype == np.float64 and result.flags.c_contiguous):
             raise ValueError("The rank-four result must be a contiguous float64 array")
         nslots = self.nslots if slot_limit is None else min(int(slot_limit), self.nslots)
-        stats = np.zeros(4, dtype=np.int64)
+        stats = np.zeros(8, dtype=np.int64)
         # Waves hold as many partial sums as the intermediate cache holds
         # bytes (at least 256 MiB): larger waves let more tiles that share
         # intermediates run together.
@@ -639,7 +643,9 @@ class SlotProgram:
             ctypes.byref(self.struct), nslots, partial, pointers.ctypes.data,
             None if ground is None else ground.ctypes.data,
             None if direction is None else direction.ctypes.data,
-            result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads), int(bool(fused)))
+            result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads), int(bool(fused)),
+            int(share_work))
         if status != 0:
             raise RuntimeError(f"The compiled slot program failed (status {status})")
-        return dict(hits=int(stats[0]), misses=int(stats[1]), peak_bytes=int(stats[2]))
+        return dict(hits=int(stats[0]), misses=int(stats[1]), peak_bytes=int(stats[2]), shared=int(stats[3]),
+                    helped=int(stats[4]))

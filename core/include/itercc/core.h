@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 29
+#define ITERCC_CORE_ABI 30
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -668,8 +668,11 @@ typedef struct {
  * sums stay within partial_limit doubles (or one slot): every tile on one
  * thread (a wave's tiles in order of their occupied tuples, positions 2, 3,
  * 0, 1), then each slot's rows get its tiles' partial sums in order, divided
- * by (4!)^2. Intermediates are shared through a cache of cache_bytes; stats
- * gets its hits, misses and peak bytes. With `fused`, the products of a
+ * by (4!)^2. Intermediates are shared through a cache of cache_bytes, the
+ * pieces of those of at least share_work multiply-adds (0: 2^22) also with
+ * the tiles waiting for them (the same values whoever runs them); stats (five
+ * entries) gets the cache's hits, misses and peak bytes, the intermediates
+ * shared in pieces and the pieces run by waiting tiles. With `fused`, the products of a
  * fusion group run after the tile's other instructions as fused GEMMs, one
  * per block of output rows and columns (other sums, so other rounding);
  * without, every product runs in place, as the Python loop does. The results
@@ -677,7 +680,8 @@ typedef struct {
  * tile without a plan. */
 int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
                          const double *const *bases, const double *ground, const double *direction,
-                         double *result, int64_t cache_bytes, int64_t *stats, int threads, int fused);
+                         double *result, int64_t cache_bytes, int64_t *stats, int threads, int fused,
+                         int64_t share_work);
 /* Diagnostic thread seconds of itercc_triplet_slots by phase (with
  * ITERCC_SLOT_PROFILE=1): zeroing, products into tiles, into intermediates,
  * packed row setup, gathers, cache lookups and waits, slot sums. */

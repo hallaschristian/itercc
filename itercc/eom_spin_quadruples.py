@@ -182,6 +182,7 @@ class TripletEOMCCSDTQ:
         # Rank-four slots as one compiled program on the CPU (see _compiled_slots).
         self.slot_program = True
         self.fused_tiles = True
+        self.share_work = None
         self._slot_programs = {}
         if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
@@ -456,8 +457,11 @@ class TripletEOMCCSDTQ:
         # Fused tile products (other rounding); ITERCC_TRIPLET_FUSED=0 keeps
         # the loop's products, bit for bit.
         fused = self.fused_tiles and os.environ.get("ITERCC_TRIPLET_FUSED", "1") != "0"
+        # Intermediates of at least this many multiply-adds are computed in
+        # pieces that waiting tiles help with (0: the core's default, 2^22).
+        share = int(os.environ.get("ITERCC_SLOT_SHARE_WORK", self.share_work or 0))
         self._program_cache = program.run(blocks, self.amplitudes[3], direction, result, cache_bytes=cache,
-                                          threads=cpu_threads(), slot_limit=done, fused=fused)
+                                          threads=cpu_threads(), slot_limit=done, fused=fused, share_work=share)
         if packed_action is not None and done:
             # The direct packed terms of consecutive slots (windows follow each
             # other), at least 2^18 rows per call as in the loop.

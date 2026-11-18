@@ -499,6 +499,79 @@ void contract_serial(const ContractPlan &p, const int64_t *table, int64_t nblock
     }
 }
 
+void contract_tasks(const int64_t *table, int64_t nblocks, int64_t workers, std::vector<ContractTask> &tasks)
+{
+    static const i64 min_share = tuned("ITERCC_SYM_MIN_SHARE", kMinShare);
+    auto task = [](i64 kind, i64 route_of, i64 first, const Block &g) {
+        return ContractTask{kind, route_of, first, {g.rows, g.cols, g.depth, g.r0, g.c0, g.k0, g.a_base,
+                                                    g.b_base, g.o_base}};
+    };
+    i64 total = 0;
+    for (i64 g = 0; g < nblocks; ++g) {
+        const Block block = block_at(table, g);
+        const i64 parts = slices(block);
+        if (parts > 1) {
+            tasks.push_back(task(0, 0, parts, block));
+        } else if (skinny(block)) {
+            const i64 nlong = std::max(block.rows, block.cols);
+            for (i64 l = 0; l < nlong; l += kChunk) tasks.push_back(task(1, 0, l, block));
+        } else {
+            total += block.work();
+        }
+    }
+    // The grid pieces of itercc_sym_contract (run_contract below).
+    const i64 share = std::max<i64>(min_share, total / (kTasksPerThread * std::max<i64>(1, workers)));
+    for (i64 g = 0; g < nblocks; ++g) {
+        const Block block = block_at(table, g);
+        if (slices(block) > 1 || skinny(block)) continue;
+        const Route kind = route(block);
+        const i64 wanted = std::max<i64>(1, block.work() / share);
+        const i64 max_r = std::max<i64>(1, block.rows / kMinTask), max_c = std::max<i64>(1, block.cols / kMinTask);
+        i64 pr = 1, pc = 1;
+        while (pr * pc < wanted && (pr < max_r || pc < max_c)) {
+            const bool more_rows = pc >= max_c || (pr < max_r && block.rows * pc >= block.cols * pr);
+            if (more_rows)
+                ++pr;
+            else
+                ++pc;
+        }
+        for (i64 i = 0; i < pr; ++i)
+            for (i64 j = 0; j < pc; ++j) {
+                Block piece = block;
+                piece.r0 += block.rows * i / pr;
+                piece.rows = block.rows * (i + 1) / pr - block.rows * i / pr;
+                piece.c0 += block.cols * j / pc;
+                piece.cols = block.cols * (j + 1) / pc - block.cols * j / pc;
+                tasks.push_back(task(2, i64(kind), 0, piece));
+            }
+    }
+}
+
+void contract_task(const ContractPlan &p, const ContractTask &t)
+{
+    if (p.alpha == 0.0) return;
+    const Block g = block_at(t.block, 0);
+    if (t.kind == 0) {
+        split_block(p, g, t.first, 1);
+    } else if (t.kind == 1) {
+        const Skinny s = skinny_view(p, g);
+        skinny_chunk(p, s, t.first, std::min(s.nlong, t.first + kChunk), scratch(0).get(size_t(s.nshort * s.depth)),
+                     scratch(2).get(size_t(skinny_line(s))), scratch(1).get(size_t(s.nshort * kChunk)));
+    } else {
+        switch (Route(t.route)) {
+        case Route::loops:
+            loops_block(p, g);
+            break;
+        case Route::shallow:
+            shallow_block(p, g);
+            break;
+        case Route::gemm:
+            gemm_block(p, g);
+            break;
+        }
+    }
+}
+
 }  // namespace itercc
 
 extern "C" void itercc_scale(double *x, int64_t n, double beta, int threads)

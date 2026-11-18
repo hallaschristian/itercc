@@ -34,6 +34,12 @@
   ABI 29) instead of one parallel pass per diagram, derivative and
   permutation (144 at rank four), with the same results bit for bit: water
   cc-pVDZ triplet actions take 3.9 s instead of 4.3 s.
+- Large intermediates of the triplet slot program (at least 2^22
+  multiply-adds, such as the g-T4 products at CuF size) are computed in the
+  pieces of the threaded executor, and the tiles waiting for one run its
+  pieces with its producer instead of sleeping (core ABI 30). The pieces
+  write disjoint entries with the single-threaded arithmetic, so the action
+  is unchanged bit for bit; `ITERCC_SLOT_SHARE_WORK` sets the threshold.
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

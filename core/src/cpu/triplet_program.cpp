@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -103,9 +104,39 @@ Key key_of(const itercc_slot_intermediate &m, const int64_t *fixed)
     return key;
 }
 
+// A large intermediate in production (the g T4 products at CuF size: about
+// 2e8 multiply-adds each): the pieces of its contraction, which the tiles
+// waiting for it run alongside its producer instead of sleeping. The pieces
+// write disjoint entries with the arithmetic of contract_serial, so the
+// intermediate is the same whoever runs them.
+constexpr i64 kShareWork = i64(1) << 22;   // multiply-adds from which an intermediate is shared
+
+struct Job {
+    itercc::ContractPlan plan;
+    itercc::PackedRows rows{};
+    std::vector<itercc::ContractTask> tasks;
+    std::atomic<i64> next{0}, done{0};
+
+    bool open() const { return next.load(std::memory_order_relaxed) < i64(tasks.size()); }
+    i64 help()   // runs pieces until none is left; returns how many it ran
+    {
+        for (i64 ran = 0;; ++ran) {
+            const i64 t = next.fetch_add(1, std::memory_order_relaxed);
+            if (t >= i64(tasks.size())) return ran;
+            itercc::contract_task(plan, tasks[size_t(t)]);
+            done.fetch_add(1, std::memory_order_release);
+        }
+    }
+    void finish() const
+    {
+        while (done.load(std::memory_order_acquire) < i64(tasks.size())) std::this_thread::yield();
+    }
+};
+
 // Intermediates shared between tiles: one producer per key while the others
-// wait; finished buffers stay while they fit the byte budget (least recently
-// used out first). A buffer in use outlives its eviction.
+// wait (or help with its pieces); finished buffers stay while they fit the
+// byte budget (least recently used out first). A buffer in use outlives its
+// eviction.
 class Cache {
   public:
     explicit Cache(i64 budget) : budget_(budget) {}
@@ -127,8 +158,31 @@ class Cache {
                 lru_.splice(lru_.begin(), lru_, found->second.place);
                 return found->second.buffer;
             }
+            const std::shared_ptr<Job> job = found->second.job;
+            if (job && job->open()) {
+                lock.unlock();
+                {
+                    const Phase timing(2);
+                    helped_ += job->help();
+                }
+                lock.lock();
+                continue;
+            }
+            const Phase timing(5);
             ready_.wait(lock);
         }
+    }
+
+    // The pieces of an intermediate being produced, for the tiles that wait.
+    void attach(const Key &key, const std::shared_ptr<Job> &job)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++shared_;
+            auto found = map_.find(key);
+            if (found != map_.end()) found->second.job = job;
+        }
+        ready_.notify_all();
     }
 
     // The producer's buffer: kept when it fits the budget, else dropped (a
@@ -152,6 +206,7 @@ class Cache {
                 found->second.buffer = buffer;
                 found->second.ready = true;
                 found->second.place = lru_.begin();
+                found->second.job.reset();
                 bytes_ += bytes;
                 peak_ = std::max(peak_, bytes_);
             }
@@ -162,18 +217,22 @@ class Cache {
     i64 hits() const { return hits_; }
     i64 misses() const { return misses_; }
     i64 peak() const { return peak_; }
+    i64 shared() const { return shared_; }
+    i64 helped() const { return helped_.load(); }
 
   private:
     struct Entry {
         Buffer buffer;
         bool ready = false;
         std::list<Key>::iterator place;
+        std::shared_ptr<Job> job;   // its pieces while it is produced
     };
     std::mutex mutex_;
     std::condition_variable ready_;
     std::unordered_map<Key, Entry, KeyHash> map_;
     std::list<Key> lru_;   // finished entries, most recent first
-    i64 budget_, bytes_ = 0, peak_ = 0, hits_ = 0, misses_ = 0;
+    i64 budget_, bytes_ = 0, peak_ = 0, hits_ = 0, misses_ = 0, shared_ = 0;
+    std::atomic<i64> helped_{0};   // pieces run by tiles that waited
 };
 
 // A plan block of a fused product: its output block and where it came from.
@@ -288,7 +347,7 @@ void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, cons
 // intermediates they read stay bound) and run as fused GEMMs.
 void run_tile(const itercc_slot_program &p, const Tile &job, const double *const *bases,
               const double *const *vectors, Cache &cache, i64 cacheable, double *tile, Worker &w,
-              double *partial, bool fused)
+              double *partial, bool fused, int workers, i64 share_work)
 {
     const i64 nv = p.nv, nv4 = nv * nv * nv * nv;
     const itercc_slot_template &m = p.templates[job.tmpl];
@@ -312,11 +371,7 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
                 continue;
             }
             if (inters[k].size * i64(sizeof(double)) <= cacheable) {
-                Buffer hit;
-                {
-                    const Phase timing(5);
-                    hit = cache.acquire(key_of(inters[k], job.fixed));
-                }
+                Buffer hit = cache.acquire(key_of(inters[k], job.fixed));
                 if (hit) {
                     w.bound[k] = std::move(hit);
                     pc = x.next;
@@ -362,7 +417,25 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
         if (count > 0) {
             const Phase timing(x.out.kind == kInter ? 2 : 1);
             const double start = profiling ? omp_get_wtime() : 0.0;
-            itercc::contract_serial(plan, reinterpret_cast<const int64_t *>(tables[x.plan]), count);
+            const int64_t *table = reinterpret_cast<const int64_t *>(tables[x.plan]);
+            i64 work = 0;
+            if (x.out.kind == kInter && w.owner[size_t(x.out.index)] && workers > 1)
+                for (i64 g = 0; g < count; ++g) work += table[9 * g] * table[9 * g + 1] * table[9 * g + 2];
+            if (work >= share_work) {
+                // Shared with the tiles that wait for this intermediate.
+                auto shared = std::make_shared<Job>();
+                shared->plan = plan;
+                if (plan.packed_b != nullptr) {
+                    shared->rows = rows;
+                    shared->plan.packed_b = &shared->rows;
+                }
+                itercc::contract_tasks(table, count, workers, shared->tasks);
+                cache.attach(key_of(inters[size_t(x.out.index)], job.fixed), shared);
+                shared->help();
+                shared->finish();
+            } else {
+                itercc::contract_serial(plan, table, count);
+            }
             if (profiling && x.inter >= 0 && x.inter < kTimed) {
                 double old = contraction_time[x.inter].load(), add = omp_get_wtime() - start;
                 while (!contraction_time[x.inter].compare_exchange_weak(old, old + add)) {
@@ -453,8 +526,9 @@ bool slot_tiles(const itercc_slot_program &p, i64 s, i64 &at, std::vector<Tile> 
 extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
                                     const double *const *bases, const double *ground,
                                     const double *direction, double *result, int64_t cache_bytes,
-                                    int64_t *stats, int threads, int fused)
+                                    int64_t *stats, int threads, int fused, int64_t share_work)
 {
+    if (share_work <= 0) share_work = kShareWork;
     const i64 nv = p->nv, nv4 = nv * nv * nv * nv;
     threads = std::max(1, threads);
     std::vector<Tile> tiles;
@@ -519,7 +593,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
             for (i64 j = 0; j < ntiles; ++j) {
                 const Tile &job = tiles[size_t(order[size_t(j)])];
                 run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, partial.get() + job.partial,
-                         fused != 0);
+                         fused != 0, threads, share_work);
             }
 #pragma omp for schedule(dynamic, 1)
             for (i64 s = 0; s < nwave; ++s) {
@@ -534,6 +608,8 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
         stats[0] = cache.hits();
         stats[1] = cache.misses();
         stats[2] = cache.peak();
+        stats[3] = cache.shared();
+        stats[4] = cache.helped();
     }
     return 0;
 }
