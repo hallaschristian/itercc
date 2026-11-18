@@ -40,6 +40,9 @@
   pieces with its producer instead of sleeping (core ABI 30). The pieces
   write disjoint entries with the single-threaded arithmetic, so the action
   is unchanged bit for bit; `ITERCC_SLOT_SHARE_WORK` sets the threshold.
+  On the first 400 CuF slots (56 cores) this takes 145.5 s instead of
+  177.6 s with an 8 GiB cache and 128.5 s instead of 134.3 s with 32 GiB;
+  the 16-slot sample is slower (12.6 s instead of 10.7 s).
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

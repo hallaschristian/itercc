@@ -233,6 +233,26 @@ products into tiles 848, gathers 98, tile zeroing 77, of 9,945; with 32 GiB,
 2,128 and 884 for the first two. The g-T4 intermediates, each computed on one
 thread while other tiles wait for it, are now the largest cost.
 
+Shared intermediates (`97ce115`): a tile producing an intermediate of at
+least 2^22 multiply-adds cuts it into the pieces of the threaded executor,
+and tiles waiting for it run pieces too. Same allocation type, every output
+equal to the previous job's bit for bit (seconds, first action for 400
+slots, second for 16):
+
+| Case | Before (`d32cc04`) | Shared (`97ce115`) | Cache waits (thread s) |
+| --- | ---: | ---: | --- |
+| 400 slots, 8 GiB cache | 177.6 | 145.5 | 1,608 -> 61 |
+| 400 slots, 32 GiB cache | 134.3 | 128.5 | 884 -> 49 |
+| 16 slots fused, 8 GiB | 10.68 | 12.65 | 41 -> 3 |
+| 16 slots unfused, 8 GiB | 11.76 | 13.57 | 40 -> 2 |
+
+The longer sample gains where the cache is tight (0.36 s per slot instead of
+0.44); the 16-slot sample loses about 18%: 3,117 shared intermediates were
+cut into about 220 pieces each, producers wait for their last pieces, and
+the thread time of intermediates rose about 14% (3,287 -> 3,749 thread s at
+400 slots, 8 GiB). `ITERCC_SLOT_SHARE_WORK` raises the threshold (a very
+large value turns sharing off).
+
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 
 The blocked GEMMs now read packed T4 in place: a T4 operand is `SignedRows`
