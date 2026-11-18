@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 32
+CORE_ABI = 33
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -37,6 +37,8 @@ CPU_FUNCTIONS = {
                             _T, _P, _P, _P, _P, _P, _P, _D, _P, _T], None),
     "spin_quad_contract_terms": ([_I, _T, _P, _I, _I, _I, _P, _P, _T], None),
     "spin_quad_dense": ([_I, _P, _I, _I, _P, _P, _I, _P, _I, _P, _P, _T], None),
+    "spin_quad_opened": ([_P, _P, _I, _P, _P, _P, _T], None),
+    "spin_quad_opened_lower": ([_P, _P, _I, _P, _P, _P, _T], None),
     "triples_plane": ([_P, _I, _I, _P, _P, _P, _P, _P, _P, _T], None),
     "triples_seeds": ([_I, _I, _P, _T, _P, _P, _P, _P, _P, _T], None),
     "triples_scatter": ([_I, _I, _P, _P, _P, _P, _P, _T], None),

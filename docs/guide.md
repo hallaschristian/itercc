@@ -129,9 +129,10 @@ and canonical address maps are reused for the lifetime of the EOM engine.
 On the CPU the rank-four slots then run as one compiled program: every raw
 tile of an action on its own thread, intermediates shared between tiles
 through the cache (large ones computed in pieces that waiting tiles help
-with), and the direct packed T4 terms by contexts (each context's T4 values
-gathered once, the contexts of a symmetry class in one GEMM with their
-coefficient block). Tile products form only the entries their projection
+with), and the direct packed T4 terms by opened letters (for each tuple of
+the amplitude's occupied letters that come from the output row, the
+amplitude block gathered once per class of the row's other particles and
+one GEMM with the coefficient block; ranks two and three alike). Tile products form only the entries their projection
 reads (letters of each antisymmetric subset in increasing spin-orbital
 order), in ranks two and three among the occupied letters as well. Its waves
 of slots hold `partial_sums_gib` of partial sums (default: as much as the
@@ -287,6 +288,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TRIPLET_PROGRAM` | call | `0`: triplet EOM-CCSDTQ rank-four slots in the Python loop instead of the compiled program |
 | `ITERCC_TRIPLET_FUSED` | call | `0`: triplet slot program adds products into a tile one by one (the loop's action bit for bit) |
 | `ITERCC_DIRECT_DENSE` | call | `0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
+| `ITERCC_DIRECT_OPENED` | call | `0`: triplet rank-four direct packed T4 terms by contexts per output slot (`ITERCC_DIRECT_DENSE`) instead of one GEMM per hole tuple and class |
 | `ITERCC_SLOT_SHARE_WORK` | call | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
 | `ITERCC_SLOT_PROFILE` | core | `1`: slot-program phase timers (`itercc_triplet_profile`) |
 | `ITERCC_SLOT_SORT` | core | `0`: slot-program tiles in slot order (diagnostic) |

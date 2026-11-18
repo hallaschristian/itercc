@@ -291,7 +291,11 @@ class TripletEOMCCSDTQ:
             # half of what remains, the partial sums the other half).
             rows = max((len(p) for p in self._direction_t4.groups.values()), default=0)
             threads = _runtime.cpu_threads(self.cpu_threads)
-            self.estimated_dense_bytes += (threads * (8 * nv**4 + rows * (72 * 8 + 16 * 24))
+            # Direct terms by opened letters: five buffers of the output's
+            # rows (oooo ladders: six sets of hole positions) and per-thread
+            # amplitude and product blocks of one hole tuple.
+            self.estimated_dense_bytes += (threads * (8 * nv**4 + rows * (72 * 8 + 16 * 24 + 64 * 8))
+                                           + 5 * 8 * self._direction_t4.size
                                            + self._partial_bytes(self.intermediate_cache_bytes))
             if self.estimated_dense_bytes > self.memory_budget_bytes:
                 raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
@@ -372,16 +376,7 @@ class TripletEOMCCSDTQ:
             if self._compiled_slots(blocks, packed_direction, result, slot_limit, slot_finished, packed_action):
                 yield None, result
                 return
-            pending = []
-
-            def flush():
-                if pending:
-                    start, stop = pending[0][0], pending[-1][1]
-                    coordinates = (pending[0][2] if len(pending) == 1 else
-                                   np.concatenate([c for _, _, c in pending]))
-                    pending.clear()
-                    packed_action.add(rank, coordinates, result[start:stop])
-
+            processed = []              # slots whose direct packed terms follow at the end
             spin_groups = {}
             started = perf_counter() if slot_finished is not None else 0.
             total = len(self._direction_t4.slots)
@@ -393,7 +388,7 @@ class TripletEOMCCSDTQ:
                 if slot_limit is not None and index >= slot_limit:
                     break
                 if selected is not None and not selected[index]:
-                    continue        # pending direct terms flush at the gap in rows
+                    continue
                 if key not in spin_groups:
                     particles = self._direction_t4.groups[key]
                     signatures = particles % 2
@@ -404,24 +399,14 @@ class TripletEOMCCSDTQ:
                             groups.append((pspin, xp.asarray(mask), xp.asarray(particles[mask].T // 2)))
                     spin_groups[key] = groups
                 self._project_packed_tile(result[rows], holes, spin_groups[key], primal, tangent, intermediates)
-                if packed_action is not None:
-                    # Direct packed terms of consecutive slots go in one call:
-                    # each output row gets the same terms in the same order.
-                    if pending and pending[-1][1] != rows.start:
-                        flush()
-                    particles = self._direction_t4.groups[key]
-                    coordinates = np.empty((len(particles), 8), dtype=np.int32)
-                    coordinates[:, :4], coordinates[:, 4:] = particles, holes
-                    pending.append((rows.start, rows.stop, coordinates))
-                    if rows.stop - pending[0][0] >= 1 << 22:
-                        flush()
+                processed.append(index)
                 done = index + 1
                 if slot_finished is not None and (done in (1, 4, 16, total) or done % 64 == 0):
-                    flush()
                     if xp is not np:
                         xp.cuda.get_current_stream().synchronize()
                     slot_finished(done, total, perf_counter() - started)
-            flush()
+            if packed_action is not None:
+                packed_action.add_rank_four(result, processed)
             yield None, result
             return
         indices = space.indices[rank - 1]
@@ -524,29 +509,8 @@ class TripletEOMCCSDTQ:
                                           threads=cpu_threads(), slot_limit=done, fused=fused, share_work=share,
                                           progress=report, slots=chosen, partial_bytes=partial)
         if packed_action is not None and done:
-            # The direct packed terms of consecutive slots (windows follow each
-            # other), at least 2^22 rows per call: the dense kernel runs a
-            # call's slots in parallel (2^18 rows were 12 CuF slots for 56
-            # threads), and each row's sums do not depend on the chunks.
-            items = list(layout.slots.items())
-            slots = items[:done] if chosen is None else [items[i] for i in chosen]
-            following = (np.ones(done, dtype=bool) if chosen is None else
-                         np.r_[True, np.diff(chosen) == 1])        # rows follow the previous slot's
-            start = 0
-            while start < done:
-                stop, count = start, 0
-                while stop < done and count < 1 << 22 and (stop == start or following[stop]):
-                    count += len(layout.groups[slots[stop][1][0]])
-                    stop += 1
-                parts = []
-                for holes, (key, _) in slots[start:stop]:
-                    particles = layout.groups[key]
-                    coordinates = np.empty((len(particles), 8), dtype=np.int32)
-                    coordinates[:, :4], coordinates[:, 4:] = particles, holes
-                    parts.append(coordinates)
-                first, last = slots[start][1][1].start, slots[stop - 1][1][1].stop
-                packed_action.add(4, parts[0] if len(parts) == 1 else np.concatenate(parts), result[first:last])
-                start = stop
+            # The direct packed terms of these slots (`add_rank_four`).
+            packed_action.add_rank_four(result, np.arange(done) if chosen is None else chosen)
         return True
 
     def _project_lower_tiles(self, rank, tiles):
@@ -718,7 +682,7 @@ class TripletEOMCCSDTQ:
                         einsum_into(xp, result, coefficient, spec, *operands)
                 outputs.append(_antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])])
             if packed_action is not None and 1 < rank < 4 and not (self.lower_part or (0,))[0]:
-                packed_action.add(rank, self.space.indices[rank - 1].T, outputs[-1])
+                packed_action.add_lower(rank, outputs[-1])
             if rank_finished is not None:
                 if xp is not np:
                     xp.cuda.get_current_stream().synchronize()

@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 32
+#define ITERCC_CORE_ABI 33
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -118,6 +118,99 @@ void itercc_spin_quad_dense(int64_t count, const int32_t *coordinates, int64_t n
     const int64_t *occupied_irrep, const int64_t *virtual_irrep, int64_t nfamilies,
     const itercc_spin_quad_family *families, int64_t nterms, const itercc_spin_quad_dense_term *terms,
     double *out, int threads);
+
+/* The rank-four direct terms by opened letters (spin_quadruples.cpp). A
+ * family's coefficient W[x, s] takes kp external particles and kh external
+ * holes x and as many summed ones s (kp, kh <= 2); its amplitude holds the
+ * row's other particles B and holes J with the summed letters. For each hole
+ * tuple J (a unit, 4 - kh holes, increasing) and class of B,
+ *   Y[B, s] = T(B + s_p, J + s_h)   (signed: B increasing, then s_p; J, then s_h)
+ *   Z[x, B] = sum_s W[x, s] Y[B, s]  (one GEMM per class),
+ * and every row of every target slot J + x_h of this process adds
+ * sum_t coef_t Z[(row at alpha_t, x_h), row without alpha_t] over the terms
+ * whose x_h positions are beta_t. With kp = 0, B is the row itself and Y the
+ * source slots' rows (same particle group), so the GEMM reads T in place.
+ * A target slot's contributions with one set of x_h positions come from one
+ * unit, so they go to that set's buffer (the first set: straight into the
+ * output) and are added in order at the end: no output has two writers.
+ *
+ * Layout (output and groups, shared by every family of an action). */
+typedef struct {
+    int64_t no, nv;                       /* spin orbitals */
+    const int64_t *occupied_irrep, *virtual_irrep;   /* by spatial orbital */
+    int64_t spin_change, irrep;           /* of the output layout */
+    const int64_t *hole_map;              /* output: signed slot offset + 1 by hole four-sequence */
+    const int64_t *own;                   /* this process's slots: compact offset + 1 by four-sequence, else 0 */
+    const int64_t *key_of;                /* particle group by alpha count * 8 + irrep (40), -1: none */
+    const int64_t *group_start;           /* groups + 1, into particles */
+    const int32_t *particles;             /* each group's increasing particle tuples, four int32 each */
+    int64_t nown;                         /* this process's slots: */
+    const int64_t *own_full, *own_compact, *own_rows;   /* output offset, compact offset, rows */
+    int64_t buffer_rows;                  /* compact rows (the sum of own_rows) */
+} itercc_spin_quad_opened_layout;
+
+/* One family on one amplitude vector. Summed tuples s (s_p then s_h, four
+ * int32 each) are sorted by class (delta - class_min) * 8 + gamma (delta: s_p's
+ * alpha count minus s_h's; gamma: their irrep product); class c's external
+ * tuples x (x_p then x_h) are x[x_start[c]..], its block of W is
+ * weights[weight_offset[c]..] (rows x, columns s). x_row: flat x (x_p in
+ * base nv, then x_h in base no) -> row in its block, -1 if absent. B tables
+ * (kp >= 1): b_start (41: by alpha count * 8 + irrep) cuts the increasing
+ * (4 - kp)-tuples, b_index maps a flat tuple (base nv) to its index, and
+ * v_table[index * nv^kp + flat s_p] is the signed row + 1 of B + s_p in its
+ * particle group. Terms: positions of x_p in the row (term_alpha) and of x_h
+ * in the slot (term_beta), two int64 each, and coefficients. */
+typedef struct {
+    int64_t kp, kh;                       /* summed particles and holes */
+    int64_t xp, xh;                       /* external particles and holes (rank four: kp, kh) */
+    const int64_t *hole_map;              /* amplitude layout: signed slot offset + 1 */
+    const double *vector;                 /* amplitude values */
+    int64_t spin_change, irrep;           /* of the amplitude layout */
+    int64_t class_min, nclasses;
+    const int64_t *sigma_start;
+    const int32_t *sigma;
+    const int64_t *x_start;
+    const int32_t *x;
+    const int32_t *x_row;
+    const double *weights;
+    const int64_t *weight_offset;
+    const int64_t *b_start;
+    const int32_t *b_index;
+    const int32_t *v_table;
+    int64_t nterms;
+    const int64_t *term_alpha, *term_beta;
+    const double *term_coef;
+} itercc_spin_quad_opened_family;
+
+/* out (the output layout's packed rows) += one family's terms for the target
+ * slots in layout->own, units (four int32 each, the first 4 - kh used) as the
+ * hole tuples J. buffers: (C(4, kh) - 1) * buffer_rows doubles of scratch. */
+void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *layout,
+    const itercc_spin_quad_opened_family *family, int64_t nunits, const int32_t *units,
+    double *out, double *buffers, int threads);
+
+/* Rank `rank` (two or three) rows from the rank-four amplitude by opened
+ * letters: the same Z blocks, external and summed letters counted apart
+ * (rank - xp = 4 - kp, rank - xh = 4 - kh), added into particle-major rows: the row of
+ * particles p and holes h is part_offset[p] + hole_pos[h], p by its index in
+ * part_values (increasing rank-tuples sorted by class alpha count * 8 +
+ * irrep, cut by part_start), h by its flat index (base no). */
+typedef struct {
+    int64_t no, nv, rank;
+    const int64_t *occupied_irrep, *virtual_irrep;
+    int64_t spin_change, irrep;           /* particle class = hole class + (spin_change, irrep) */
+    int64_t rows;
+    const int64_t *part_start;            /* 41 */
+    const int32_t *part_values;           /* four int32 each, `rank` used */
+    const int64_t *part_offset;
+    const int64_t *hole_pos;              /* by flat increasing hole tuple, -1 if none */
+} itercc_spin_quad_opened_rows;
+
+/* out (one rank's rows) += one family's terms; units as in
+ * itercc_spin_quad_opened (4 - kh holes); buffers: (patterns - 1) * rows. */
+void itercc_spin_quad_opened_lower(const itercc_spin_quad_opened_rows *layout,
+    const itercc_spin_quad_opened_family *family, int64_t nunits, const int32_t *units,
+    double *out, double *buffers, int threads);
 
 /* Integral transformations (integrals.cpp, itercc.integrals.mo_eri). s4 (npair
  * x npair) from the row-packed lower triangle s8; out[b] (n x n, symmetric)

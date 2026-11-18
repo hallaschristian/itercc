@@ -5,6 +5,7 @@ terms retain the shared tile executor. The dense spin-orbital implementation
 stays independent.
 """
 from functools import lru_cache
+from itertools import combinations, permutations
 from math import factorial
 
 import numpy as np
@@ -137,6 +138,22 @@ def _pair_factor(pairs):
     return factor
 
 
+def opened_enabled():
+    """Rank-four direct terms by opened letters (itercc_spin_quad_opened)
+    unless ITERCC_DIRECT_OPENED=0 (then `dense_enabled` decides)."""
+    return _runtime.enabled("ITERCC_DIRECT_OPENED")
+
+
+def _order_sign(keys):
+    """The parity of sorting distinct `keys`: +1 or -1."""
+    sign = 1
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            if keys[i] > keys[j]:
+                sign = -sign
+    return sign
+
+
 def dense_enabled():
     """Rank-four direct terms by contexts (itercc_spin_quad_dense) unless
     ITERCC_DIRECT_DENSE=0 (then the sparse per-row lookups)."""
@@ -180,6 +197,16 @@ FAMILY = np.dtype([("virtual_map", _i8), ("virtual_key", _i8), ("hole_map", _i8)
                    ("n_ext", _i8)])
 DENSE_TERM = np.dtype([("family", _i8), ("nexternal", _i8), ("external_axes", _i8, 4),
                        ("external_strides", _i8, 4), ("amplitude_axes", _i8, 8), ("alpha", np.float64)])
+OPENED_LAYOUT = np.dtype([(name, _i8) for name in (
+    "no", "nv", "occupied_irrep", "virtual_irrep", "spin_change", "irrep", "hole_map", "own", "key_of",
+    "group_start", "particles", "nown", "own_full", "own_compact", "own_rows", "buffer_rows")])
+OPENED_FAMILY = np.dtype([(name, _i8) for name in (
+    "kp", "kh", "xp", "xh", "hole_map", "vector", "spin_change", "irrep", "class_min", "nclasses", "sigma_start", "sigma",
+    "x_start", "x", "x_row", "weights", "weight_offset", "b_start", "b_index", "v_table", "nterms",
+    "term_alpha", "term_beta", "term_coef")])
+OPENED_ROWS = np.dtype([(name, _i8) for name in (
+    "no", "nv", "rank", "occupied_irrep", "virtual_irrep", "spin_change", "irrep", "rows", "part_start",
+    "part_values", "part_offset", "hole_pos")])
 TERM = np.dtype([("virtual_map", _i8), ("virtual_key", _i8), ("hole_map", _i8), ("hole_key", _i8),
                  ("packed", _i8), ("nexternal", _i8), ("external_axes", _i8, 8),
                  ("external_extents", _i8, 8), ("amplitude_axes", _i8, 8), ("starts", _i8),
@@ -358,6 +385,367 @@ class PackedBinaryAction:
                                 occupied.ctypes.data, virtual.ctypes.data, len(family_table),
                                 family_table.ctypes.data, len(term_table), term_table.ctypes.data,
                                 result.ctypes.data, cpu_threads(None))
+
+    def add_rank_four(self, result, slots):
+        """The rank-four direct terms of the output slots `slots` (indices of
+        the direction layout's slots, increasing) added into `result`, the
+        whole packed R4: one GEMM per hole tuple and class
+        (itercc_spin_quad_opened), else by contexts per output slot or by
+        per-row lookups (`add`) in runs of consecutive slots."""
+        engine = self.engine
+        layout = engine._direction_t4
+        slots = np.asarray(slots, dtype=np.int64)
+        if not len(slots):
+            return
+        if opened_enabled() and self._add_opened(result, slots):
+            return
+        # The direct packed terms of consecutive slots (windows follow each
+        # other), at least 2^22 rows per call: the dense kernel runs a call's
+        # slots in parallel (2^18 rows were 12 CuF slots for 56 threads), and
+        # each row's sums do not depend on the chunks.
+        items = list(layout.slots.items())
+        chosen = [items[i] for i in slots]
+        following = np.r_[True, np.diff(slots) == 1]          # rows follow the previous slot's
+        done, start = len(chosen), 0
+        while start < done:
+            stop, count = start, 0
+            while stop < done and count < 1 << 22 and (stop == start or following[stop]):
+                count += len(layout.groups[chosen[stop][1][0]])
+                stop += 1
+            parts = []
+            for holes, (key, _) in chosen[start:stop]:
+                particles = layout.groups[key]
+                coordinates = np.empty((len(particles), 8), dtype=np.int32)
+                coordinates[:, :4], coordinates[:, 4:] = particles, holes
+                parts.append(coordinates)
+            first, last = chosen[start][1][1].start, chosen[stop - 1][1][1].stop
+            self.add(4, parts[0] if len(parts) == 1 else np.concatenate(parts), result[first:last])
+            start = stop
+
+    def _opened_particles(self, kp):
+        """B tables of `kp` opened particles (see itercc_spin_quad_opened): the
+        increasing (4 - kp)-tuples of virtual spin orbitals sorted by class
+        (alpha count * 8 + irrep), their starts, the index of each flat tuple,
+        and the signed row + 1 of B followed by each flat s_p in its particle
+        group. Kept on the engine (the virtual maps are shared)."""
+        engine = self.engine
+        cache = engine.__dict__.setdefault("_opened_particles", {})
+        if kp in cache:
+            return cache[kp]
+        nv = 2 * engine.nvir
+        virtual = np.asarray(engine._spatial_labels["v"], dtype=np.int64)
+        tuples = np.array(list(combinations(range(nv), 4 - kp)), dtype=np.int64).reshape(-1, 4 - kp)
+        classes = (tuples % 2 == 0).sum(axis=1) * 8 + np.bitwise_xor.reduce(virtual[tuples // 2], axis=1)
+        order = np.argsort(classes, kind="stable")
+        tuples, classes = tuples[order], classes[order]
+        b_start = np.r_[0, np.cumsum(np.bincount(classes, minlength=40))].astype(np.int64)
+        flat = np.ravel_multi_index(tuples.T, (nv,) * (4 - kp)).astype(np.int64)
+        b_index = np.full(nv ** (4 - kp), -1, dtype=np.int32)
+        b_index[flat] = np.arange(len(tuples), dtype=np.int32)
+        virtual_map = self._maps(1).virtual_map
+        v_table = np.ascontiguousarray(
+            virtual_map[flat[:, None] * nv**kp + np.arange(nv**kp, dtype=np.int64)[None, :]], dtype=np.int32)
+        values = np.zeros((len(tuples), 4), dtype=np.int32)
+        values[:, :4 - kp] = tuples
+        cache[kp] = b_start, b_index, v_table, values
+        return cache[kp]
+
+    def _opened_layout(self, slots):
+        """The output side of itercc_spin_quad_opened for the target `slots`
+        (kept on the engine for the last set of slots)."""
+        engine = self.engine
+        layout = engine._direction_t4
+        kept = engine.__dict__.get("_opened_layout")
+        if kept is not None and np.array_equal(kept[0], slots):
+            return kept[1]
+        no = 2 * engine.nocc
+        groups = engine.__dict__.get("_opened_groups")
+        if groups is None:
+            keys = sorted(layout.groups)
+            key_of = np.full(40, -1, dtype=np.int64)
+            for i, (alpha, irrep) in enumerate(keys):
+                key_of[alpha * 8 + irrep] = i
+            group_start = np.r_[0, np.cumsum([len(layout.groups[k]) for k in keys])].astype(np.int64)
+            particles = np.ascontiguousarray(np.concatenate([layout.groups[k] for k in keys]), dtype=np.int32)
+            groups = engine._opened_groups = key_of, group_start, particles
+        key_of, group_start, particles = groups
+        items = list(layout.slots.items())
+        holes = np.array([items[i][0] for i in slots], dtype=np.int64).reshape(-1, 4)
+        full = np.array([items[i][1][1].start for i in slots], dtype=np.int64)
+        rows = np.array([items[i][1][1].stop - items[i][1][1].start for i in slots], dtype=np.int64)
+        compact = np.r_[0, np.cumsum(rows)[:-1]].astype(np.int64)
+        own = np.zeros(no**4, dtype=np.int64)
+        for order in permutations(range(4)):
+            own[np.ravel_multi_index(holes[:, order].T, (no,) * 4)] = compact + 1
+        units = np.ascontiguousarray(holes, dtype=np.int32)
+        occupied = np.ascontiguousarray(engine._spatial_labels["o"], dtype=np.int64)
+        virtual = np.ascontiguousarray(engine._spatial_labels["v"], dtype=np.int64)
+        struct = np.zeros(1, dtype=OPENED_LAYOUT)
+        maps = self._maps(1)
+        values = dict(no=no, nv=2 * engine.nvir, occupied_irrep=occupied.ctypes.data,
+                      virtual_irrep=virtual.ctypes.data, spin_change=layout.spin_change, irrep=layout.irrep,
+                      hole_map=maps.hole_map.ctypes.data, own=own.ctypes.data, key_of=key_of.ctypes.data,
+                      group_start=group_start.ctypes.data, particles=particles.ctypes.data, nown=len(slots),
+                      own_full=full.ctypes.data, own_compact=compact.ctypes.data, own_rows=rows.ctypes.data,
+                      buffer_rows=int(rows.sum()))
+        for name, value in values.items():
+            struct[name] = value
+        # The arrays stay alive with the struct.
+        built = dict(struct=struct, units=units, keep=(own, full, rows, compact, occupied, virtual, maps),
+                     buffer_rows=int(rows.sum()))
+        engine._opened_layout = (np.array(slots, copy=True), built)
+        return built
+
+    def _opened_tables(self, rank, number, derivative, equivalent, labels, amplitude, output, pairs, members):
+        """Class tables of a merged coefficient of `rank` for
+        itercc_spin_quad_opened(_lower) (None: no coefficient; False: not of
+        the opened form). The ground-state ones (derivative 1) are kept on
+        the engine."""
+        key = "opened", rank, number, derivative
+        engine = self.engine
+        kept = engine.__dict__.setdefault("_packed_merged_rows", {}) if derivative == 1 else self.rows
+        if key in kept:
+            return kept[key]
+        internal = [c for c in labels if c not in output]
+        external = [c for c in labels if c in output]
+        particle = [amplitude.index(c) < 4 for c in internal]
+        kp, kh = sum(particle), len(internal) - sum(particle)
+        outer = [output.index(c) < rank for c in external]
+        xp, xh = sum(outer), len(outer) - sum(outer)
+        if (max(kp, kh, xp, xh) > 2 or outer != sorted(outer, reverse=True)
+                or rank - xp != 4 - kp or rank - xh != 4 - kh or (rank == 4 and (xp, xh) != (kp, kh))):
+            kept[key] = False
+            return False
+        tensor = self._merged_tensor(derivative, members)
+        if tensor is None:
+            kept[key] = None
+            return None
+        occupied = np.asarray(engine._spatial_labels["o"], dtype=np.int64)
+        virtual = np.asarray(engine._spatial_labels["v"], dtype=np.int64)
+        target = engine._direction_t4
+        source = (engine._ground_t4, engine._direction_t4)[derivative]
+        factor = _pair_factor(pairs)
+        # Terms: positions of the external letters, and coefficients with the
+        # sign that brings the amplitude to (context increasing, summed letters).
+        merged = {}
+        for (p, sp), (h, sh) in _permutation_pairs(rank, equivalent):
+            positions = p + tuple(rank + i for i in h)
+            axes = [positions[output.index(c)] for c in external]
+            alpha = tuple(a for a in axes if a < rank)
+            beta = tuple(a - rank for a in axes if a >= rank)
+            amp = [positions[output.index(c)] if c in output else -1 - internal.index(c) for c in amplitude]
+            signs = [_order_sign([(0, a) if a >= 0 else (1, -1 - a) for a in half]) for half in (amp[:4], amp[4:])]
+            merged[alpha, beta] = merged.get((alpha, beta), 0.0) + (
+                factor * sp * sh / factorial(rank)**2 * signs[0] * signs[1])
+        terms = [(alpha, beta, coef) for (alpha, beta), coef in merged.items() if coef != 0.0]
+        term_alpha = np.zeros((max(len(terms), 1), 2), dtype=np.int64)
+        term_beta = np.zeros((max(len(terms), 1), 2), dtype=np.int64)
+        for t, (alpha, beta, _) in enumerate(terms):
+            term_alpha[t, :len(alpha)], term_beta[t, :len(beta)] = alpha, beta
+        term_coef = np.array([coef for _, _, coef in terms], dtype=np.float64)
+        # Summed tuples by class, particles first.
+        n_ext = int(np.prod(tensor.shape[:len(external)]))
+        dims = tensor.shape[len(external):]
+        tuples = np.stack(np.meshgrid(*(np.arange(d) for d in dims), indexing="ij"), axis=-1).reshape(-1, len(dims))
+        keep = np.ones(len(tuples), dtype=bool)
+        for pair in pairs:
+            columns = [internal.index(c) for c in pair]
+            for a, b in zip(columns, columns[1:]):
+                keep &= tuples[:, a] < tuples[:, b]
+        flat = np.flatnonzero(keep)
+        tuples = tuples[keep]
+        delta = np.zeros(len(tuples), dtype=np.int64)
+        gamma = np.zeros(len(tuples), dtype=np.int64)
+        for column, is_particle in enumerate(particle):
+            alphas = (tuples[:, column] % 2 == 0).astype(np.int64)
+            delta += alphas if is_particle else -alphas
+            gamma ^= (virtual if is_particle else occupied)[tuples[:, column] // 2]
+        class_min, nclasses = -kh, (len(internal) + 1) * 8
+        classes = (delta - class_min) * 8 + gamma
+        order = np.argsort(classes, kind="stable")
+        sigma_start = np.r_[0, np.cumsum(np.bincount(classes, minlength=nclasses))].astype(np.int64)
+        columns = ([i for i in range(len(internal)) if particle[i]]
+                   + [i for i in range(len(internal)) if not particle[i]])
+        sigma = np.zeros((len(tuples), 4), dtype=np.int32)
+        sigma[:, :len(internal)] = tuples[order][:, columns]
+        sigma_flat = flat[order]
+        # External tuples (particles first): distinct, increasing where every
+        # term takes them increasing, paired with the summed class they meet.
+        grid = (np.stack(np.meshgrid(*(np.arange(d) for d in tensor.shape[:len(external)]), indexing="ij"),
+                         axis=-1).reshape(-1, len(external)) if external else np.zeros((1, 0), dtype=np.int64))
+        valid = np.ones(len(grid), dtype=bool)
+        for first, size, index in ((0, xp, 0), (xp, xh, 1)):
+            if size == 2:
+                increasing = all(term[index][0] < term[index][1] for term in terms)
+                valid &= grid[:, first] < grid[:, first + 1] if increasing else grid[:, first] != grid[:, first + 1]
+        dx = np.zeros(len(grid), dtype=np.int64)
+        gx = np.zeros(len(grid), dtype=np.int64)
+        for column in range(len(external)):
+            alphas = (grid[:, column] % 2 == 0).astype(np.int64)
+            is_particle = column < xp
+            dx += alphas if is_particle else -alphas
+            gx ^= (virtual if is_particle else occupied)[grid[:, column] // 2]
+        ds = dx - (target.spin_change - source.spin_change)
+        gs = gx ^ target.irrep ^ source.irrep
+        paired = (ds - class_min) * 8 + gs
+        valid &= (ds >= class_min) & (paired < nclasses)
+        x_flat = np.flatnonzero(valid)
+        x_class = paired[valid]
+        order = np.argsort(x_class, kind="stable")
+        x_flat, x_class = x_flat[order], x_class[order]
+        x_start = np.r_[0, np.cumsum(np.bincount(x_class, minlength=nclasses))].astype(np.int64)
+        x = np.zeros((len(x_flat), 4), dtype=np.int32)
+        x[:, :len(external)] = grid[x_flat]
+        x_row = np.full(n_ext, -1, dtype=np.int32)
+        x_row[x_flat] = np.arange(len(x_flat)) - x_start[x_class]
+        matrix = tensor.reshape(n_ext, -1)
+        blocks, offsets, at = [], [], 0
+        for c in range(nclasses):
+            block = np.ascontiguousarray(matrix[np.ix_(x_flat[x_start[c]:x_start[c + 1]],
+                                                       sigma_flat[sigma_start[c]:sigma_start[c + 1]])])
+            offsets.append(at)
+            blocks.append(block.reshape(-1))
+            at += block.size
+        weights = np.ascontiguousarray(np.concatenate(blocks)) if at else np.zeros(1)
+        b_start, b_index, v_table, _ = self._opened_particles(kp) if kp else (
+            np.zeros(41, dtype=np.int64), np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32), None)
+        tables = dict(kp=kp, kh=kh, xp=xp, xh=xh, source=source, class_min=class_min, nclasses=nclasses,
+                      arrays=(sigma_start, sigma, x_start, x, x_row, weights,
+                              np.asarray(offsets, dtype=np.int64), b_start, b_index, v_table,
+                              term_alpha, term_beta, term_coef))
+        kept[key] = tables
+        return tables
+
+    def _opened_units(self, kh):
+        """Hole tuples J of (4 - kh) increasing occupied spin orbitals."""
+        cache = self.engine.__dict__.setdefault("_opened_units", {})
+        if kh not in cache:
+            tuples = np.array(list(combinations(range(2 * self.engine.nocc), 4 - kh)), dtype=np.int32)
+            units = np.zeros((len(tuples), 4), dtype=np.int32)
+            units[:, :4 - kh] = tuples.reshape(len(tuples), 4 - kh)
+            cache[kh] = units
+        return cache[kh]
+
+    def _add_opened(self, result, slots):
+        """itercc_spin_quad_opened for every rank-four family (False: a family
+        is not of the opened form; nothing is added then)."""
+        families = []
+        for number, (equivalent, labels, amplitude, output, pairs, members) in enumerate(merged_diagrams(4)):
+            for derivative in range(2):
+                if self.vectors[derivative] is None:
+                    continue
+                tables = self._opened_tables(4, number, derivative, equivalent, labels, amplitude, output,
+                                             pairs, members)
+                if tables is False:
+                    return False
+                if tables is not None:
+                    families.append((derivative, tables))
+        if not families:
+            return True
+        library = _cpu_kernels.library()
+        built = self._opened_layout(slots)
+        engine = self.engine
+        need = max((3 if t["kh"] == 1 else 5 if t["kh"] == 2 else 0) for _, t in families) * built["buffer_rows"]
+        buffers = engine.__dict__.get("_opened_buffers")
+        if buffers is None or buffers.size < max(need, 1):
+            buffers = engine._opened_buffers = None
+            buffers = engine._opened_buffers = np.empty(max(need, 1))
+        threads = cpu_threads(None)
+        for derivative, tables in families:
+            struct = self._opened_struct(derivative, tables)
+            units = built["units"] if tables["kh"] == 0 else self._opened_units(tables["kh"])
+            library.spin_quad_opened(built["struct"].ctypes.data, struct.ctypes.data, len(units),
+                                     units.ctypes.data, result.ctypes.data, buffers.ctypes.data, threads)
+        return True
+
+    def _opened_struct(self, derivative, tables):
+        """The itercc_spin_quad_opened_family of a family's tables on this
+        action's vector (the tables keep the arrays alive)."""
+        (sigma_start, sigma, x_start, x, x_row, weights, offsets, b_start, b_index, v_table,
+         term_alpha, term_beta, term_coef) = tables["arrays"]
+        maps = self._maps(derivative)
+        vector = self.vectors[derivative]
+        struct = np.zeros(1, dtype=OPENED_FAMILY)
+        values = dict(kp=tables["kp"], kh=tables["kh"], xp=tables["xp"], xh=tables["xh"],
+                      hole_map=maps.hole_map.ctypes.data,
+                      vector=vector.ctypes.data, spin_change=tables["source"].spin_change,
+                      irrep=tables["source"].irrep, class_min=tables["class_min"],
+                      nclasses=tables["nclasses"], sigma_start=sigma_start.ctypes.data,
+                      sigma=sigma.ctypes.data, x_start=x_start.ctypes.data, x=x.ctypes.data,
+                      x_row=x_row.ctypes.data, weights=weights.ctypes.data, weight_offset=offsets.ctypes.data,
+                      b_start=b_start.ctypes.data, b_index=b_index.ctypes.data, v_table=v_table.ctypes.data,
+                      nterms=len(term_coef), term_alpha=term_alpha.ctypes.data,
+                      term_beta=term_beta.ctypes.data, term_coef=term_coef.ctypes.data)
+        for name, value in values.items():
+            struct[name] = value
+        return struct
+
+    def _opened_rows(self, rank):
+        """The particle-major rows of `rank` (two or three) for
+        itercc_spin_quad_opened_lower, kept on the engine."""
+        engine = self.engine
+        cache = engine.__dict__.setdefault("_opened_rows", {})
+        if rank in cache:
+            return cache[rank]
+        no, nv = 2 * engine.nocc, 2 * engine.nvir
+        indices = np.asarray(engine.space.indices[rank - 1])
+        part_start, _, _, part_values = self._opened_particles(4 - rank)
+        rows = indices.shape[1]
+        particles = np.ravel_multi_index(indices[:rank].astype(np.int64), (nv,) * rank)
+        holes = np.ravel_multi_index(indices[rank:].astype(np.int64), (no,) * rank)
+        first = np.full(nv**rank, -1, dtype=np.int64)
+        unique, start = np.unique(particles, return_index=True)
+        first[unique] = start
+        hole_pos = np.full(no**rank, -1, dtype=np.int64)
+        hole_pos[holes] = np.arange(rows) - first[particles]
+        part_offset = first[np.ravel_multi_index(part_values[:, :rank].T.astype(np.int64), (nv,) * rank)]
+        occupied = np.ascontiguousarray(engine._spatial_labels["o"], dtype=np.int64)
+        virtual = np.ascontiguousarray(engine._spatial_labels["v"], dtype=np.int64)
+        struct = np.zeros(1, dtype=OPENED_ROWS)
+        values = dict(no=no, nv=nv, rank=rank, occupied_irrep=occupied.ctypes.data,
+                      virtual_irrep=virtual.ctypes.data, spin_change=engine._direction_t4.spin_change,
+                      irrep=engine._direction_t4.irrep, rows=rows, part_start=part_start.ctypes.data,
+                      part_values=part_values.ctypes.data, part_offset=part_offset.ctypes.data,
+                      hole_pos=hole_pos.ctypes.data)
+        for name, value in values.items():
+            struct[name] = value
+        cache[rank] = dict(struct=struct, rows=rows, keep=(part_offset, hole_pos, occupied, virtual, part_values))
+        return cache[rank]
+
+    def add_lower(self, rank, out):
+        """The direct packed terms of rank two or three into `out` (that
+        rank's canonical rows): by opened letters (itercc_spin_quad_opened_lower)
+        unless ITERCC_DIRECT_OPENED=0 or a family is not of that form, else by
+        per-row lookups (`add`)."""
+        if opened_enabled() and self._add_opened_lower(rank, out):
+            return
+        self.add(rank, self.engine.space.indices[rank - 1].T, out)
+
+    def _add_opened_lower(self, rank, out):
+        families = []
+        for number, (equivalent, labels, amplitude, output, pairs, members) in enumerate(merged_diagrams(rank)):
+            for derivative in range(2):
+                if self.vectors[derivative] is None:
+                    continue
+                tables = self._opened_tables(rank, number, derivative, equivalent, labels, amplitude, output,
+                                             pairs, members)
+                if tables is False:
+                    return False
+                if tables is not None:
+                    families.append((derivative, tables))
+        if not families:
+            return True
+        library = _cpu_kernels.library()
+        layout = self._opened_rows(rank)
+        patterns = max({0: 1, 1: rank, 2: rank * (rank - 1) // 2}[t["xh"]] for _, t in families)
+        buffers = np.empty(max((patterns - 1) * layout["rows"], 1))
+        threads = cpu_threads(None)
+        for derivative, tables in families:
+            struct = self._opened_struct(derivative, tables)
+            units = self._opened_units(tables["kh"])
+            library.spin_quad_opened_lower(layout["struct"].ctypes.data, struct.ctypes.data, len(units),
+                                           units.ctypes.data, out.ctypes.data, buffers.ctypes.data, threads)
+        return True
 
     def add(self, rank, coordinates, result):
         engine = self.engine

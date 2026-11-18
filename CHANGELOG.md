@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Triplet direct packed T4 terms by opened letters (`itercc_spin_quad_opened`,
+  `itercc_spin_quad_opened_lower`, core ABI 33). A family's coefficient takes
+  external particles and holes x and summed ones s; its amplitude holds the
+  row's other particles B and holes J with the summed letters. For each hole
+  tuple J the amplitude block Y[B, s] = T(B + s_p, J + s_h) is gathered once
+  per class of B (through precomputed particle-row tables and the slots
+  J + s_h), multiplied with the coefficient block in one GEMM, Z[x, B], and
+  every output row with holes J + x_h adds its terms' entries of Z. Before,
+  every output slot gathered the same blocks again (a ring context was
+  shared by about 20 slots) through two address-map lookups per entry. With
+  no summed particle (Fock-oo, oooo ladders) B is the row itself and the GEMM
+  reads the amplitude slots in place. A slot's contributions with one set of
+  external hole positions come from one hole tuple, so they go to that
+  set's buffer and are added in order: no output has two writers, and the
+  action does not depend on the thread count or on how slots are split
+  between processes. Ranks two and three use the same blocks with their
+  particle-major rows. Direct terms of an action: water cc-pVDZ 0.239 ->
+  0.062 s (rank four), 6o/24v synthetic 5.93 -> 0.65 s (rank four) and
+  3.14 -> 0.44 s (rank three), within 1.2e-15 of the contexts and lookups.
+  `ITERCC_DIRECT_OPENED=0` restores them.
 - Triplet EOM-CCSDTQ ranks two and three by projection groups: each group's
   raw tiles hold only its diagrams and are formed only where the letters of
   each antisymmetric subset, particles and holes alike (their occupied axes

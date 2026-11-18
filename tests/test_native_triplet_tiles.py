@@ -124,6 +124,7 @@ def test_dense_direct_terms_match_the_sparse_lookups(monkeypatch):
     from itercc._cpu_triples import thread_scope
     engine = _triplet_engine(packed_spin=True, intermediate_cache_gib=0.0001)
     vector = np.random.default_rng(739).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_DIRECT_OPENED", "0")
     monkeypatch.setenv("ITERCC_DIRECT_DENSE", "0")
     sparse = engine.sigma(vector)
     monkeypatch.setenv("ITERCC_DIRECT_DENSE", "1")
@@ -133,6 +134,49 @@ def test_dense_direct_terms_match_the_sparse_lookups(monkeypatch):
             images.append(engine._action(vector))
     np.testing.assert_array_equal(images[0], images[1])
     np.testing.assert_allclose(images[0], sparse, rtol=1e-12, atol=1e-13 * np.abs(sparse).max())
+
+
+@pytest.mark.parametrize("irrep", [0, 2])
+def test_opened_direct_terms_match_the_contexts(monkeypatch, irrep):
+    """Rank-four direct packed terms by opened letters (per hole tuple J and
+    class, the amplitude block gathered once and one GEMM with the coefficient
+    block; itercc_spin_quad_opened) give the contexts' action to round-off,
+    bit for bit on any number of threads, and per set of target slots."""
+    from itercc import TripletEOMCCSDTQ
+    from itercc._cpu_symmetry_blocks import CpuSymmetryBlocks
+    from itercc._cpu_triples import thread_scope
+    from test_quadruples import warm_amplitudes, symmetric_model
+    labels = np.array([0, 1, 2, 0, 1, 2, 3])
+    solver, amplitudes = warm_amplitudes(symmetric_model(labels, no=3), evaluations=2, backend="cpu")
+    engine = TripletEOMCCSDTQ(solver, amplitudes, labels, irrep, occupied_tiles=True, packed_spin=True,
+                             intermediate_cache_gib=0.0001)
+    if not isinstance(engine._symmetry_engine, CpuSymmetryBlocks):
+        pytest.skip("compiled core unavailable")
+    vector = np.random.default_rng(755).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_DIRECT_OPENED", "0")
+    contexts = engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_DIRECT_OPENED", "1")
+    images = []
+    for threads in (1, 3):
+        with thread_scope(threads):
+            images.append(engine._action(vector))
+    np.testing.assert_array_equal(images[0], images[1])
+    np.testing.assert_allclose(images[0], contexts, rtol=1e-12, atol=1e-13 * np.abs(contexts).max())
+    monkeypatch.setenv("ITERCC_DIRECT_OPENED", "0")
+    lookups = engine._action(vector, ranks=(2, 3))
+    monkeypatch.setenv("ITERCC_DIRECT_OPENED", "1")
+    lower = engine._action(vector, ranks=(2, 3))         # ranks two and three by opened letters too
+    np.testing.assert_allclose(lower, lookups, rtol=1e-12, atol=1e-13 * np.abs(lookups).max())
+    with thread_scope(3):
+        np.testing.assert_array_equal(engine._action(vector, ranks=(2, 3)), lower)
+    total = len(engine._direction_t4.slots)
+    rows = engine.space.slices[3]
+    summed = np.zeros(rows.stop - rows.start)
+    for part in (np.arange(0, total, 2), np.arange(1, total, 2)):
+        engine.rank_four_slots = part
+        summed += engine._action(vector, ranks=(4,))
+    engine.rank_four_slots = None
+    assert np.array_equal(summed, images[0][rows])
 
 
 def _split_engine():

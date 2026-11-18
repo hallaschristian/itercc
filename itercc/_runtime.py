@@ -84,6 +84,9 @@ SWITCHES = {
         "action bit for bit)"),
     "ITERCC_DIRECT_DENSE": Switch(
         "1", "call", "`0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts"),
+    "ITERCC_DIRECT_OPENED": Switch(
+        "1", "call", "`0`: triplet rank-four direct packed T4 terms by contexts per output slot "
+        "(`ITERCC_DIRECT_DENSE`) instead of one GEMM per hole tuple and class"),
     "ITERCC_SLOT_SHARE_WORK": Switch(
         "", "call", "multiply-adds from which a slot-program intermediate is computed in shared "
         "pieces (default 2^22)"),
