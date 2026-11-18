@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Triplet slot-program intermediates are formed only where they are read.
+  A tile product forms only the entries its projection reads, so it reads an
+  operand only where the constraints among the operand's letters that are
+  also output letters hold; an intermediate (one template, shared by tiles
+  of every kind through the cache) now keeps the constraints all its readers
+  share, found from the tile products down through nested intermediates
+  (`SlotProgram._order_intermediates`). The g T4 products of the rings
+  (`mnef,bcdfklmn->bcdekl`, read only at b < c < d) shrink six-fold. 6o/24v
+  synthetic model, 12 threads: rank four 77.7 -> 47.8 s (intermediates 565
+  -> 168 thread-s), action within 1.5e-16; on the CuF layout the modelled
+  intermediates of half an action fall to 1.6e12 multiply-adds at a 192 GiB
+  cache. `ITERCC_ORDERED_INTERMEDIATES=0` forms them whole.
 - Davidson (`itercc.krylov.davidson`) pads its first space with unit vectors
   of the lowest diagonal only when the guesses do not cover every root. A
   restart from saved Ritz vectors then starts from them alone: orthogonalized

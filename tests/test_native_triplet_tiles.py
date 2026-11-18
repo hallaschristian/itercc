@@ -260,6 +260,27 @@ def test_grouped_ordered_lower_ranks_keep_the_action(monkeypatch):
     np.testing.assert_allclose(grouped, whole, rtol=1e-13, atol=1e-13 * np.abs(whole).max())
 
 
+def test_intermediates_are_formed_only_where_read(monkeypatch):
+    """Slot-program intermediates keep the ordering constraints every product
+    reading them shares (`SlotProgram._order_intermediates`): some are
+    formed in part, and the action is the one with whole intermediates."""
+    from itercc import _spin_quadruples_program as sp
+
+    engine = _split_engine()
+    vector = np.random.default_rng(757).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_ORDERED_INTERMEDIATES", "0")
+    engine._slot_programs = {}
+    whole = engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_ORDERED_INTERMEDIATES", "1")
+    engine._slot_programs = {}
+    ordered = engine.sigma(vector)
+    np.testing.assert_allclose(ordered, whole, rtol=1e-13, atol=1e-13 * np.abs(whole).max())
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    producers = [program._contraction_info[kind.contracts[x[3]][0]] for kind in program._kinds
+                 for x in kind.code if x[0] == sp.CONTRACT and x[6][0] == sp.INTER]
+    assert any(info[5] for info in producers)
+
+
 def test_ordered_tiles_and_wave_sizes_keep_the_action(monkeypatch):
     """Tile products form only the entries the projection reads (ordered
     letters of antisymmetric subsets): the action equals the one with every

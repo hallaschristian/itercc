@@ -26,6 +26,11 @@ single-threaded contraction routes and its raw tile in that thread's caches.
   contraction into the pieces of the threaded executor, which the waiting
   tiles run too (the g T4 intermediates at CuF size, about 2e8 multiply-adds
   each, were computed on one thread while dozens of tiles waited).
+* Tile products form only the entries their projection reads (letters of
+  an antisymmetric subset in increasing spin-orbital order), so they read an
+  intermediate only at such entries: an intermediate is formed only where
+  every product that reads it, in any kind, reads (`_order_intermediates`;
+  the g T4 products of the rings, read at b < c < d, shrink six-fold).
 * Each tile's gathers go to partial sums, added to the slot's rows in the
   order of the Python loop and divided by (4!)^2 as it does, so the action is
   the loop's bit for bit, on any number of threads.
@@ -40,7 +45,7 @@ from math import prod
 
 import numpy as np
 
-from . import _cpu_kernels
+from . import _cpu_kernels, _runtime
 from ._spin_quadruples_tiles import (_PACKED_TILE_BYTES, _packed_cuts, ordered_letters, _tree_irrep, contraction_schedule,
                                      external_routes, routes)
 from ._tensor_scatter import SignedRows, _gather_steps
@@ -168,7 +173,8 @@ class SlotProgram:
         self._templates = {}                   # intermediate expressions
         self._kinds, self._kind_of = [], {}
         self._contractions = {}                # distinct contraction -> number
-        self._contraction_info = []            # (spec, operand arrays, labels, irreps, structure)
+        self._contraction_keys = []            # number -> its identity in `_contractions`
+        self._contraction_info = []            # (spec, operand arrays, labels, irreps, structure, ordered)
         self._plans_of = {}                    # (contraction, irreps of its occupied indices) -> plan
         self._plan_sets = []
         self._keep = []
@@ -248,14 +254,86 @@ class SlotProgram:
         irreps = (int(irreps[0]), int(irreps[1]))
         operands = tuple((x[0] == ROWS, x[2], x[3]) for x in (a, b, out))
         identity = (spec, operands, tuple(labels), irreps, tuple(ordered))
+        number = self._number(identity)
+        kind.code.append((CONTRACT, -1, -1, len(kind.contracts), a, b, out, float(alpha), beta))
+        kind.contracts.append((number, tuple(positions)))
+
+    def _number(self, identity):
+        """The contraction number of an identity (spec, operands, labels,
+        irreps, ordered), registered on first use."""
         number = self._contractions.get(identity)
         if number is None:
+            spec, operands, labels, irreps, ordered = identity
             number = self._contractions[identity] = len(self._contraction_info)
             arrays = tuple(_rows_like(shape, strides) if rows else _like(shape, strides)
                            for rows, shape, strides in operands)
-            self._contraction_info.append([spec, arrays, tuple(labels), irreps, None, tuple(ordered)])
-        kind.code.append((CONTRACT, -1, -1, len(kind.contracts), a, b, out, float(alpha), beta))
-        kind.contracts.append((number, tuple(positions)))
+            self._contraction_info.append([spec, arrays, labels, irreps, None, ordered])
+            self._contraction_keys.append(identity)
+        return number
+
+    def _order_intermediates(self):
+        """Form each intermediate only where every product reading it reads.
+
+        A product writes only the entries of its output allowed by its
+        ordering constraints, so it reads an operand only where the
+        constraints among the operand's letters that are also output letters
+        hold. An intermediate (one template, shared through the cache by tiles
+        of every kind) keeps the constraints all its readers share (a strict
+        one where every reader's is strict), found from the tile products down
+        through nested intermediates; its product is then recorded with them.
+        The entries it forms are those it formed before, with the same
+        arithmetic, so the action does not change."""
+        found = {}                      # template identity -> {(x, y): strict}
+
+        def readers():
+            needed = {}                 # identity -> list of constraint dicts, one per reader
+            for kind in self._kinds:
+                for op, _, _, plan, a, b, out, _, _ in kind.code:
+                    if op != CONTRACT:
+                        continue
+                    info = self._contraction_info[kind.contracts[plan][0]]
+                    spec = info[0]
+                    letters_a, letters_b = spec.split("->")[0].split(",")
+                    output = spec.split("->")[1]
+                    if out[0] == TILE:
+                        constraints = {(x, y): strict for x, y, strict in info[5]}
+                    else:
+                        constraints = found.get(kind.inters[out[1]][0], {})
+                    for operand, letters in ((a, letters_a), (b, letters_b)):
+                        if operand[0] != INTER:
+                            continue
+                        kept = {(x, y): strict for (x, y), strict in constraints.items()
+                                if x in letters and y in letters and x in output and y in output}
+                        needed.setdefault(kind.inters[operand[1]][0], []).append(kept)
+            result = {}
+            for identity, lists in needed.items():
+                common = dict(lists[0])
+                for other in lists[1:]:
+                    common = {pair: strict and other[pair] for pair, strict in common.items() if pair in other}
+                if common:
+                    result[identity] = common
+            return result
+
+        for _ in range(8):              # nested intermediates: a few levels
+            updated = readers()
+            if updated == found:
+                break
+            found = updated
+        else:
+            return                      # no fixed point: keep every entry
+        if not found:
+            return
+        for kind in self._kinds:
+            for op, _, _, plan, a, b, out, _, _ in kind.code:
+                if op != CONTRACT or out[0] != INTER:
+                    continue
+                constraints = found.get(kind.inters[out[1]][0])
+                if not constraints:
+                    continue
+                number, positions = kind.contracts[plan]
+                spec, operands, labels, irreps, ordered = self._contraction_keys[number]
+                ordered = tuple(sorted((x, y, strict) for (x, y), strict in constraints.items()))
+                kind.contracts[plan] = (self._number((spec, operands, labels, irreps, ordered)), positions)
 
     def _record(self, group, raw):
         """The products of contract_tile for one projection group and raw spin
@@ -445,6 +523,8 @@ class SlotProgram:
                 class_tiles.append(self._class(spins, pspins, equal, terms_of))
             slots[s] = (c, k, window.start, window.stop - window.start, occupied)
         self.nslots = len(layout.slots)
+        if _runtime.enabled("ITERCC_ORDERED_INTERMEDIATES"):
+            self._order_intermediates()
         # Plans for every (kind, irrep pattern) the slots need.
         plan_id = np.full((max(1, len(self._kinds)), n**4), -1, dtype=np.int64)
         templates, parts, class_start, class_count = [], [], [], []
