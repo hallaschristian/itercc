@@ -44,3 +44,48 @@ extern "C" void itercc_spin_quad_contract(
         out[row] += alpha * total;
     }
 }
+
+// Many terms of itercc_spin_quad_contract in one pass over the rows: each row
+// takes the terms in order, adding alpha * total after each as a separate
+// call would, so the results are those of one call per term (bit for bit),
+// without a pass over the coordinates and outputs and a parallel region per
+// term.
+extern "C" void itercc_spin_quad_contract_terms(int64_t count, int rank, const int32_t *coordinates,
+    int64_t no, int64_t nv, int64_t nterms, const itercc_spin_quad_term *terms, double *out, int threads)
+{
+    #pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t row = 0; row < count; ++row) {
+        const int32_t *coordinate = coordinates + row * (2 * rank);
+        double value = out[row];
+        for (int64_t k = 0; k < nterms; ++k) {
+            const itercc_spin_quad_term &term = terms[k];
+            int64_t group = 0;
+            for (int64_t e = 0; e < term.nexternal; ++e)
+                group = group * term.external_extents[e] + coordinate[term.external_axes[e]];
+            int64_t vb = 0, hb = 0, vs[4] = {}, hs[4] = {};
+            for (int a = 0; a < 4; ++a) {
+                vb *= nv; hb *= no;
+                for (int b = 0; b < 4; ++b) { vs[b] *= nv; hs[b] *= no; }
+                const int64_t p = term.amplitude_axes[a], h = term.amplitude_axes[a + 4];
+                if (p >= 0) vb += coordinate[p]; else vs[-p - 1] += 1;
+                if (h >= 0) hb += coordinate[h]; else hs[-h - 1] += 1;
+            }
+            double total = 0;
+            for (int64_t t = term.starts[group]; t < term.starts[group + 1]; ++t) {
+                int64_t v = vb, h = hb;
+                for (int b = 0; b < 4; ++b) {
+                    v += vs[b] * term.internal[4 * t + b];
+                    h += hs[b] * term.internal[4 * t + b];
+                }
+                const int64_t base = term.hole_map[h];
+                const int32_t index = term.virtual_map[v];
+                if (base && index && term.hole_key[h] == term.virtual_key[v]) {
+                    const double x = term.packed[std::abs(base) - 1 + std::abs(index) - 1];
+                    total += term.values[t] * ((base < 0) != (index < 0) ? -x : x);
+                }
+            }
+            value += term.alpha * total;
+        }
+        out[row] = value;
+    }
+}

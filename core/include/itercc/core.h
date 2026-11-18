@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 28
+#define ITERCC_CORE_ABI 29
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -56,6 +56,26 @@ void itercc_spin_quad_contract(int64_t count, int rank, const int32_t *coordinat
     int nexternal, const int32_t *external_axes, const int32_t *external_extents,
     const int32_t *amplitude_axes, const int64_t *starts, const int32_t *internal,
     const double *values, double alpha, double *out, int threads);
+
+/* One term of itercc_spin_quad_contract (its arguments, eight bytes each). */
+typedef struct {
+    const int32_t *virtual_map;
+    const uint8_t *virtual_key;
+    const int64_t *hole_map;
+    const uint8_t *hole_key;
+    const double *packed;
+    int64_t nexternal;
+    int64_t external_axes[8], external_extents[8], amplitude_axes[8];
+    const int64_t *starts;
+    const int32_t *internal;
+    const double *values;
+    double alpha;
+} itercc_spin_quad_term;
+
+/* The terms in order in one pass over the rows: the results of one
+ * itercc_spin_quad_contract call per term, bit for bit. */
+void itercc_spin_quad_contract_terms(int64_t count, int rank, const int32_t *coordinates, int64_t no,
+    int64_t nv, int64_t nterms, const itercc_spin_quad_term *terms, double *out, int threads);
 
 /* Integral transformations (integrals.cpp, itercc.integrals.mo_eri). s4 (npair
  * x npair) from the row-packed lower triangle s8; out[b] (n x n, symmetric)

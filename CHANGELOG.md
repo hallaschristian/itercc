@@ -27,6 +27,13 @@
   program runs a wave's tiles sorted by occupied tuple, T4 hole pair first,
   sizes waves by the intermediate cache budget and no longer clears the
   partial-sum buffer.
+  On the 16-slot CuF sample this takes the fused program from 20.8 s to
+  10.7 s and the loop from 43.3 s to 25.9 s.
+- Direct packed spin-orbital terms (`PackedBinaryAction.add`) run all their
+  terms in one pass over the rows (`itercc_spin_quad_contract_terms`, core
+  ABI 29) instead of one parallel pass per diagram, derivative and
+  permutation (144 at rank four), with the same results bit for bit: water
+  cc-pVDZ triplet actions take 3.9 s instead of 4.3 s.
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

@@ -53,8 +53,9 @@ stale prebuilt libraries are rejected.
 
 1. **Batch the CCSDTQ rank-four work across occupied slots.** The compiled
    slot program (Evidence below) now runs every tile of an action in the core,
-   6.1-6.5x faster on water cc-pVDZ and 2.1x on a 16-slot CuF sample, where
-   intermediates (cache size) and the waits between waves now limit it. The scalar
+   about 6.5x faster on water cc-pVDZ and 3.3x on a 16-slot CuF sample (0.34-0.44
+   s per slot on the first 400 slots); the g-T4 intermediates, computed one
+   per thread while other tiles wait, now limit it. The scalar
    occupied-slot loop repeatedly forms raw virtual tiles and projects them
    into canonical output. The earlier benchmark covers eight slots, not a
    full rank-four action. Fast triples and doubles do not establish a
@@ -209,6 +210,28 @@ multiply-adds and 6.1e13 gathers. With whole T4 the new trees need 7.0e13 and
 wave's tiles run sorted by occupied tuple (the T4 hole pair first) and waves
 hold 200 slots. The executor now runs each wave's tiles in that order (only
 the order of independent tiles changes) and sizes waves by the cache budget.
+
+Measured with `d32cc04` on the same 16-slot sample and allocation type
+(56 cores, 200 GiB, 8 GiB cache; seconds of the second action, the first in
+parentheses):
+
+| Case | `d32cc04` | `100e276` | Peak RSS (GiB) | Output |
+| --- | ---: | ---: | ---: | --- |
+| Slot loop | 25.91 (24.73) | 43.26 (47.22) | 81.3 | — |
+| Compiled, unfused | 11.76 (16.91) | 25.21 (34.43) | 83.7 | the loop's, bit for bit |
+| Compiled, fused | 10.68 (15.59) | 20.80 (30.58) | 83.9 | 2.2e-17 relative to the loop |
+
+Cache misses fell from 40,885 to 10,541 and recording from 8.1 s to 4.0 s.
+Against the `42cc1e4` loop (35.48 s, old trees and slabs) the fused program
+is 3.3x faster. The fused outputs of `d32cc04` and `100e276` differ by
+1.5e-17 relative. On the first 400 slots (8.5 million R4 rows, one action,
+recording included) the fused program took 177.6 s with an 8 GiB cache
+(91 GiB peak RSS) and 134.3 s with 32 GiB (135 GiB), with the same output bit
+for bit: 0.44 and 0.34 s per slot, against 0.67 s per slot in the 16-slot
+sample. Thread seconds (8 GiB): intermediates 3,287, cache waits 1,608,
+products into tiles 848, gathers 98, tile zeroing 77, of 9,945; with 32 GiB,
+2,128 and 884 for the first two. The g-T4 intermediates, each computed on one
+thread while other tiles wait for it, are now the largest cost.
 
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 

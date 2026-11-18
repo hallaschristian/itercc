@@ -108,6 +108,13 @@ def _coefficient_rows(tensor, subscript, amplitude, output, halves):
     return external, internal, extents, starts, inside, values[order], factor
 
 
+_i8 = np.int64
+TERM = np.dtype([("virtual_map", _i8), ("virtual_key", _i8), ("hole_map", _i8), ("hole_key", _i8),
+                 ("packed", _i8), ("nexternal", _i8), ("external_axes", _i8, 8),
+                 ("external_extents", _i8, 8), ("amplitude_axes", _i8, 8), ("starts", _i8),
+                 ("internal", _i8), ("values", _i8), ("alpha", np.float64)])
+
+
 class PackedBinaryAction:
     """Action-local coefficient tables; immutable amplitude address maps are reused."""
 
@@ -159,7 +166,8 @@ class PackedBinaryAction:
             raise ValueError("Packed contraction needs contiguous canonical coordinates and output")
         if not len(result):
             return
-        kernel = _cpu_kernels.library().spin_quad_contract
+        library = _cpu_kernels.library()
+        terms = []          # one itercc_spin_quad_term per kernel call, in order
         for equivalent, multiplicity, diagram, small_spec, spec, halves in packed_diagrams(rank):
             coefficient, original_spec, names = diagram
             lhs, output = spec.split("->")
@@ -185,9 +193,15 @@ class PackedBinaryAction:
                     amp_axes = np.array([positions[output.index(c)] if c in output
                                          else -1 - internal.index(c) for c in amplitude], dtype=np.int32)
                     alpha = coefficient * multiplicity * factor * sp * sh / factorial(rank)**2
-                    kernel(len(result), rank, coordinates.ctypes.data, 2 * engine.nocc, 2 * engine.nvir,
-                           maps.virtual_map.ctypes.data, maps.virtual_key.ctypes.data,
-                           maps.hole_map.ctypes.data, maps.hole_key.ctypes.data, vector.ctypes.data,
-                           len(external), axes.ctypes.data, extents.ctypes.data, amp_axes.ctypes.data,
-                           starts.ctypes.data, inside.ctypes.data, values.ctypes.data, alpha,
-                           result.ctypes.data, cpu_threads(None))
+                    terms.append((maps.virtual_map.ctypes.data, maps.virtual_key.ctypes.data,
+                                  maps.hole_map.ctypes.data, maps.hole_key.ctypes.data, vector.ctypes.data,
+                                  len(external), tuple(axes) + (0,) * (8 - len(axes)),
+                                  tuple(extents) + (0,) * (8 - len(extents)), tuple(amp_axes),
+                                  starts.ctypes.data, inside.ctypes.data, values.ctypes.data, alpha))
+        if terms:
+            # Every term in one pass over the rows (the arrays above stay alive
+            # in self.rows, the maps and the vectors).
+            table = np.array(terms, dtype=TERM)
+            library.spin_quad_contract_terms(len(result), rank, coordinates.ctypes.data, 2 * engine.nocc,
+                                             2 * engine.nvir, len(table), table.ctypes.data,
+                                             result.ctypes.data, cpu_threads(None))
