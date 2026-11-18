@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Davidson (`itercc.krylov.davidson`) pads its first space with unit vectors
+  of the lowest diagonal only when the guesses do not cover every root. A
+  restart from saved Ritz vectors then starts from them alone: orthogonalized
+  against a dense guess, each unit vector became dense, and the CuF triplet
+  restart spent three extra full actions (870-906 s each) on them.
 - Triplet direct packed T4 terms by opened letters (`itercc_spin_quad_opened`,
   `itercc_spin_quad_opened_lower`, core ABI 33). A family's coefficient takes
   external particles and holes x and summed ones s; its amplitude holds the

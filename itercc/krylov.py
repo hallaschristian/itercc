@@ -324,8 +324,13 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
             raise ValueError("Too many initial guesses")
         for part in parts:
             append(part)
+    # Unit vectors of the lowest diagonal pad the space, unless the guesses
+    # already cover every root: a restart from Ritz vectors then starts from
+    # them alone. Orthogonalized against a dense guess, each unit vector
+    # becomes dense, an action as costly as any other for little gain.
+    padded = basis.count if guesses is not None and basis.count >= nroots else min(max_space, 2 * nroots + 2)
     for index in np.argsort(tohost(diagonal)):
-        if basis.count >= min(max_space, 2 * nroots + 2):
+        if basis.count >= padded:
             break
         unit = xp.zeros(size)
         unit[int(index)] = 1
