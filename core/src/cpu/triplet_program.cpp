@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <cstdlib>
 #include <list>
 #include <memory>
@@ -44,8 +45,9 @@ using Buffer = std::shared_ptr<std::vector<double>>;
 // Diagnostic thread time by phase (ITERCC_SLOT_PROFILE=1, read by
 // itercc_triplet_profile): 0 zeroing, 1 products into the tile, 2 products
 // into intermediates, 3 packed T4 row setup, 4 gathers, 5 cache waits and
-// lookups, 6 slot sums, 7 intermediate allocation.
-constexpr int kPhases = 8;
+// lookups, 6 slot sums, 7 intermediate allocation, 8 the barrier at the end
+// of a wave's tiles.
+constexpr int kPhases = 9;
 std::atomic<double> phase_time[kPhases];
 constexpr i64 kTimed = 1 << 16;        // contractions timed one by one (instruction `inter`)
 std::atomic<double> contraction_time[kTimed];
@@ -118,18 +120,20 @@ struct Job {
     std::atomic<i64> next{0}, done{0};
 
     bool open() const { return next.load(std::memory_order_relaxed) < i64(tasks.size()); }
+    bool complete() const { return done.load(std::memory_order_acquire) >= i64(tasks.size()); }
+    bool step()   // runs one piece if one is left
+    {
+        const i64 t = next.fetch_add(1, std::memory_order_relaxed);
+        if (t >= i64(tasks.size())) return false;
+        itercc::contract_task(plan, tasks[size_t(t)]);
+        done.fetch_add(1, std::memory_order_release);
+        return true;
+    }
     i64 help()   // runs pieces until none is left; returns how many it ran
     {
-        for (i64 ran = 0;; ++ran) {
-            const i64 t = next.fetch_add(1, std::memory_order_relaxed);
-            if (t >= i64(tasks.size())) return ran;
-            itercc::contract_task(plan, tasks[size_t(t)]);
-            done.fetch_add(1, std::memory_order_release);
-        }
-    }
-    void finish() const
-    {
-        while (done.load(std::memory_order_acquire) < i64(tasks.size())) std::this_thread::yield();
+        i64 ran = 0;
+        while (step()) ++ran;
+        return ran;
     }
 };
 
@@ -168,9 +172,34 @@ class Cache {
                 lock.lock();
                 continue;
             }
+            // Its pieces are all taken (or not cut yet): help another one.
+            std::shared_ptr<Job> other = open_job();
+            if (other) {
+                lock.unlock();
+                {
+                    const Phase timing(2);
+                    if (other->step()) ++helped_;
+                }
+                lock.lock();
+                continue;
+            }
             const Phase timing(5);
             ready_.wait(lock);
         }
+    }
+
+    // One piece of any intermediate being produced; false when none is left.
+    // A producer runs these while helpers finish its own last pieces.
+    bool help_other()
+    {
+        std::shared_ptr<Job> job;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job = open_job();
+        }
+        if (!job || !job->step()) return false;
+        ++helped_;
+        return true;
     }
 
     // The pieces of an intermediate being produced, for the tiles that wait.
@@ -181,6 +210,7 @@ class Cache {
             ++shared_;
             auto found = map_.find(key);
             if (found != map_.end()) found->second.job = job;
+            open_.push_back(job);
         }
         ready_.notify_all();
     }
@@ -221,6 +251,15 @@ class Cache {
     i64 helped() const { return helped_.load(); }
 
   private:
+    // A job with pieces left (the lock held); finished ones leave the list.
+    std::shared_ptr<Job> open_job()
+    {
+        while (!open_.empty() && !open_.front()->open()) open_.pop_front();
+        for (const auto &job : open_)
+            if (job->open()) return job;
+        return nullptr;
+    }
+
     struct Entry {
         Buffer buffer;
         bool ready = false;
@@ -233,6 +272,7 @@ class Cache {
     std::list<Key> lru_;   // finished entries, most recent first
     i64 budget_, bytes_ = 0, peak_ = 0, hits_ = 0, misses_ = 0, shared_ = 0;
     std::atomic<i64> helped_{0};   // pieces run by tiles that waited
+    std::deque<std::shared_ptr<Job>> open_;   // jobs being produced, oldest first
 };
 
 // A plan block of a fused product: its output block and where it came from.
@@ -432,7 +472,9 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
                 itercc::contract_tasks(table, count, workers, shared->tasks);
                 cache.attach(key_of(inters[size_t(x.out.index)], job.fixed), shared);
                 shared->help();
-                shared->finish();
+                // Helpers finish the last pieces: meanwhile, run other pieces.
+                while (!shared->complete())
+                    if (!cache.help_other()) std::this_thread::yield();
             } else {
                 itercc::contract_serial(plan, table, count);
             }
@@ -589,11 +631,15 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
         {
             Worker w;
             double *tile = itercc::scratch(4).get(size_t(nv4));
-#pragma omp for schedule(dynamic, 1)
+#pragma omp for schedule(dynamic, 1) nowait
             for (i64 j = 0; j < ntiles; ++j) {
                 const Tile &job = tiles[size_t(order[size_t(j)])];
                 run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, partial.get() + job.partial,
                          fused != 0, threads, share_work);
+            }
+            {
+                const Phase timing(8);
+#pragma omp barrier
             }
 #pragma omp for schedule(dynamic, 1)
             for (i64 s = 0; s < nwave; ++s) {

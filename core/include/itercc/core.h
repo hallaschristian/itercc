@@ -684,7 +684,8 @@ int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t p
                          int64_t share_work);
 /* Diagnostic thread seconds of itercc_triplet_slots by phase (with
  * ITERCC_SLOT_PROFILE=1): zeroing, products into tiles, into intermediates,
- * packed row setup, gathers, cache lookups and waits, slot sums. */
+ * packed row setup, gathers, cache waits, slot sums, intermediate allocation,
+ * the barrier after a wave's tiles (nine entries). */
 void itercc_triplet_profile(double *seconds, int reset);
 /* ... and by contraction (the contraction number of each instruction). */
 void itercc_triplet_contraction_profile(int64_t count, double *seconds, int64_t *calls, int reset);

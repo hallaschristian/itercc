@@ -42,7 +42,12 @@
   is unchanged bit for bit; `ITERCC_SLOT_SHARE_WORK` sets the threshold.
   On the first 400 CuF slots (56 cores) this takes 145.5 s instead of
   177.6 s with an 8 GiB cache and 128.5 s instead of 134.3 s with 32 GiB;
-  the 16-slot sample is slower (12.6 s instead of 10.7 s).
+  the 16-slot sample was slower there (12.6 s instead of 10.7 s), but so
+  were the phases that sharing does not touch, by about the same 16%, so
+  most of that difference was the allocation. A producer whose last pieces
+  are with helpers now runs pieces of other intermediates being produced
+  instead of waiting, and so does a tile whose intermediate has no pieces
+  left.
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of
