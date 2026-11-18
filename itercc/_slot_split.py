@@ -186,9 +186,15 @@ def serve(engine, exchange, part, parts, block=BLOCK):
         np.copyto(image, rows)
         image.flush()
         (exchange / f"done-{action}-{part}").write_text("")
-        print(json.dumps(dict(event="slot_worker_action", part=part, action=action,
-                              wall_seconds=time.perf_counter() - started,
-                              intermediate_cache=engine.last_intermediate_cache)), flush=True)
+        record = dict(event="slot_worker_action", part=part, action=action,
+                      wall_seconds=time.perf_counter() - started, intermediate_cache=engine.last_intermediate_cache)
+        if _runtime.enabled("ITERCC_SLOT_PROFILE"):         # the slot program's thread-seconds by phase
+            from . import _cpu_kernels
+
+            seconds = np.zeros(9)
+            _cpu_kernels.library().triplet_profile(seconds.ctypes.data, 1)
+            record["slot_phases"] = [round(float(x), 1) for x in seconds]
+        print(json.dumps(record), flush=True)
 
 
 def main(argv=None):

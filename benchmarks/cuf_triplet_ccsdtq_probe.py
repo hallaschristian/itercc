@@ -51,9 +51,24 @@ class MonitoredTriplet(TripletEOMCCSDTQ):
         print(json.dumps(dict(event="action_finished", action=action,
                               wall_seconds=perf_counter() - start,
                               intermediate_cache=self.last_intermediate_cache,
+                              slot_phases=slot_phases(),
                               peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)),
               flush=True)
         return image
+
+
+def slot_phases():
+    """The slot program's thread-seconds by phase since the last call
+    (ITERCC_SLOT_PROFILE=1; else None)."""
+    from itercc import _runtime, _cpu_kernels
+
+    if not _runtime.enabled("ITERCC_SLOT_PROFILE"):
+        return None
+    seconds = np.zeros(9)
+    _cpu_kernels.library().triplet_profile(seconds.ctypes.data, 1)
+    names = ("zero", "tile_products", "intermediates", "t4_rows", "gathers", "cache_waits", "slot_sums",
+             "allocation", "wave_barrier")
+    return dict(zip(names, (round(float(x), 1) for x in seconds)))
 
 
 def run_solve(engine, args, signature):
