@@ -49,6 +49,13 @@
   instead of waiting, and so does a tile whose intermediate has no pieces
   left. In one allocation, sharing is neutral on the 16-slot sample
   (10.3 s either way) and takes the first 400 slots from 151.8 s to 136.4 s.
+- Direct packed T4 terms that read the same T4 entries in the same pattern
+  share one coefficient table (`merged_diagrams`: at rank four 10 diagrams
+  in 5 tables, such as gvovo T4 with (goovv t2) T4 and gvvvv T4 with
+  (goovv t2) T4), so each entry is looked up once instead of once per
+  diagram, and the ground-state tables are kept across actions. The action
+  changes at round-off (1.9e-15 relative on water cc-pVDZ, which takes 3.7 s
+  instead of 3.95 s).
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

@@ -78,6 +78,56 @@ def supported_diagrams(rank):
     return frozenset(item[2] for item in packed_diagrams(rank))
 
 
+@lru_cache(maxsize=None)
+def merged_diagrams(rank):
+    """The packed diagrams grouped by the T4 entries they read: diagrams of one
+    projection group whose coefficients, after renaming the summed letters in
+    the order of the T4 subscript, have the same letters, T4 pattern and
+    antisymmetric summed pairs read the same entries in the same pattern, so
+    their coefficients add into one table (one lookup per entry instead of
+    one per diagram; at CuF size gvovo T4 and (goovv t2) T4 each made 9,300
+    lookups per output row).
+
+    Each group is (equivalent, labels, amplitude, output, pairs, members): the
+    merged coefficient has subscript `labels` (output letters, then the
+    summed letters P, Q, R, S), `pairs` are its antisymmetric summed pairs as
+    `_coefficient_rows` halves, and members are (scale, diagram, small_spec,
+    order): the diagram's coefficient (`small_spec`) transposed by `order`,
+    times `scale` (its coefficient and multiplicity)."""
+    groups = {}
+    for equivalent, multiplicity, diagram, small_spec, spec, halves in packed_diagrams(rank):
+        coefficient, _, _ = diagram
+        lhs, output = spec.split("->")
+        labels, amplitude = lhs.split(",")
+        internal = [c for c in amplitude if c in labels and c not in output]
+        if any(c not in output and c not in internal for c in labels) or len(internal) > 4:
+            internal = None
+        if internal is None:
+            key = ("alone", len(groups))
+            groups[key] = (equivalent, labels, amplitude, output, halves, [(coefficient * multiplicity, diagram,
+                                                                           small_spec, tuple(range(len(labels))))])
+            continue
+        rename = {c: c for c in output} | {c: "PQRS"[k] for k, c in enumerate(internal)}
+        canonical = sorted(labels, key=lambda c: output.index(c) if c in output else len(output) + internal.index(c))
+        merged_labels = "".join(rename[c] for c in canonical)
+        order = tuple(labels.index(c) for c in canonical)
+        merged_amplitude = "".join(rename.get(c, c) for c in amplitude)
+        # Only summed letters of one half that share a T4 half matter (the
+        # factor and ordering of _coefficient_rows).
+        pairs = []
+        for half in halves:
+            for side in (amplitude[:4], amplitude[4:]):
+                group = "".join(rename[c] for c in half if c in internal and c in side)
+                if len(group) > 1:
+                    pairs.append(group)
+        pairs = tuple(sorted(pairs))
+        key = (equivalent, merged_labels, merged_amplitude, output, pairs)
+        if key not in groups:
+            groups[key] = (equivalent, merged_labels, merged_amplitude, output, pairs, [])
+        groups[key][5].append((coefficient * multiplicity, diagram, small_spec, order))
+    return tuple((*group[:5], tuple(group[5])) for group in groups.values())
+
+
 def _coefficient_rows(tensor, subscript, amplitude, output, halves):
     """Exact sparse rows; no numerical threshold or integral screening."""
     external = tuple(c for c in subscript if c in output)
@@ -159,6 +209,25 @@ class PackedBinaryAction:
                 result += part
         return result
 
+    def _merged_rows(self, rank, number, derivative, labels, amplitude, output, pairs, members):
+        """Sparse rows of a merged coefficient (see `merged_diagrams`), or None.
+        The ground-state ones (derivative 1) do not depend on the direction and
+        are kept on the engine across actions."""
+        key = rank, number, derivative
+        kept = self.engine.__dict__.setdefault("_packed_merged_rows", {}) if derivative == 1 else self.rows
+        if key in kept:
+            return kept[key]
+        tensor = None
+        for scale, diagram, small_spec, order in members:
+            part = self._coefficient(diagram[2][:-1], small_spec, derivative)
+            if part is None:
+                continue
+            part = scale * np.transpose(part, order)
+            tensor = part if tensor is None else tensor + part
+        kept[key] = (None if tensor is None else
+                     _coefficient_rows(np.ascontiguousarray(tensor), labels, amplitude, output, pairs))
+        return kept[key]
+
     def add(self, rank, coordinates, result):
         engine = self.engine
         coordinates = np.ascontiguousarray(coordinates, dtype=np.int32)
@@ -168,22 +237,15 @@ class PackedBinaryAction:
             return
         library = _cpu_kernels.library()
         terms = []          # one itercc_spin_quad_term per kernel call, in order
-        for equivalent, multiplicity, diagram, small_spec, spec, halves in packed_diagrams(rank):
-            coefficient, original_spec, names = diagram
-            lhs, output = spec.split("->")
-            small, amplitude = lhs.split(",")
+        for number, (equivalent, labels, amplitude, output, pairs, members) in enumerate(merged_diagrams(rank)):
             for derivative in range(2):
                 vector = self.vectors[derivative]
                 if vector is None:
                     continue
-                key = original_spec, derivative
-                if key not in self.rows:
-                    tensor = self._coefficient(names[:-1], small_spec, derivative)
-                    self.rows[key] = (None if tensor is None else
-                                      _coefficient_rows(tensor, small, amplitude, output, halves))
-                if self.rows[key] is None:
+                rows = self._merged_rows(rank, number, derivative, labels, amplitude, output, pairs, members)
+                if rows is None:
                     continue
-                external, internal, extents, starts, inside, values, factor = self.rows[key]
+                external, internal, extents, starts, inside, values, factor = rows
                 if not len(values):
                     continue
                 maps = self._maps(derivative)
@@ -192,7 +254,7 @@ class PackedBinaryAction:
                     axes = np.array([positions[output.index(c)] for c in external], dtype=np.int32)
                     amp_axes = np.array([positions[output.index(c)] if c in output
                                          else -1 - internal.index(c) for c in amplitude], dtype=np.int32)
-                    alpha = coefficient * multiplicity * factor * sp * sh / factorial(rank)**2
+                    alpha = factor * sp * sh / factorial(rank)**2
                     terms.append((maps.virtual_map.ctypes.data, maps.virtual_key.ctypes.data,
                                   maps.hole_map.ctypes.data, maps.hole_key.ctypes.data, vector.ctypes.data,
                                   len(external), tuple(axes) + (0,) * (8 - len(axes)),
