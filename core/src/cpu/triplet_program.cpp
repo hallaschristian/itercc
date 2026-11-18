@@ -25,6 +25,8 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -41,7 +43,7 @@ using Buffer = std::shared_ptr<std::vector<double>>;
 // Diagnostic thread time by phase (ITERCC_SLOT_PROFILE=1, read by
 // itercc_triplet_profile): 0 zeroing, 1 products into the tile, 2 products
 // into intermediates, 3 packed T4 row setup, 4 gathers, 5 cache waits and
-// lookups, 6 slot sums.
+// lookups, 6 slot sums, 7 intermediate allocation.
 constexpr int kPhases = 8;
 std::atomic<double> phase_time[kPhases];
 constexpr i64 kTimed = 1 << 16;        // contractions timed one by one (instruction `inter`)
@@ -340,6 +342,7 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
         }
         double *out;
         if (x.out.kind == kInter) {
+            const Phase timing(7);
             Buffer fresh = std::make_shared<std::vector<double>>(size_t(inters[x.out.index].size), 0.0);
             out = fresh->data();
             w.bound[size_t(x.out.index)] = std::move(fresh);
@@ -463,7 +466,12 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
     Cache cache(cache_bytes);
     const double *const vectors[2] = {ground, direction};
     std::vector<i64> first;   // each slot's first tile in the wave, then the end
-    std::vector<double> partial;
+    std::vector<i64> order;   // the wave's tiles in the order they run
+    // Every partial sum is written by its tile before its slot reads it, so
+    // the buffer is not cleared (a zero fill of a 1.5 GB wave on one thread
+    // cost water cc-pVDZ about 0.8 s); its pages fault in on the threads.
+    std::unique_ptr<double[]> partial;
+    i64 capacity = 0;
     for (i64 s0 = 0; s0 < nslots;) {
         tiles.clear();
         first.clear();
@@ -481,21 +489,43 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
             ++s1;
         }
         first.push_back(i64(tiles.size()));
-        if (partial.size() < size_t(used)) partial.resize(size_t(used));
+        if (capacity < used) {
+            partial.reset();
+            partial.reset(new double[size_t(used)]);
+            capacity = used;
+        }
+        // Tiles run by occupied tuple, T4 hole pair (positions 2 and 3) first:
+        // the intermediates of g with T4 (one per hole pair, about 5 MB at CuF
+        // size) and of the other operands are then used by neighbouring
+        // tiles, while the cache still holds them. Only the order changes:
+        // every slot adds its tiles' partial sums in their own order.
+        order.resize(tiles.size());
+        std::iota(order.begin(), order.end(), i64(0));
+        static const bool sorted = [] {
+            const char *value = std::getenv("ITERCC_SLOT_SORT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (sorted)
+        std::stable_sort(order.begin(), order.end(), [&tiles](i64 x, i64 y) {
+            const int64_t *u = tiles[size_t(x)].fixed, *v = tiles[size_t(y)].fixed;
+            return std::tie(u[2], u[3], u[0], u[1]) < std::tie(v[2], v[3], v[0], v[1]);
+        });
         const i64 ntiles = i64(tiles.size()), nwave = s1 - s0;
 #pragma omp parallel num_threads(threads)
         {
             Worker w;
             double *tile = itercc::scratch(4).get(size_t(nv4));
 #pragma omp for schedule(dynamic, 1)
-            for (i64 j = 0; j < ntiles; ++j)
-                run_tile(*p, tiles[size_t(j)], bases, vectors, cache, cache_bytes, tile, w,
-                         partial.data() + tiles[size_t(j)].partial, fused != 0);
+            for (i64 j = 0; j < ntiles; ++j) {
+                const Tile &job = tiles[size_t(order[size_t(j)])];
+                run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, partial.get() + job.partial,
+                         fused != 0);
+            }
 #pragma omp for schedule(dynamic, 1)
             for (i64 s = 0; s < nwave; ++s) {
                 const Phase timing(6);
                 finish_slot(*p, p->slots[s0 + s], tiles.data() + first[size_t(s)],
-                            first[size_t(s + 1)] - first[size_t(s)], partial.data(), result);
+                            first[size_t(s + 1)] - first[size_t(s)], partial.get(), result);
             }
         }
         s0 = s1;

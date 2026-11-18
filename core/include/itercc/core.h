@@ -646,7 +646,8 @@ typedef struct {
 
 /* Slots 0 .. nslots - 1 of `result` (zero on entry), in waves whose partial
  * sums stay within partial_limit doubles (or one slot): every tile on one
- * thread, then each slot's rows get its tiles' partial sums in order, divided
+ * thread (a wave's tiles in order of their occupied tuples, positions 2, 3,
+ * 0, 1), then each slot's rows get its tiles' partial sums in order, divided
  * by (4!)^2. Intermediates are shared through a cache of cache_bytes; stats
  * gets its hits, misses and peak bytes. With `fused`, the products of a
  * fusion group run after the tile's other instructions as fused GEMMs, one

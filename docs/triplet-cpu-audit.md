@@ -185,6 +185,31 @@ zeroing 2. So intermediates dominate (the cache is full: 12,353 hits, 40,885
 misses), and about 60% of the thread time is idle, mostly at the barriers
 between waves of about three slots each (10 million partial sums per slot).
 
+An offline model explains most of it: the real `SlotProgram` built for the
+CuF layout (checkpoint irreps, 13 occupied, 29 virtual, B1) on shape-only
+operands, and a sequential walk over its tiles with the cache as an LRU
+(model estimates, not measurements). At CuF size the tile byte budget cut the
+summed hole pair (m, n) of packed T4 into 28 slabs, so `mnef,bcdfklmn->bcdekl`
+became 28 full-size intermediates per hole pair and 28 products into each
+tile: 43,232 of them in the 16-slot sample. Read in place, packed T4 needs no
+slab, and both the loop and the program now keep its summed letters whole
+(an explicit `occupied_slab` keeps slabs). Multiply-adds and packed-T4 gathers
+of the model, 16-slot sample, 8 GiB cache:
+
+| Trees and slabs | Tile products | Intermediates | Packed-T4 gathers |
+| --- | ---: | ---: | ---: |
+| Old trees, slabs (`42cc1e4`) | 4.18e11 | 1.5e10 | 4.8e10 |
+| New trees, slabs (`100e276`) | 1.11e11 | 3.92e11 | 4.8e10 |
+| New trees, whole T4 | 5.2e10 | 2.18e11 | 2.7e10 |
+
+For a whole action (6.49 million tiles) the old trees need 5.5e14
+multiply-adds and 6.1e13 gathers. With whole T4 the new trees need 7.0e13 and
+4.5e11 if every intermediate is kept (262 GiB), 2.9e14 and 2.7e13 with a
+16 GiB cache in slot order, and 1.6e14 and 1.1e13 with the same cache when a
+wave's tiles run sorted by occupied tuple (the T4 hole pair first) and waves
+hold 200 slots. The executor now runs each wave's tiles in that order (only
+the order of independent tiles changes) and sizes waves by the cache budget.
+
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 
 The blocked GEMMs now read packed T4 in place: a T4 operand is `SignedRows`

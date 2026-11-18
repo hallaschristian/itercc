@@ -27,7 +27,9 @@ single-threaded contraction routes and its raw tile in that thread's caches.
   order of the Python loop and divided by (4!)^2 as it does, so the action is
   the loop's bit for bit, on any number of threads.
 
-Slots run in waves that bound the partial sums (`_PARTIAL_DOUBLES`).
+Slots run in waves that bound the partial sums (as many bytes as the
+intermediate cache, at least `_PARTIAL_DOUBLES` doubles); a wave's tiles run
+sorted by occupied tuple, so tiles that share intermediates run together.
 """
 import ctypes
 from itertools import product
@@ -262,11 +264,11 @@ class SlotProgram:
             inputs = lhs.split(",")
             cut = {c: q for q, c in enumerate(output[4:])}
             t4 = names.index("t4") if "t4" in names else None
-            if t4 is None:
+            if t4 is None or self.slab is None:      # packed T4 is read whole (see contract_tile)
                 slabs = ((),)
             else:
-                budget = _PACKED_TILE_BYTES if self.slab else _PACKED_TILE_BYTES // 4
-                slabs = _packed_cuts(inputs[t4][4:], tuple((c, 0, 1) for c in cut), no, nv, budget, self.slab)
+                slabs = _packed_cuts(inputs[t4][4:], tuple((c, 0, 1) for c in cut), no, nv, _PACKED_TILE_BYTES,
+                                     self.slab)
             for derivative in range(len(names)):
                 if not self.presence[names[derivative]]:
                     continue
@@ -629,8 +631,12 @@ class SlotProgram:
             raise ValueError("The rank-four result must be a contiguous float64 array")
         nslots = self.nslots if slot_limit is None else min(int(slot_limit), self.nslots)
         stats = np.zeros(4, dtype=np.int64)
+        # Waves hold as many partial sums as the intermediate cache holds
+        # bytes (at least 256 MiB): larger waves let more tiles that share
+        # intermediates run together.
+        partial = max(_PARTIAL_DOUBLES, int(cache_bytes) // 8)
         status = self.library.triplet_slots(
-            ctypes.byref(self.struct), nslots, _PARTIAL_DOUBLES, pointers.ctypes.data,
+            ctypes.byref(self.struct), nslots, partial, pointers.ctypes.data,
             None if ground is None else ground.ctypes.data,
             None if direction is None else direction.ctypes.data,
             result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads), int(bool(fused)))

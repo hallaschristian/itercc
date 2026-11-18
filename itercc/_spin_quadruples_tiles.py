@@ -245,7 +245,15 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
         inputs = lhs.split(",")
         cuts = dict(zip(output[rank:], fixed))
         t4 = names.index("t4") if "t4" in names else None
-        if t4 is None:
+        # The CPU blocked engine reads packed T4 rows in place: the dense
+        # slab is never written (it was most of an action's memory traffic).
+        packed = (t4 is not None and engine is not None and getattr(engine, "packed_operands", False)
+                  and (len(names) == 2 or compiled_products))
+        if t4 is None or (packed and occupied_slab is None):
+            # Read in place, T4 needs no slab: its summed occupied letters
+            # stay whole, one product (and one intermediate per occupied
+            # tuple, shared between tiles) instead of one per slab. At CuF
+            # size the byte budget below cut them into 28 slabs.
             slabs = ((),)
         else:
             # Caching multi-slot expansions across diagrams is only useful
@@ -256,10 +264,6 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
             slabs = _packed_cuts(inputs[t4][4:], tuple((c, s.start, s.stop) for c, s in cuts.items()),
                                  no, nv, max_cache_bytes if occupied_slab else max_cache_bytes // 4,
                                  occupied_slab)
-        # The CPU blocked engine reads packed T4 rows in place: the dense
-        # slab is never written (it was most of an action's memory traffic).
-        packed = (t4 is not None and engine is not None and getattr(engine, "packed_operands", False)
-                  and (len(names) == 2 or compiled_products))
         for derivative in range(len(names)):
             if tangent[names[derivative]] is None:
                 continue
