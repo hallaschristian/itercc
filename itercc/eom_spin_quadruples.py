@@ -695,6 +695,11 @@ class TripletEOMCCSDTQ:
         for rank in ranks:
             start = perf_counter() if rank_finished is not None else 0.
             shape = self.space.shapes[rank - 1]
+            if rank == 4 and intermediates is not None and self.slot_program and xp is np:
+                # The compiled slot program keeps its own cache of the same
+                # budget: free the lower ranks' products first, or the process
+                # holds both.
+                intermediates.release()
             if self.occupied_tiles and rank > 1:
                 r4 = vector[self.space.slices[3]] if nonzero[3] else None
                 if r4 is not None and not self._packed_direction:

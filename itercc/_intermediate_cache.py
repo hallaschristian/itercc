@@ -29,6 +29,11 @@ class IntermediateCache:
             self.hits += 1
         return value
 
+    def release(self):
+        """Drop every retained product (the counters stay)."""
+        self.entries.clear()
+        self.bytes = 0
+
     def put(self, key, value):
         previous = self.entries.pop(key, None)
         if previous is not None:
