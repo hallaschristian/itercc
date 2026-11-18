@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 30
+#define ITERCC_CORE_ABI 31
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -76,6 +76,48 @@ typedef struct {
  * itercc_spin_quad_contract call per term, bit for bit. */
 void itercc_spin_quad_contract_terms(int64_t count, int rank, const int32_t *coordinates, int64_t no,
     int64_t nv, int64_t nterms, const itercc_spin_quad_term *terms, double *out, int threads);
+
+/* The direct terms in dense form (spin_quadruples.cpp). A family is one
+ * coefficient on one packed T4 (the maps, `packed`, the layout's spin change
+ * and irrep): its summed tuples (four spin-orbital indices each, `internal`)
+ * sorted by symmetry class, class (delta - class_min) * 8 + gamma with delta
+ * the alpha count of the summed particles minus that of the summed holes and
+ * gamma the irrep product; class_start (nclasses + 1 entries) cuts them, and
+ * class c's coefficient block is weights[weight_offset[c] ..], n_ext rows of
+ * external values by its tuples. */
+typedef struct {
+    const int32_t *virtual_map;
+    const uint8_t *virtual_key;
+    const int64_t *hole_map;
+    const uint8_t *hole_key;
+    const double *packed;
+    int64_t spin_change, irrep, class_min, nclasses;
+    const int64_t *class_start;
+    const int32_t *internal;
+    const double *weights;
+    const int64_t *weight_offset;
+    int64_t n_ext;
+} itercc_spin_quad_family;
+
+/* One term (permutation) of a family: the external values at row positions
+ * external_axes with flat index sum value * stride, the amplitude as in
+ * itercc_spin_quad_contract (amplitude_axes: row position, or -1 - the index
+ * of a summed letter), and its factor. */
+typedef struct {
+    int64_t family, nexternal;
+    int64_t external_axes[4], external_strides[4];
+    int64_t amplitude_axes[8];
+    double alpha;
+} itercc_spin_quad_dense_term;
+
+/* out[row] += sum_t alpha_t sum_k W_t[ext][k] T4(context(row, t) + tuple k) for
+ * rank-four rows (eight int32 coordinates, slots in runs of equal holes), each
+ * context gathering its T4 values once; each row adds its terms in order.
+ * occupied_irrep and virtual_irrep give each spatial orbital's irrep. */
+void itercc_spin_quad_dense(int64_t count, const int32_t *coordinates, int64_t no, int64_t nv,
+    const int64_t *occupied_irrep, const int64_t *virtual_irrep, int64_t nfamilies,
+    const itercc_spin_quad_family *families, int64_t nterms, const itercc_spin_quad_dense_term *terms,
+    double *out, int threads);
 
 /* Integral transformations (integrals.cpp, itercc.integrals.mo_eri). s4 (npair
  * x npair) from the row-packed lower triangle s8; out[b] (n x n, symmetric)

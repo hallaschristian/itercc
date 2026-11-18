@@ -57,6 +57,15 @@
   changes at round-off (1.9e-15 relative on water cc-pVDZ, which takes 3.7 s
   instead of 3.95 s). On the first 400 CuF slots the direct terms take 25.4 s
   instead of 41.6 s (121.2 s instead of 135.1 s in all).
+- Rank-four direct packed T4 terms run by contexts
+  (`itercc_spin_quad_dense`, core ABI 31): the T4 indices of a row and
+  permutation that are not summed form a context; each context gathers its
+  T4 values once, only over the summed tuples of the one symmetry class that
+  can complete it to a stored amplitude, and every row and permutation using
+  it takes a dot product with a dense block of the coefficient. The sparse
+  per-row lookups mostly read amplitudes that cannot exist. The same nonzero
+  products are added in the same order, so the action is the sparse path's
+  bit for bit; `ITERCC_DIRECT_DENSE=0` keeps the sparse path.
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

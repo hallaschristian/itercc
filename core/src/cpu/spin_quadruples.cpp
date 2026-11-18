@@ -1,6 +1,8 @@
 // Direct contractions of canonical, antisymmetric spin-orbital T4/R4.
 // Sparse small-operand rows and signed lookup tables replace dense T4 tiles.
+#include <algorithm>
 #include <cstdlib>
+#include <vector>
 #include "itercc/core.h"
 
 extern "C" void itercc_spin_quad_contract(
@@ -87,5 +89,133 @@ extern "C" void itercc_spin_quad_contract_terms(int64_t count, int rank, const i
             value += term.alpha * total;
         }
         out[row] = value;
+    }
+}
+
+// The direct terms in dense form. For one output row and permutation, a term
+// reads T4 at its amplitude with the summed letters running over the
+// coefficient: its other amplitude indices (the context) are the row's. Rows
+// and permutations with the same context read the same T4 values, so each
+// context gathers them once, over the summed tuples of the one symmetry
+// class (alpha count and irrep difference) that can complete it to a stored
+// amplitude, and every row and permutation using it takes a contiguous dot
+// product with its block of the coefficient. Each row then adds its terms in
+// order, as itercc_spin_quad_contract_terms does.
+namespace {
+
+struct DenseItem {
+    uint64_t key;    // the context: amplitude values, 0xFF for summed letters
+    int64_t slot;    // row in the slot * nterms + term
+    int64_t ext;     // flat index of the external values in the coefficient
+};
+
+double quad_lookup(const itercc_spin_quad_family &f, const int64_t *p, const int64_t *h, int64_t no, int64_t nv)
+{
+    const int64_t v = ((p[0] * nv + p[1]) * nv + p[2]) * nv + p[3];
+    const int64_t w = ((h[0] * no + h[1]) * no + h[2]) * no + h[3];
+    const int64_t base = f.hole_map[w];
+    const int32_t index = f.virtual_map[v];
+    if (!base || !index || f.hole_key[w] != f.virtual_key[v]) return 0.0;
+    const double x = f.packed[std::abs(base) - 1 + std::abs(index) - 1];
+    return (base < 0) != (index < 0) ? -x : x;
+}
+
+}  // namespace
+
+extern "C" void itercc_spin_quad_dense(int64_t count, const int32_t *coordinates, int64_t no, int64_t nv,
+    const int64_t *occupied_irrep, const int64_t *virtual_irrep, int64_t nfamilies,
+    const itercc_spin_quad_family *families, int64_t nterms, const itercc_spin_quad_dense_term *terms,
+    double *out, int threads)
+{
+    // Output slots: runs of rows with the same holes.
+    std::vector<int64_t> bounds{0};
+    for (int64_t r = 1; r < count; ++r) {
+        const int32_t *x = coordinates + 8 * r, *y = x - 8;
+        if (x[4] != y[4] || x[5] != y[5] || x[6] != y[6] || x[7] != y[7]) bounds.push_back(r);
+    }
+    bounds.push_back(count);
+    const int64_t nslots = int64_t(bounds.size()) - 1;
+    #pragma omp parallel num_threads(threads)
+    {
+        std::vector<DenseItem> items;
+        std::vector<double> z, tvec;
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t s = 0; s < nslots; ++s) {
+            const int64_t r0 = bounds[size_t(s)], r1 = bounds[size_t(s + 1)], n = r1 - r0;
+            z.assign(size_t(n * nterms), 0.0);
+            for (int64_t fam = 0; fam < nfamilies; ++fam) {
+                const itercc_spin_quad_family &f = families[fam];
+                items.clear();
+                for (int64_t r = r0; r < r1; ++r) {
+                    const int32_t *c = coordinates + 8 * r;
+                    for (int64_t t = 0; t < nterms; ++t) {
+                        const itercc_spin_quad_dense_term &term = terms[t];
+                        if (term.family != fam) continue;
+                        uint64_t key = 0;
+                        for (int a = 0; a < 8; ++a) {
+                            const int64_t axis = term.amplitude_axes[a];
+                            key = (key << 8) | (axis >= 0 ? uint64_t(c[axis]) : uint64_t(0xFF));
+                        }
+                        int64_t ext = 0;
+                        for (int64_t e = 0; e < term.nexternal; ++e)
+                            ext += c[term.external_axes[e]] * term.external_strides[e];
+                        items.push_back(DenseItem{key, (r - r0) * nterms + t, ext});
+                    }
+                }
+                std::sort(items.begin(), items.end(),
+                          [](const DenseItem &x, const DenseItem &y) { return x.key < y.key; });
+                for (size_t i = 0; i < items.size();) {
+                    size_t j = i;
+                    while (j < items.size() && items[j].key == items[i].key) ++j;
+                    // The context's amplitude values and symmetry class.
+                    int64_t value[8], delta = f.spin_change, gamma = f.irrep;
+                    for (int a = 0; a < 8; ++a) {
+                        value[a] = int64_t((items[i].key >> (8 * (7 - a))) & 0xFF);
+                        if (value[a] == 0xFF) continue;
+                        if (a < 4) {
+                            delta -= value[a] % 2 == 0;
+                            gamma ^= virtual_irrep[value[a] / 2];
+                        } else {
+                            delta += value[a] % 2 == 0;
+                            gamma ^= occupied_irrep[value[a] / 2];
+                        }
+                    }
+                    const int64_t cls = (delta - f.class_min) * 8 + gamma;
+                    if (cls < 0 || cls >= f.nclasses || f.class_start[cls + 1] == f.class_start[cls]) {
+                        i = j;
+                        continue;
+                    }
+                    const int64_t k0 = f.class_start[cls], size = f.class_start[cls + 1] - k0;
+                    tvec.resize(size_t(size));
+                    for (int64_t k = 0; k < size; ++k) {
+                        const int32_t *in = f.internal + 4 * (k0 + k);
+                        int64_t p[4], h[4];
+                        for (int a = 0; a < 8; ++a) {
+                            int64_t x = value[a];
+                            if (x == 0xFF) {
+                                // summed letter: its index among the internals
+                                const itercc_spin_quad_dense_term &term = terms[items[i].slot % nterms];
+                                x = in[-1 - term.amplitude_axes[a]];
+                            }
+                            (a < 4 ? p[a] : h[a - 4]) = x;
+                        }
+                        tvec[size_t(k)] = quad_lookup(f, p, h, no, nv);
+                    }
+                    const double *wblock = f.weights + f.weight_offset[cls];
+                    for (size_t m = i; m < j; ++m) {
+                        const double *w = wblock + items[m].ext * size;
+                        double sum = 0.0;
+                        for (int64_t k = 0; k < size; ++k) sum += w[k] * tvec[size_t(k)];
+                        z[size_t(items[m].slot)] = sum;
+                    }
+                    i = j;
+                }
+            }
+            for (int64_t r = 0; r < n; ++r) {
+                double value = out[r0 + r];
+                for (int64_t t = 0; t < nterms; ++t) value += terms[t].alpha * z[size_t(r * nterms + t)];
+                out[r0 + r] = value;
+            }
+        }
     }
 }

@@ -100,3 +100,19 @@ def test_compiled_slots_probe_a_prefix():
         engine.slot_program = True
         np.testing.assert_array_equal(engine.probe_rank_four(vector, limit), loop)
     assert np.any(loop)
+
+
+def test_dense_direct_terms_match_the_sparse_lookups(monkeypatch):
+    """Rank-four direct packed terms by contexts (each context's T4 values
+    gathered once, then dense dot products) add the same nonzero products in
+    the same order as the per-row sparse lookups: the same action bit for bit,
+    on any number of threads."""
+    from itercc._cpu_triples import thread_scope
+    engine = _triplet_engine(packed_spin=True, intermediate_cache_gib=0.0001)
+    vector = np.random.default_rng(739).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_DIRECT_DENSE", "0")
+    sparse = engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_DIRECT_DENSE", "1")
+    for threads in (1, 3):
+        with thread_scope(threads):
+            np.testing.assert_array_equal(engine._action(vector), sparse)

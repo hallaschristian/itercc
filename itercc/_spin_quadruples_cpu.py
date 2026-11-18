@@ -128,6 +128,22 @@ def merged_diagrams(rank):
     return tuple((*group[:5], tuple(group[5])) for group in groups.values())
 
 
+def _pair_factor(pairs):
+    """The summed antisymmetric pairs counted once: their orderings."""
+    factor = 1
+    for pair in pairs:
+        factor *= factorial(len(pair))
+    return factor
+
+
+def dense_enabled():
+    """Rank-four direct terms by contexts (itercc_spin_quad_dense) unless
+    ITERCC_DIRECT_DENSE=0 (then the sparse per-row lookups)."""
+    import os
+
+    return os.environ.get("ITERCC_DIRECT_DENSE", "1") != "0"
+
+
 def _coefficient_rows(tensor, subscript, amplitude, output, halves):
     """Exact sparse rows; no numerical threshold or integral screening."""
     external = tuple(c for c in subscript if c in output)
@@ -159,6 +175,12 @@ def _coefficient_rows(tensor, subscript, amplitude, output, halves):
 
 
 _i8 = np.int64
+FAMILY = np.dtype([("virtual_map", _i8), ("virtual_key", _i8), ("hole_map", _i8), ("hole_key", _i8),
+                   ("packed", _i8), ("spin_change", _i8), ("irrep", _i8), ("class_min", _i8), ("nclasses", _i8),
+                   ("class_start", _i8), ("internal", _i8), ("weights", _i8), ("weight_offset", _i8),
+                   ("n_ext", _i8)])
+DENSE_TERM = np.dtype([("family", _i8), ("nexternal", _i8), ("external_axes", _i8, 4),
+                       ("external_strides", _i8, 4), ("amplitude_axes", _i8, 8), ("alpha", np.float64)])
 TERM = np.dtype([("virtual_map", _i8), ("virtual_key", _i8), ("hole_map", _i8), ("hole_key", _i8),
                  ("packed", _i8), ("nexternal", _i8), ("external_axes", _i8, 8),
                  ("external_extents", _i8, 8), ("amplitude_axes", _i8, 8), ("starts", _i8),
@@ -209,6 +231,17 @@ class PackedBinaryAction:
                 result += part
         return result
 
+    def _merged_tensor(self, derivative, members):
+        """The merged coefficient of a group (see `merged_diagrams`), or None."""
+        tensor = None
+        for scale, diagram, small_spec, order in members:
+            part = self._coefficient(diagram[2][:-1], small_spec, derivative)
+            if part is None:
+                continue
+            part = scale * np.transpose(part, order)
+            tensor = part if tensor is None else tensor + part
+        return None if tensor is None else np.ascontiguousarray(tensor)
+
     def _merged_rows(self, rank, number, derivative, labels, amplitude, output, pairs, members):
         """Sparse rows of a merged coefficient (see `merged_diagrams`), or None.
         The ground-state ones (derivative 1) do not depend on the direction and
@@ -217,16 +250,115 @@ class PackedBinaryAction:
         kept = self.engine.__dict__.setdefault("_packed_merged_rows", {}) if derivative == 1 else self.rows
         if key in kept:
             return kept[key]
-        tensor = None
-        for scale, diagram, small_spec, order in members:
-            part = self._coefficient(diagram[2][:-1], small_spec, derivative)
-            if part is None:
-                continue
-            part = scale * np.transpose(part, order)
-            tensor = part if tensor is None else tensor + part
-        kept[key] = (None if tensor is None else
-                     _coefficient_rows(np.ascontiguousarray(tensor), labels, amplitude, output, pairs))
+        tensor = self._merged_tensor(derivative, members)
+        kept[key] = None if tensor is None else _coefficient_rows(tensor, labels, amplitude, output, pairs)
         return kept[key]
+
+    def _dense_family(self, rank, number, derivative, labels, amplitude, output, pairs, members):
+        """Class tables of a merged coefficient for itercc_spin_quad_dense, or
+        None: its summed tuples (in the order of `labels`, ordered within each
+        antisymmetric pair as `_coefficient_rows` keeps them) sorted by
+        symmetry class, and its blocks of external values by tuples."""
+        key = "dense", rank, number, derivative
+        kept = self.engine.__dict__.setdefault("_packed_merged_rows", {}) if derivative == 1 else self.rows
+        if key in kept:
+            return kept[key]
+        tensor = self._merged_tensor(derivative, members)
+        if tensor is None:
+            kept[key] = None
+            return None
+        engine = self.engine
+        occupied = np.asarray(engine._spatial_labels["o"], dtype=np.int64)
+        virtual = np.asarray(engine._spatial_labels["v"], dtype=np.int64)
+        internal = [c for c in labels if c not in output]
+        particle = [amplitude.index(c) < 4 for c in internal]
+        n_ext = int(np.prod(tensor.shape[:len(labels) - len(internal)]))
+        dims = tensor.shape[len(labels) - len(internal):]
+        tuples = np.stack(np.meshgrid(*(np.arange(d) for d in dims), indexing="ij"), axis=-1).reshape(-1, len(dims))
+        keep = np.ones(len(tuples), dtype=bool)
+        for pair in pairs:
+            columns = [internal.index(c) for c in pair]
+            for a, b in zip(columns, columns[1:]):
+                keep &= tuples[:, a] < tuples[:, b]
+        flat = np.flatnonzero(keep)
+        tuples = tuples[keep]
+        delta = np.zeros(len(tuples), dtype=np.int64)
+        gamma = np.zeros(len(tuples), dtype=np.int64)
+        for column, is_particle in enumerate(particle):
+            spins = tuples[:, column] % 2 == 0
+            if is_particle:
+                delta += spins
+                gamma ^= virtual[tuples[:, column] // 2]
+            else:
+                delta -= spins
+                gamma ^= occupied[tuples[:, column] // 2]
+        class_min = -sum(not x for x in particle)
+        nclasses = (len(internal) + 1) * 8
+        classes = (delta - class_min) * 8 + gamma
+        order = np.argsort(classes, kind="stable")
+        counts = np.bincount(classes, minlength=nclasses)
+        class_start = np.ascontiguousarray(np.r_[0, np.cumsum(counts)], dtype=np.int64)
+        values = np.zeros((len(tuples), 4), dtype=np.int32)
+        values[:, :len(internal)] = tuples[order]
+        weights_all = tensor.reshape(n_ext, -1)[:, flat[order]]
+        blocks, offsets, at = [], [], 0
+        for c in range(nclasses):
+            block = np.ascontiguousarray(weights_all[:, class_start[c]:class_start[c + 1]])
+            offsets.append(at)
+            blocks.append(block.reshape(-1))
+            at += block.size
+        weights = np.ascontiguousarray(np.concatenate(blocks)) if at else np.zeros(1)
+        layout = (engine._ground_t4, engine._direction_t4)[derivative]
+        maps = self._maps(derivative)
+        family = dict(arrays=(class_start, values, weights, np.asarray(offsets, dtype=np.int64)),
+                      spin_change=layout.spin_change, irrep=layout.irrep, class_min=class_min,
+                      nclasses=nclasses, n_ext=n_ext, maps=maps, factor=_pair_factor(pairs),
+                      internal=tuple(internal))
+        kept[key] = family
+        return family
+
+    def _add_dense(self, rank, coordinates, result, library):
+        """The rank-four direct terms by contexts (see itercc_spin_quad_dense)."""
+        engine = self.engine
+        families, terms = [], []
+        for number, (equivalent, labels, amplitude, output, pairs, members) in enumerate(merged_diagrams(rank)):
+            for derivative in range(2):
+                vector = self.vectors[derivative]
+                if vector is None:
+                    continue
+                family = self._dense_family(rank, number, derivative, labels, amplitude, output, pairs, members)
+                if family is None:
+                    continue
+                maps = family["maps"]
+                class_start, values, weights, offsets = family["arrays"]
+                index = len(families)
+                families.append((maps.virtual_map.ctypes.data, maps.virtual_key.ctypes.data,
+                                 maps.hole_map.ctypes.data, maps.hole_key.ctypes.data, vector.ctypes.data,
+                                 family["spin_change"], family["irrep"], family["class_min"], family["nclasses"],
+                                 class_start.ctypes.data, values.ctypes.data, weights.ctypes.data,
+                                 offsets.ctypes.data, family["n_ext"]))
+                internal = family["internal"]
+                external = [c for c in labels if c in output]
+                dims = [2 * (engine.nvir if output.index(c) < rank else engine.nocc) for c in external]
+                strides = [int(np.prod(dims[k + 1:])) for k in range(len(dims))]
+                for (p, sp), (h, sh) in _permutation_pairs(rank, equivalent):
+                    positions = p + tuple(rank + i for i in h)
+                    axes = [positions[output.index(c)] for c in external]
+                    amp_axes = [positions[output.index(c)] if c in output else -1 - internal.index(c)
+                                for c in amplitude]
+                    terms.append((index, len(external), tuple(axes) + (0,) * (4 - len(axes)),
+                                  tuple(strides) + (0,) * (4 - len(strides)), tuple(amp_axes),
+                                  family["factor"] * sp * sh / factorial(rank)**2))
+        if not terms:
+            return
+        family_table = np.array(families, dtype=FAMILY)
+        term_table = np.array(terms, dtype=DENSE_TERM)
+        occupied = np.ascontiguousarray(engine._spatial_labels["o"], dtype=np.int64)
+        virtual = np.ascontiguousarray(engine._spatial_labels["v"], dtype=np.int64)
+        library.spin_quad_dense(len(result), coordinates.ctypes.data, 2 * engine.nocc, 2 * engine.nvir,
+                                occupied.ctypes.data, virtual.ctypes.data, len(family_table),
+                                family_table.ctypes.data, len(term_table), term_table.ctypes.data,
+                                result.ctypes.data, cpu_threads(None))
 
     def add(self, rank, coordinates, result):
         engine = self.engine
@@ -237,6 +369,11 @@ class PackedBinaryAction:
             return
         library = _cpu_kernels.library()
         terms = []          # one itercc_spin_quad_term per kernel call, in order
+        dense = (rank == 4 and dense_enabled() and hasattr(library, "spin_quad_dense")
+                 and 2 * max(engine.nocc, engine.nvir) < 255)
+        if dense:
+            self._add_dense(rank, coordinates, result, library)
+            return
         for number, (equivalent, labels, amplitude, output, pairs, members) in enumerate(merged_diagrams(rank)):
             for derivative in range(2):
                 vector = self.vectors[derivative]
