@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <vector>
 #include "itercc/core.h"
+#include "gemm_kernel.h"
 
 extern "C" void itercc_spin_quad_contract(
     int64_t count, int rank, const int32_t *coordinates,
@@ -99,14 +100,23 @@ extern "C" void itercc_spin_quad_contract_terms(int64_t count, int rank, const i
 // context gathers them once, over the summed tuples of the one symmetry
 // class (alpha count and irrep difference) that can complete it to a stored
 // amplitude, and every row and permutation using it takes a contiguous dot
-// product with its block of the coefficient. Each row then adds its terms in
-// order, as itercc_spin_quad_contract_terms does.
+// product with its block of the coefficient. Contexts of one symmetry class
+// share that block, so they go together into one GEMM (the coefficient rows
+// of their external values times their gathered T4 columns) when most of
+// its entries are wanted, instead of a coefficient row streamed per item.
+// Each row then adds its terms in order, as itercc_spin_quad_contract_terms
+// does.
 namespace {
 
 struct DenseItem {
     uint64_t key;    // the context: amplitude values, 0xFF for summed letters
     int64_t slot;    // row in the slot * nterms + term
     int64_t ext;     // flat index of the external values in the coefficient
+};
+
+struct Context {
+    int64_t cls;         // symmetry class of the summed tuples
+    int64_t begin, end;  // its items
 };
 
 double quad_lookup(const itercc_spin_quad_family &f, const int64_t *p, const int64_t *h, int64_t no, int64_t nv)
@@ -138,7 +148,12 @@ extern "C" void itercc_spin_quad_dense(int64_t count, const int32_t *coordinates
     #pragma omp parallel num_threads(threads)
     {
         std::vector<DenseItem> items;
-        std::vector<double> z, tvec;
+        std::vector<Context> contexts;
+        std::vector<double> z, tmat, product;
+        std::vector<int64_t> rows, ar, ak, bc, cc, cr;
+        int64_t most_ext = 1;
+        for (int64_t fam = 0; fam < nfamilies; ++fam) most_ext = std::max(most_ext, families[fam].n_ext);
+        std::vector<int64_t> row_of(size_t(most_ext), -1);
         #pragma omp for schedule(dynamic, 1)
         for (int64_t s = 0; s < nslots; ++s) {
             const int64_t r0 = bounds[size_t(s)], r1 = bounds[size_t(s + 1)], n = r1 - r0;
@@ -164,51 +179,109 @@ extern "C" void itercc_spin_quad_dense(int64_t count, const int32_t *coordinates
                 }
                 std::sort(items.begin(), items.end(),
                           [](const DenseItem &x, const DenseItem &y) { return x.key < y.key; });
+                // Contexts (runs of equal keys) with their symmetry classes.
+                contexts.clear();
                 for (size_t i = 0; i < items.size();) {
                     size_t j = i;
                     while (j < items.size() && items[j].key == items[i].key) ++j;
-                    // The context's amplitude values and symmetry class.
-                    int64_t value[8], delta = f.spin_change, gamma = f.irrep;
+                    int64_t delta = f.spin_change, gamma = f.irrep;
                     for (int a = 0; a < 8; ++a) {
-                        value[a] = int64_t((items[i].key >> (8 * (7 - a))) & 0xFF);
-                        if (value[a] == 0xFF) continue;
+                        const int64_t v = int64_t((items[i].key >> (8 * (7 - a))) & 0xFF);
+                        if (v == 0xFF) continue;
                         if (a < 4) {
-                            delta -= value[a] % 2 == 0;
-                            gamma ^= virtual_irrep[value[a] / 2];
+                            delta -= v % 2 == 0;
+                            gamma ^= virtual_irrep[v / 2];
                         } else {
-                            delta += value[a] % 2 == 0;
-                            gamma ^= occupied_irrep[value[a] / 2];
+                            delta += v % 2 == 0;
+                            gamma ^= occupied_irrep[v / 2];
                         }
                     }
                     const int64_t cls = (delta - f.class_min) * 8 + gamma;
-                    if (cls < 0 || cls >= f.nclasses || f.class_start[cls + 1] == f.class_start[cls]) {
-                        i = j;
-                        continue;
-                    }
-                    const int64_t k0 = f.class_start[cls], size = f.class_start[cls + 1] - k0;
-                    tvec.resize(size_t(size));
-                    for (int64_t k = 0; k < size; ++k) {
-                        const int32_t *in = f.internal + 4 * (k0 + k);
-                        int64_t p[4], h[4];
-                        for (int a = 0; a < 8; ++a) {
-                            int64_t x = value[a];
-                            if (x == 0xFF) {
-                                // summed letter: its index among the internals
-                                const itercc_spin_quad_dense_term &term = terms[items[i].slot % nterms];
-                                x = in[-1 - term.amplitude_axes[a]];
-                            }
-                            (a < 4 ? p[a] : h[a - 4]) = x;
-                        }
-                        tvec[size_t(k)] = quad_lookup(f, p, h, no, nv);
-                    }
-                    const double *wblock = f.weights + f.weight_offset[cls];
-                    for (size_t m = i; m < j; ++m) {
-                        const double *w = wblock + items[m].ext * size;
-                        double sum = 0.0;
-                        for (int64_t k = 0; k < size; ++k) sum += w[k] * tvec[size_t(k)];
-                        z[size_t(items[m].slot)] = sum;
-                    }
+                    if (cls >= 0 && cls < f.nclasses && f.class_start[cls + 1] > f.class_start[cls])
+                        contexts.push_back(Context{cls, int64_t(i), int64_t(j)});
                     i = j;
+                }
+                std::stable_sort(contexts.begin(), contexts.end(),
+                                 [](const Context &x, const Context &y) { return x.cls < y.cls; });
+                for (size_t g = 0; g < contexts.size();) {
+                    size_t h = g;
+                    while (h < contexts.size() && contexts[h].cls == contexts[g].cls) ++h;
+                    const int64_t cls = contexts[g].cls, k0 = f.class_start[cls];
+                    const int64_t size = f.class_start[cls + 1] - k0, ncontexts = int64_t(h - g);
+                    const double *wblock = f.weights + f.weight_offset[cls];
+                    // Each context's T4 values over the class's summed tuples: column c.
+                    tmat.resize(size_t(size * ncontexts));
+                    int64_t wanted = 0;
+                    for (int64_t c = 0; c < ncontexts; ++c) {
+                        const Context &x = contexts[g + size_t(c)];
+                        wanted += x.end - x.begin;
+                        const DenseItem &first = items[size_t(x.begin)];
+                        const itercc_spin_quad_dense_term &term = terms[first.slot % nterms];
+                        double *column = tmat.data() + c * size;
+                        for (int64_t k = 0; k < size; ++k) {
+                            const int32_t *in = f.internal + 4 * (k0 + k);
+                            int64_t p[4], q[4];
+                            for (int a = 0; a < 8; ++a) {
+                                int64_t v = int64_t((first.key >> (8 * (7 - a))) & 0xFF);
+                                if (v == 0xFF) v = in[-1 - term.amplitude_axes[a]];   // a summed letter
+                                (a < 4 ? p[a] : q[a - 4]) = v;
+                            }
+                            column[k] = quad_lookup(f, p, q, no, nv);
+                        }
+                    }
+                    // The distinct external values of the class's items: the GEMM rows.
+                    rows.clear();
+                    for (int64_t c = 0; c < ncontexts; ++c) {
+                        const Context &x = contexts[g + size_t(c)];
+                        for (int64_t m = x.begin; m < x.end; ++m) {
+                            const int64_t e = items[size_t(m)].ext;
+                            if (row_of[size_t(e)] < 0) {
+                                row_of[size_t(e)] = int64_t(rows.size());
+                                rows.push_back(e);
+                            }
+                        }
+                    }
+                    const int64_t nrows = int64_t(rows.size());
+                    if (size >= 8 && nrows * ncontexts <= 2 * wanted) {
+                        ar.resize(size_t(nrows));
+                        cr.resize(size_t(nrows));
+                        for (int64_t r = 0; r < nrows; ++r) {
+                            ar[size_t(r)] = rows[size_t(r)] * size;
+                            cr[size_t(r)] = r * ncontexts;
+                        }
+                        ak.resize(size_t(size));
+                        for (int64_t k = 0; k < size; ++k) ak[size_t(k)] = k;
+                        bc.resize(size_t(ncontexts));
+                        cc.resize(size_t(ncontexts));
+                        for (int64_t c = 0; c < ncontexts; ++c) {
+                            bc[size_t(c)] = c * size;
+                            cc[size_t(c)] = c;
+                        }
+                        product.assign(size_t(nrows * ncontexts), 0.0);
+                        itercc::IndirectGemm gemm{nrows, ncontexts, size, wblock, ar.data(), ak.data(), false,
+                                                  tmat.data(), ak.data(), bc.data(), true,
+                                                  product.data(), cr.data(), cc.data(), 1.0};
+                        itercc::indirect_gemm(gemm);
+                        for (int64_t c = 0; c < ncontexts; ++c) {
+                            const Context &x = contexts[g + size_t(c)];
+                            for (int64_t m = x.begin; m < x.end; ++m)
+                                z[size_t(items[size_t(m)].slot)] =
+                                    product[size_t(row_of[size_t(items[size_t(m)].ext)] * ncontexts + c)];
+                        }
+                    } else {                     // few wanted entries: a dot product per item
+                        for (int64_t c = 0; c < ncontexts; ++c) {
+                            const Context &x = contexts[g + size_t(c)];
+                            const double *column = tmat.data() + c * size;
+                            for (int64_t m = x.begin; m < x.end; ++m) {
+                                const double *w = wblock + items[size_t(m)].ext * size;
+                                double sum = 0.0;
+                                for (int64_t k = 0; k < size; ++k) sum += w[k] * column[k];
+                                z[size_t(items[size_t(m)].slot)] = sum;
+                            }
+                        }
+                    }
+                    for (int64_t e : rows) row_of[size_t(e)] = -1;
+                    g = h;
                 }
             }
             for (int64_t r = 0; r < n; ++r) {

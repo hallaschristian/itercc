@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Triplet direct packed T4 terms (`itercc_spin_quad_dense`): the contexts of
+  one symmetry class share their coefficient block, so they go into one GEMM
+  (`indirect_gemm`, coefficient rows of the items' external values times
+  the gathered T4 columns) when most of its entries are wanted, instead of
+  a coefficient row streamed per item. Results move at round-off (3.9e-16 on
+  water, 4.6e-16 on the first 400 CuF slots) and do not depend on the thread
+  count. Water cc-pVDZ actions take 2.07 s instead of 2.61 s; at CuF size
+  the kernel is bound by its T4 lookups and stays at about 4.8 s per 400
+  slots.
 - Triplet EOM-CCSDTQ tile products form only the tile entries their
   projection reads. A projection group takes only the permutations that keep
   each antisymmetric subset of external letters increasing, so a raw tile is
