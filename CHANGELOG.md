@@ -55,7 +55,8 @@
   (goovv t2) T4), so each entry is looked up once instead of once per
   diagram, and the ground-state tables are kept across actions. The action
   changes at round-off (1.9e-15 relative on water cc-pVDZ, which takes 3.7 s
-  instead of 3.95 s).
+  instead of 3.95 s). On the first 400 CuF slots the direct terms take 25.4 s
+  instead of 41.6 s (121.2 s instead of 135.1 s in all).
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

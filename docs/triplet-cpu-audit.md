@@ -276,6 +276,28 @@ time (4,951 of 7,638 thread s) and less than half of the 16-slot time; the
 rest is outside the slot program, most likely the direct packed terms, which
 these runs do not time.
 
+Timed (`5e55b47`, same sample and allocation type): on the 16-slot sample
+(second action, 9.98 s) the slot program took 4.44 s and the direct packed
+T4 terms 2.88 s (coefficient tables in Python 1.48 s, the compiled lookups
+1.11 s), the rest of the action's setup about 2.7 s. On the first 400 slots
+(135.1 s) the slot program took 86.7 s and the direct terms 41.6 s, 39.6 s
+of it in the lookups: about 43,000 signed T4 lookups per output row (11
+billion for the 16 slots), growing with the rows (about 27 minutes for a
+whole action). Pairs of diagrams read the same T4 entries in the same
+pattern (gvovo T4 and (goovv t2) T4, 9,300 lookups per row each, likewise
+gvvvv, goooo, fvv and foo with their t2 partners), so `merged_diagrams` adds
+their coefficients into one table (10 rank-four diagrams in 5 tables) and
+the ground-state tables stay on the engine across actions (`0aa0fff`):
+
+| Case | `5e55b47` | `0aa0fff` | Direct terms | Their lookups |
+| --- | ---: | ---: | --- | --- |
+| 400 slots, 8 GiB (first action) | 135.05 | 121.24 | 41.6 -> 25.4 | 39.6 -> 24.2 |
+| 16 slots, 8 GiB (second action) | 9.98 | 7.94 | 2.88 -> 1.38 | 1.11 -> 0.95 |
+
+The outputs agree with `5e55b47` to 8e-16 (relative, in norm). On 400 slots
+the slot program is now three quarters of the time (89.7 of 121.2 s); at
+these rates a whole action would take about 1.1 hours.
+
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 
 The blocked GEMMs now read packed T4 in place: a T4 operand is `SignedRows`
