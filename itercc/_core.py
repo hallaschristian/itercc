@@ -16,7 +16,7 @@ from pathlib import Path
 import sys
 import threading
 
-CORE_ABI = 31
+CORE_ABI = 32
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -52,7 +52,7 @@ CPU_FUNCTIONS = {
     "scratch_release": ([_T], None),
     "sym_contract": ([_I, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _D, _T, _T], _T),
     "sym_contract_packed": ([_I, _P, _P, _P, _P, _P, _I, _P, _P, _P, _P, _P, _P, _P, _D, _T, _T], _T),
-    "triplet_slots": ([_P, _I, _I, _P, _P, _P, _P, _I, _P, _T, _T, _I], _T),
+    "triplet_slots": ([_P, _I, _I, _P, _P, _P, _P, _I, _P, _T, _T, _I, _P], _T),
     "triplet_profile": ([_P, _T], None),
     "triplet_contraction_profile": ([_I, _P, _P, _T], None),
     "quad_gather_boxes": ([_P, _P, _P, _P, _I, _I, _I, _I, _T, _P, _T], None),

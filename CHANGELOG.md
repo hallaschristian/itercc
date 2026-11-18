@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Triplet slot program, propagated: progress callbacks (`slot_finished`, as
+  the CuF drivers print them) arrive after each wave of slots again instead
+  of once at the end (`itercc_triplet_slots` takes a progress function, core
+  ABI 32); the engine's memory estimate counts the program's per-thread
+  tiles, dense direct-term buffers and partial sums; docs/guide.md and
+  llms.txt describe the compiled path, its switches and why `occupied_slab`
+  should stay at its default with packed T4.
 - Triplet EOM-CCSDTQ rank-four slots run as one compiled program on the CPU
   (`itercc_triplet_slots`, core ABI 28): water cc-pVDZ on 12 threads takes
   4.0-4.3 s per action instead of 26.4 s (6-31G: 0.47 s instead of 8.3 s).

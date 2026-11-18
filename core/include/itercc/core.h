@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 31
+#define ITERCC_CORE_ABI 32
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -718,12 +718,13 @@ typedef struct {
  * fusion group run after the tile's other instructions as fused GEMMs, one
  * per block of output rows and columns (other sums, so other rounding);
  * without, every product runs in place, as the Python loop does. The results
- * do not depend on the thread count. Returns 0, or 1 (nothing done) for a
- * tile without a plan. */
+ * do not depend on the thread count. `progress` (may be NULL) gets the slots
+ * done after each wave, on the calling thread. Returns 0, or 1 (nothing done)
+ * for a tile without a plan. */
 int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
                          const double *const *bases, const double *ground, const double *direction,
                          double *result, int64_t cache_bytes, int64_t *stats, int threads, int fused,
-                         int64_t share_work);
+                         int64_t share_work, void (*progress)(int64_t done, int64_t total));
 /* Diagnostic thread seconds of itercc_triplet_slots by phase (with
  * ITERCC_SLOT_PROFILE=1): zeroing, products into tiles, into intermediates,
  * packed row setup, gathers, cache waits, slot sums, intermediate allocation,

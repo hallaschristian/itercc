@@ -151,7 +151,11 @@ builds the one-electron X2C SOC operator. See docs/guide.md#spin-orbit-coupling.
 ### Others
 `TensorCC(Hamiltonian.restricted(h, eri, nocc, constant), rank=3)`: slow
 independent spin-orbital reference for small checks. `TripletEOMCCSDTQ`:
-experimental, small systems only.
+experimental. On the CPU, `occupied_tiles=True, packed_spin=True` runs its
+rank-four slots as one compiled program (shared intermediates, dense direct
+T4 terms); keep `occupied_slab=None`, and budget about twice
+`intermediate_cache_gib` (the slot waves' partial sums). Switches:
+docs/guide.md (`ITERCC_TRIPLET_PROGRAM=0` and others).
 
 ## GPU
 

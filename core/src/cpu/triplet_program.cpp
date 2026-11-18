@@ -568,7 +568,8 @@ bool slot_tiles(const itercc_slot_program &p, i64 s, i64 &at, std::vector<Tile> 
 extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
                                     const double *const *bases, const double *ground,
                                     const double *direction, double *result, int64_t cache_bytes,
-                                    int64_t *stats, int threads, int fused, int64_t share_work)
+                                    int64_t *stats, int threads, int fused, int64_t share_work,
+                                    void (*progress)(int64_t done, int64_t total))
 {
     if (share_work <= 0) share_work = kShareWork;
     const i64 nv = p->nv, nv4 = nv * nv * nv * nv;
@@ -649,6 +650,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
             }
         }
         s0 = s1;
+        if (progress != nullptr) progress(s0, nslots);   // between waves, on the calling thread
     }
     if (stats != nullptr) {
         stats[0] = cache.hits();

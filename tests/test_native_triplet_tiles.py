@@ -90,6 +90,18 @@ def test_compiled_slots_match_the_loop(active):
     assert engine._slot_programs and all(p is not None for p in engine._slot_programs.values())
 
 
+def test_compiled_slots_report_progress():
+    """The compiled program reports the slots done after each wave, as the
+    loop reports its milestones (the CuF drivers print them)."""
+    engine = _triplet_engine(action_only=True, intermediate_cache_gib=0.0001)
+    vector = np.random.default_rng(741).normal(size=engine.space.size)
+    reports = []
+    engine._action(vector, ranks=(4,), slot_limit=5,
+                   slot_finished=lambda done, total, seconds: reports.append((done, total)))
+    assert reports and reports[-1] == (5, len(engine._direction_t4.slots))
+    assert engine._slot_programs and all(p is not None for p in engine._slot_programs.values())
+
+
 def test_compiled_slots_probe_a_prefix():
     engine = _triplet_engine(action_only=True, intermediate_cache_gib=0.0001)
     vector = np.random.default_rng(737).normal(size=engine.space.size)

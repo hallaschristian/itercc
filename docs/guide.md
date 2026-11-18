@@ -126,12 +126,24 @@ set `memory_budget_gib` for the full allocation. Cached direction-dependent
 products are discarded between actions. `last_intermediate_cache` reports
 hits, misses and peak cached array bytes. Ground-state effective coefficients
 and canonical address maps are reused for the lifetime of the EOM engine.
-`occupied_slab=None` (default) sizes summed occupied slabs from the tile byte
-budget. Set a positive integer, for example `occupied_slab=2`, to cap their
-width across the shared tiled contractions. Wider slabs are not universally
-faster: benchmark the intended molecule and CPU before selecting a width.
-Both CuF triplet benchmark drivers expose this as `--occupied-slab` and record
-the setting. It changes contraction tiling, not the Hamiltonian or equations.
+On the CPU the rank-four slots then run as one compiled program: every raw
+tile of an action on its own thread, intermediates shared between tiles
+through the cache (large ones computed in pieces that waiting tiles help
+with), and the direct packed T4 terms by contexts (each context's T4 values
+gathered once, then dense dot products). Its waves of slots hold as many
+partial sums as the cache holds bytes, so budget about twice
+`intermediate_cache_gib` for them; without a cache setting the program takes
+half of what `memory_budget_gib` leaves beside the engine's estimate (which
+counts the program's tiles and buffers). Progress callbacks arrive after each
+wave. The action agrees with the earlier Python slot loop to round-off, and
+bit for bit with `ITERCC_TRIPLET_FUSED=0`; the switches below fall back.
+Packed T4 is read in place, so by default (`occupied_slab=None`) its summed
+occupied letters stay whole. A positive `occupied_slab`, for example 2, still
+cuts them into slabs of at most that width, which with packed T4 only repeats
+work (an intermediate and a product per slab); keep the default unless
+benchmarking. Both CuF triplet benchmark drivers expose this as
+`--occupied-slab` and record the setting. It changes contraction tiling, not
+the Hamiltonian or equations.
 Canonical CPU input expansion also uses the compiled core. The packed
 engine's Davidson memory check accounts for its actual packed/tiled storage
 instead of a logical dense rank-four tensor. See the
@@ -241,10 +253,15 @@ gather kernels; see the [packed-tile measurements](triplet-cpu-audit.md#native-p
 | `ITERCC_TILE_MEMORY`, `ITERCC_TILE_TEAM`, `ITERCC_LOWER_TEAMS` | CCSDTQ tile memory budget (bytes), team size, concurrent teams |
 | `ITERCC_DIIS_COMPACT=0` | float64 instead of compact float32 host T4 DIIS history |
 | `ITERCC_GEMM_AUTOTUNE=0` | CUDA: static GEMM route choice instead of timing both |
+| `ITERCC_TRIPLET_PROGRAM=0` | triplet EOM-CCSDTQ: rank-four slots in the Python loop instead of the compiled program |
+| `ITERCC_TRIPLET_FUSED=0` | triplet slot program: products into a tile one by one (the loop's action bit for bit) |
+| `ITERCC_DIRECT_DENSE=0` | triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
+| `ITERCC_SLOT_SHARE_WORK` | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
+| `ITERCC_SLOT_PROFILE=1`, `ITERCC_SLOT_SORT=0` | slot program diagnostics: phase timers (`itercc_triplet_profile`), tiles in slot order |
 
 ## How results are validated
 
-The test suite (`pytest`, about 940 tests) checks residuals and energies
+The test suite (`pytest`, about 1030 tests) checks residuals and energies
 against PySCF's RCCSDT and RCCSDTQ, exact diagonalization and an independent
 spin-orbital implementation; EOM roots and polarizabilities against
 determinant-space references and finite-field derivatives; and every compiled

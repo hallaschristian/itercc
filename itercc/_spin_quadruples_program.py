@@ -79,6 +79,9 @@ class ProgramStruct(ctypes.Structure):
                 + [(name, ctypes.c_void_p) for name in _ARRAYS])
 
 
+_PROGRESS = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64)
+
+
 class Unsupported(Exception):
     """A product the compiled program cannot run (the Python loop runs the action)."""
 
@@ -617,10 +620,10 @@ class SlotProgram:
         self._arrays = arrays
 
     def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,
-            share_work=0):
+            share_work=0, progress=None):
         """Add the projected rank-four slots into `result` (zero on entry: the
-        slots' rows get the Python loop's values). Returns the intermediate
-        cache statistics."""
+        slots' rows get the Python loop's values). `progress(done)` is called
+        after each wave of slots. Returns the intermediate cache statistics."""
         pointers = np.zeros(max(1, len(self._bases)), dtype=np.int64)
         for name, pair in blocks.items():
             for side, array in enumerate((pair.value, pair.tangent)):
@@ -635,6 +638,7 @@ class SlotProgram:
             raise ValueError("The rank-four result must be a contiguous float64 array")
         nslots = self.nslots if slot_limit is None else min(int(slot_limit), self.nslots)
         stats = np.zeros(8, dtype=np.int64)
+        callback = None if progress is None else _PROGRESS(lambda done, total: progress(int(done)))
         # Waves hold as many partial sums as the intermediate cache holds
         # bytes (at least 256 MiB): larger waves let more tiles that share
         # intermediates run together.
@@ -644,7 +648,7 @@ class SlotProgram:
             None if ground is None else ground.ctypes.data,
             None if direction is None else direction.ctypes.data,
             result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads), int(bool(fused)),
-            int(share_work))
+            int(share_work), ctypes.cast(callback, ctypes.c_void_p) if callback is not None else None)
         if status != 0:
             raise RuntimeError(f"The compiled slot program failed (status {status})")
         return dict(hits=int(stats[0]), misses=int(stats[1]), peak_bytes=int(stats[2]), shared=int(stats[3]),
