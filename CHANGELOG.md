@@ -38,6 +38,12 @@
   -> 4.81 s, CCSD aug-cc-pVTZ and CCSDT cc-pVTZ iterations 3-6% faster; a
   triplet EOM-CCSDTQ action (cc-pVDZ) 3.10 -> 2.98 s. Energies agree to
   1e-13 with the same iteration counts.
+- docs/benchmarks.md, its charts, README and llms.txt rerun for IterCC on one
+  Xeon 8480CL socket (whole node held, 56 threads) after the review: most
+  iterations 2-8% faster (CCSD aug-cc-pVQZ 59 -> 57 ms, CCSDT aug-cc-pVTZ
+  0.139 -> 0.130 s, CCSDTQ aug-cc-pVDZ 0.496 -> 0.484 s), EOM-CCSDT
+  aug-cc-pVDZ 5.2 -> 4.8 s and cc-pVTZ 13.3 -> 12.4 s; the other programs'
+  records are unchanged.
 
 - Triplet slot program, propagated: progress callbacks (`slot_finished`, as
   the CuF drivers print them) arrive after each wave of slots again instead
