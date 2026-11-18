@@ -65,7 +65,10 @@
   it takes a dot product with a dense block of the coefficient. The sparse
   per-row lookups mostly read amplitudes that cannot exist. The same nonzero
   products are added in the same order, so the action is the sparse path's
-  bit for bit; `ITERCC_DIRECT_DENSE=0` keeps the sparse path.
+  bit for bit; `ITERCC_DIRECT_DENSE=0` keeps the sparse path. The slot
+  program passes the direct terms 2^22 rows at a time (the kernel runs a
+  call's slots in parallel). On the first 400 CuF slots (56 cores) they take
+  5.4 s instead of 24.2 s, and the whole probe 99.0 s instead of 121.2 s.
 - Benchmarks: IterCC re-timed on one 56-core cluster socket (node held
   whole, 56 threads at most). Three cc-pVTZ EOM-CCSDT roots take 13.3 s
   instead of 15.1 s, CCSD polarizabilities in cc-pVTZ 7.3 s instead of

@@ -53,9 +53,9 @@ stale prebuilt libraries are rejected.
 
 1. **Batch the CCSDTQ rank-four work across occupied slots.** The compiled
    slot program (Evidence below) now runs every tile of an action in the core,
-   about 6.5x faster on water cc-pVDZ and 3.3x on a 16-slot CuF sample (0.34-0.44
-   s per slot on the first 400 slots); the g-T4 intermediates, computed one
-   per thread while other tiles wait, now limit it. The scalar
+   about 6.5x faster on water cc-pVDZ and 4.8x on a 16-slot CuF sample (0.25
+   s per slot on the first 400 slots, direct terms included); the slot
+   program's intermediates now take most of the time. The scalar
    occupied-slot loop repeatedly forms raw virtual tiles and projects them
    into canonical output. The earlier benchmark covers eight slots, not a
    full rank-four action. Fast triples and doubles do not establish a
@@ -297,6 +297,29 @@ the ground-state tables stay on the engine across actions (`0aa0fff`):
 The outputs agree with `5e55b47` to 8e-16 (relative, in norm). On 400 slots
 the slot program is now three quarters of the time (89.7 of 121.2 s); at
 these rates a whole action would take about 1.1 hours.
+
+Dense direct terms (`69be4e8`, `88eba68`): for a row and permutation, the T4
+indices a term does not sum over form a context, and rows and permutations
+with the same context read the same T4 values. `itercc_spin_quad_dense`
+gathers a context's values once, only over the summed tuples of the one
+symmetry class (alpha count and irrep difference) that can complete it to a
+stored amplitude, and takes each row's and permutation's dot product with a
+dense block of the merged coefficient; the sparse rows mostly read
+amplitudes that cannot exist (about 565 coefficient entries per ring row and
+permutation, about 94 of them valid). The same nonzero products are added in
+the same order, so the outputs equal the sparse path's bit for bit (on water
+and on both CuF samples). The kernel runs a call's slots in parallel, so the
+direct terms now go 2^22 rows per call instead of 2^18 (12 CuF slots for 56
+threads):
+
+| 400 slots, 8 GiB (first action) | `0aa0fff` sparse | `69be4e8` dense, 2^18 rows | `88eba68` dense, 2^22 rows |
+| --- | ---: | ---: | ---: |
+| Direct-term kernel | 24.2 | 28.5 | 5.4 |
+| Probe | 121.2 | 120.1 | 99.0 |
+
+The 16-slot sample takes 7.39 s (direct terms 0.90 s; its 16 slots keep at
+most 16 threads busy). On 400 slots the slot program is now 88% of the time
+(87.0 of 99.0 s); at these rates a whole action would take about 55 minutes.
 
 ### Packed T4 rows in the GEMMs (November 17, `0afcdff`)
 
