@@ -99,7 +99,7 @@ def _evaluate(xp, tree, operands, keys=None, cache=None, blocked=None):
 
 
 def tile_product(xp, spec, operands, target, coefficient, no, nv, fixed=(), *, keys=None, cache=None,
-                 blocked=None):
+                 blocked=None, ordered=()):
     """Evaluate only the requested occupied tile and accumulate into its output."""
     _, output = spec.split("->")
     if len(operands) == 1:
@@ -116,7 +116,7 @@ def tile_product(xp, spec, operands, target, coefficient, no, nv, fixed=(), *, k
     else:
         engine, labels, irreps = blocked
         engine.einsum(binary, a, b, view, alpha=coefficient, beta=1.0, labels=labels,
-                      irreps=(_tree_irrep(left, irreps), _tree_irrep(right, irreps)))
+                      irreps=(_tree_irrep(left, irreps), _tree_irrep(right, irreps)), ordered=ordered)
 
 
 def spin_blocks(tensor):
@@ -189,6 +189,24 @@ def projection_diagrams(rank):
                  for group, diagrams in groups.items())
 
 
+@lru_cache(maxsize=None)
+def ordered_letters(equivalent, raw, output):
+    """Ordering constraints (letter, letter, strict) on the particle letters of
+    a raw tile that its projection reads. A projection group takes only the
+    coset permutations that keep each antisymmetric subset of external
+    positions (letters from one operand half) increasing (`_permutation_pairs`):
+    raw letters x before y of a subset hold spin orbitals 2x + s_x < 2y + s_y,
+    so x < y, or x <= y when s_x < s_y. A tile product forms only those entries
+    (its other entries are never read): half of an antisymmetric pair, five
+    sixths of a triple."""
+    rank = len(output) // 2
+    found = []
+    for subset in equivalent[0]:
+        for p, q in zip(subset, subset[1:]):
+            found.append((output[p], output[q], not raw[p] < raw[q]))
+    return tuple(found)
+
+
 _PACKED_TILE_BYTES = 256 * 2**20
 _ALL = (None, None)
 _TILE_LABELS = {}
@@ -228,9 +246,11 @@ def _packed_cuts(holes, free, no, nv, budget, occupied_slab):
 
 def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                   labels=None, engine=None, occupied_slab=None, diagrams=None, intermediates=None,
-                  compiled_products=False, out=None):
+                  compiled_products=False, out=None, equivalent=None):
     """Raw virtual tile for one external spin pattern and occupied tuple
-    (added into `out` when given: a zeroed array of the tile's shape)."""
+    (added into `out` when given: a zeroed array of the tile's shape). With
+    the projection group's `equivalent` subsets, the blocked engine forms only
+    the entries the projection reads (`ordered_letters`)."""
     output_shape = (nv,) * rank + tuple(value.stop - value.start for value in fixed)
     if out is not None and out.shape != output_shape:
         raise ValueError("The output tile has the wrong shape")
@@ -294,10 +314,13 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                         return tile
 
                     operands = tuple(lambda i=i: fetch(i) for i in range(len(names)))
+                    ordered = (() if equivalent is None or engine is None else
+                               ordered_letters(equivalent, raw, output))
                     if engine is not None and len(names) == 2:
                         engine.einsum(spec, *[op() for op in operands], target, alpha=coefficient,
                                       beta=1.0, labels=_tile_labels(labels["o"], selected),
-                                      irreps=tuple(irrep if i == derivative else 0 for i in range(2)))
+                                      irreps=tuple(irrep if i == derivative else 0 for i in range(2)),
+                                      ordered=ordered)
                     else:
                         unit = tuple(c for c in cuts if selected[c].stop - selected[c].start == 1)
                         keys = None
@@ -310,5 +333,6 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                                      keys=keys, cache=intermediates,
                                      blocked=((engine, _tile_labels(labels["o"], selected),
                                                tuple(irrep if i == derivative else 0 for i in range(len(names))))
-                                              if compiled_products and engine is not None else None))
+                                              if compiled_products and engine is not None else None),
+                                     ordered=ordered if compiled_products else ())
     return result

@@ -174,7 +174,7 @@ class TripletEOMCCSDTQ:
     def __init__(self, solver, amplitudes, orbital_irreps=None, irrep=0, *,
                  backend="cpu", memory_budget_gib=4, occupied_tiles=False, action_only=False,
                  packed_spin=False, packed_contractions=None, intermediate_cache_gib=0,
-                 occupied_slab=None, cpu_threads=None):
+                 occupied_slab=None, cpu_threads=None, partial_sums_gib=None):
         no, nv = solver.nocc, solver.nvir
         # Kernel threads of every action and solve: the option, else the
         # ground-state solver's.
@@ -197,6 +197,13 @@ class TripletEOMCCSDTQ:
         if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
         self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
+        # The slot program's waves hold this many bytes of partial sums (default:
+        # as many as the cache, at most 32 GiB). Tiles sharing intermediates run
+        # in the same wave; a cache larger than the waves still keeps
+        # intermediates between them (CuF: 262 GiB of distinct intermediates).
+        if partial_sums_gib is not None and (not np.isfinite(partial_sums_gib) or partial_sums_gib <= 0):
+            raise ValueError("Partial sums need a positive finite budget")
+        self.partial_sums_bytes = (None if partial_sums_gib is None else int(partial_sums_gib * 2**30))
         self._packed_direction = packed_spin or action_only
         if self._packed_direction and not occupied_tiles:
             raise ValueError("The packed spin layout requires occupied tiling")
@@ -275,12 +282,13 @@ class TripletEOMCCSDTQ:
         if occupied_tiles and self._packed_direction and self.packed_contractions:
             # The compiled rank-four slot program (_compiled_slots): a raw tile
             # per thread, the dense direct terms' per-slot buffers (72 terms and
-            # 16 contexts per row at most), and the waves' partial sums, as
-            # large as an explicit intermediate cache (a default cache takes
+            # 16 contexts per row at most), and the waves' partial sums
+            # (`_partial_bytes` of an explicit cache; a default cache takes
             # half of what remains, the partial sums the other half).
             rows = max((len(p) for p in self._direction_t4.groups.values()), default=0)
-            self.estimated_dense_bytes += (_runtime.cpu_threads(self.cpu_threads) * (8 * nv**4 + rows * (72 * 8 + 16 * 24))
-                                           + self.intermediate_cache_bytes)
+            threads = _runtime.cpu_threads(self.cpu_threads)
+            self.estimated_dense_bytes += (threads * (8 * nv**4 + rows * (72 * 8 + 16 * 24))
+                                           + self._partial_bytes(self.intermediate_cache_bytes))
             if self.estimated_dense_bytes > self.memory_budget_bytes:
                 raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
         self.action_only = action_only
@@ -477,12 +485,13 @@ class TripletEOMCCSDTQ:
             done = total = len(chosen)
         # Shared intermediates: the configured budget, else half of what the
         # memory budget leaves beside the estimate (which counts the program's
-        # tiles and direct-term buffers): the waves' partial sums take as much
-        # as the cache. At least 256 MiB.
+        # tiles and direct-term buffers), at least 256 MiB. The waves' partial
+        # sums take `_partial_bytes` (as much as the cache, at most 32 GiB).
         cache = self.intermediate_cache_bytes
         if not cache:
             cache = (self.memory_budget_bytes - self.estimated_dense_bytes) // 2
         cache = max(cache, 2**28)
+        partial = self._partial_bytes(cache)
         # Fused tile products (other rounding); ITERCC_TRIPLET_FUSED=0 keeps
         # the loop's products, bit for bit.
         fused = self.fused_tiles and _runtime.enabled("ITERCC_TRIPLET_FUSED")
@@ -495,7 +504,7 @@ class TripletEOMCCSDTQ:
                 slot_finished(slots, total, perf_counter() - started)
         self._program_cache = program.run(blocks, self.amplitudes[3], direction, result, cache_bytes=cache,
                                           threads=cpu_threads(), slot_limit=done, fused=fused, share_work=share,
-                                          progress=report, slots=chosen)
+                                          progress=report, slots=chosen, partial_bytes=partial)
         if packed_action is not None and done:
             # The direct packed terms of consecutive slots (windows follow each
             # other), at least 2^22 rows per call: the dense kernel runs a
@@ -574,10 +583,17 @@ class TripletEOMCCSDTQ:
                                      occupied_slab=self.occupied_slab,
                                      intermediates=intermediates,
                                      compiled_products=self.packed_contractions,
-                                     out=self._zeroed_tile()).reshape((self.nvir,) * rank)
+                                     out=self._zeroed_tile(),
+                                     equivalent=equivalent).reshape((self.nvir,) * rank)
                 for rows, particles, permutations in by_group.values():
                     self._accumulate_projection(result, rows, particles, permutations, tile, multiplicity)
         result /= len(_permutations(rank))**2
+
+    def _partial_bytes(self, cache):
+        """Bytes of partial sums per wave of the slot program."""
+        if self.partial_sums_bytes is not None:
+            return self.partial_sums_bytes
+        return min(int(cache), 32 * 2**30)
 
     def _zeroed_tile(self):
         """A zeroed rank-four raw tile for one occupied tuple, reused: each tile

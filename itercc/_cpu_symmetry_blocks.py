@@ -110,14 +110,14 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         self._label_keys[id(labels)] = (labels, key)
         return key
 
-    def _entry(self, spec, a, b, out, labels, irreps):
+    def _entry(self, spec, a, b, out, labels, irreps, ordered=()):
         """(structure, block table, kernel arguments) of one call signature, cached."""
         call = (spec, a.shape, a.strides, a.dtype.char, b.shape, b.strides, b.dtype.char,
                 out.shape, out.strides, out.dtype.char, int(irreps[0]), int(irreps[1]),
-                self._label_key_of(labels))
+                self._label_key_of(labels), tuple(ordered))
         hit = self._calls.get(call)
         if hit is None:
-            structure, plan = self._resolve(spec, a, b, out, labels, irreps)
+            structure, plan = self._resolve(spec, a, b, out, labels, irreps, ordered)
             # The table and offset columns live as long as the cached plan, so
             # their addresses are resolved once instead of on every call.
             arguments = (None if not structure or not len(plan) else
@@ -126,10 +126,10 @@ class CpuSymmetryBlocks(SymmetryBlocks):
             hit = self._calls[call] = (structure, plan, arguments)
         return hit
 
-    def plan_for(self, spec, a, b, out, labels=None, irreps=(0, 0)):
+    def plan_for(self, spec, a, b, out, labels=None, irreps=(0, 0), ordered=()):
         """(structure, block table) of one call signature, cached, or (False, None)
         when the product has no blocked plan (`einsum` then uses the fallback)."""
-        return self._entry(spec, a, b, out, labels, irreps)[:2]
+        return self._entry(spec, a, b, out, labels, irreps, ordered)[:2]
 
     @staticmethod
     def flags(structure):
@@ -137,7 +137,8 @@ class CpuSymmetryBlocks(SymmetryBlocks):
         return (int(bool(structure["ta"])) | 2 * int(bool(structure["tb"]))
                 | 4 * int(bool(structure["rfast"])))
 
-    def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0), threads=None):
+    def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0), threads=None,
+               ordered=()):
         """out = beta * out + alpha * einsum(spec, a, b) (see `SymmetryBlocks.einsum`)
         on `threads` (default: the engine's count, else `cpu_threads`)."""
         if isinstance(a, SignedRows):
@@ -147,7 +148,7 @@ class CpuSymmetryBlocks(SymmetryBlocks):
                 inputs, output = spec.split("->")
                 first, second = inputs.split(",")
                 spec, a, b, irreps = f"{second},{first}->{output}", b, a, (irreps[1], irreps[0])
-        structure, plan, arguments = self._entry(spec, a, b, out, labels, irreps)
+        structure, plan, arguments = self._entry(spec, a, b, out, labels, irreps, ordered)
         if not structure:
             if self.fallback is None:
                 raise ValueError(f"No symmetry-blocked plan for {spec}")

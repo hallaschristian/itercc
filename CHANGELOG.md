@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Triplet EOM-CCSDTQ tile products form only the tile entries their
+  projection reads. A projection group takes only the permutations that keep
+  each antisymmetric subset of external letters increasing, so a raw tile is
+  read only where those letters are in increasing spin-orbital order (x < y,
+  or x <= y when x's spin bit is the smaller): half of an antisymmetric
+  pair, five sixths of a triple. The symmetry-block planner now takes
+  ordering constraints on free letters (`_composite(..., ordered)`) and
+  builds GEMMs over the kept tuples only; the slot program and the Python
+  loop pass the constraints of each projection group and raw spin pattern
+  (`ordered_letters`). The water cc-pVDZ action is bit for bit the one
+  before; on the CuF layout the tile products of an action fall from
+  6.7e13 to 1.7e13 multiply-adds (offline model), and the first 400 CuF
+  slots take 62.7 s instead of 99.0 s (slot program 50.0 s instead of
+  87.0 s; output within 3.4e-16 of the earlier one).
+- `TripletEOMCCSDTQ(partial_sums_gib=...)`: the slot program's waves hold
+  that many bytes of partial sums (default: as many as the cache, at most
+  32 GiB) instead of always as many as the intermediate cache, so a cache
+  can hold every distinct intermediate of an action (262 GiB on CuF, where
+  each is then computed once: the modelled action falls from 1.2e14 to
+  2.0e13 multiply-adds) without waves of the same size.
 - Triplet EOM-CCSDTQ actions split over processes (`itercc/_slot_split.py`):
   every rank-four slot writes only its own rows with values that do not
   depend on the other slots of the process, so `Partners` deals the slots

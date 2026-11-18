@@ -180,3 +180,25 @@ def test_split_action_with_a_worker_process(tmp_path):
     assert engine.rank_four_partner is None and not (tmp_path / "exchange").exists()
     for one, two in zip(whole, split):
         np.testing.assert_allclose(two, one, rtol=1e-12, atol=1e-12 * np.abs(one).max())
+
+
+def test_ordered_tiles_and_wave_sizes_keep_the_action(monkeypatch):
+    """Tile products form only the entries the projection reads (ordered
+    letters of antisymmetric subsets): the action equals the one with every
+    tile entry formed, and does not depend on how many partial sums a wave
+    holds."""
+    from itercc import _spin_quadruples_program, _spin_quadruples_tiles
+
+    engine = _split_engine()
+    vector = np.random.default_rng(749).normal(size=engine.space.size)
+    ordered = engine.sigma(vector)
+    engine.partial_sums_bytes = 1                  # one slot per wave
+    assert np.array_equal(engine.sigma(vector), ordered)
+    engine.partial_sums_bytes = None
+    for module in (_spin_quadruples_program, _spin_quadruples_tiles):
+        monkeypatch.setattr(module, "ordered_letters", lambda *args: ())
+    engine._slot_programs = {}                     # recorded again, with dense tiles
+    dense = engine.sigma(vector)
+    np.testing.assert_allclose(ordered, dense, rtol=1e-13, atol=1e-13 * np.abs(dense).max())
+    engine.slot_program = False                    # the Python tile loop, dense tiles
+    np.testing.assert_allclose(engine.sigma(vector), dense, rtol=1e-13, atol=1e-13 * np.abs(dense).max())

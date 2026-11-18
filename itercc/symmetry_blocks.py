@@ -376,20 +376,30 @@ def _parse(spec):
     return first, second, output
 
 
-def _composite(letters, extent, labels, nirrep):
+def _composite(letters, extent, labels, nirrep, ordered=()):
     """Sorted composite index over `letters`: permutation, per-irrep starts and irreps.
 
     Returns (order, starts) where `order[s]` is the row-major flat index (over
     `letters`) of the s-th element in irrep-sorted order and `starts[g]` is the
-    first sorted position with irrep g (length nirrep + 1).
+    first sorted position with irrep g (length nirrep + 1). `ordered` holds
+    (i, j, strict) for positions i, j of `letters`: only tuples whose value at
+    i is below (strict) or at most the value at j are kept, so a product
+    writes only the entries its reader takes (antisymmetric pairs, say).
     """
     if not letters:
         irreps = np.zeros(1, dtype=np.int64)
     else:
         grids = np.meshgrid(*[np.asarray(labels[c], dtype=np.int64) for c in letters], indexing="ij")
         irreps = reduce(np.bitwise_xor, grids).reshape(-1)
-    order = np.argsort(irreps, kind="stable")
-    counts = np.bincount(irreps, minlength=nirrep)
+    flat = np.arange(irreps.size)
+    if ordered:
+        values = np.indices([extent[c] for c in letters]).reshape(len(letters), -1)
+        keep = np.ones(irreps.size, dtype=bool)
+        for i, j, strict in ordered:
+            keep &= values[i] < values[j] if strict else values[i] <= values[j]
+        flat = np.flatnonzero(keep)
+    order = flat[np.argsort(irreps[flat], kind="stable")]
+    counts = np.bincount(irreps[flat], minlength=nirrep)
     return order, np.r_[0, np.cumsum(counts)]
 
 
@@ -465,12 +475,15 @@ class SymmetryBlocks:
         """A cache key of one letter's labels (its extent with one irrep)."""
         return len(values) if self.nirrep == 1 else values.tobytes()
 
-    def _sorted(self, letters, extent, labels):
-        """Cached `_composite` over `letters` (keyed by extents and labels)."""
-        key = tuple((extent[c], self._labels_key(labels[c])) for c in letters)
+    def _sorted(self, letters, extent, labels, ordered=()):
+        """Cached `_composite` over `letters` (keyed by extents, labels and the
+        ordering constraints among `letters`: (letter, letter, strict))."""
+        local = tuple((letters.index(x), letters.index(y), bool(strict)) for x, y, strict in ordered
+                      if x in letters and y in letters)
+        key = (tuple((extent[c], self._labels_key(labels[c])) for c in letters), local)
         hit = self._composites.get(key)
         if hit is None:
-            hit = self._composites[key] = (key, *_composite(letters, extent, labels, self.nirrep))
+            hit = self._composites[key] = (key, *_composite(letters, extent, labels, self.nirrep, local))
         return hit
 
     def _offsets(self, letters, extent, strides, composite):
@@ -483,7 +496,7 @@ class SymmetryBlocks:
             hit = self._tables[key] = cp.asarray(_offsets(letters, extent, strides, composite[1]))
         return hit
 
-    def _structure(self, spec, a, b, out, labels):
+    def _structure(self, spec, a, b, out, labels, ordered=()):
         sa, sb, so = _parse(spec)
         rows = [c for c in so if c in sa and c not in sb]
         cols = [c for c in so if c in sb and c not in sa]
@@ -532,8 +545,9 @@ class SymmetryBlocks:
         # [combination][column][k]. cuBLAS reads either through its transpose flags.
         ta = last(vrow, sta) < last(summed, sta)
         tb = last(summed, stb) < last(vcol, stb)
-        r_sorted = self._sorted(vrow, extent, labels)
-        c_sorted = self._sorted(vcol, extent, labels)
+        # Ordered free letters of one operand: only those output entries are formed.
+        r_sorted = self._sorted(vrow, extent, labels, ordered)
+        c_sorted = self._sorted(vcol, extent, labels, ordered)
         k_sorted = self._sorted(summed, extent, labels)
         (_, _, r_start), (_, _, c_start), (_, _, k_start) = r_sorted, c_sorted, k_sorted
         combos_r = list(product(*[range(extent[c]) for c in orow]))
@@ -693,8 +707,9 @@ class SymmetryBlocks:
                     shared=0 if shallow else 16 * (tr + tc + 2) * 8,
                     table=cp.asarray(np.ascontiguousarray(table.T)), shape=(grid, (256, 1, 1)))
 
-    def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0)):
-        """out = beta * out + alpha * einsum(spec, a, b).
+    def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0), ordered=()):
+        """out = beta * out + alpha * einsum(spec, a, b) (with `ordered`, only
+        the output entries those constraints keep; see `_composite`).
 
         `labels` replaces the labels of any letters for this call; `irreps`
         gives the total irreps of `a` and `b` (zero for totally symmetric
@@ -707,10 +722,10 @@ class SymmetryBlocks:
         call = (spec, a.shape, a.strides, a.dtype.char, b.shape, b.strides, b.dtype.char,
                 out.shape, out.strides, out.dtype.char, int(irreps[0]), int(irreps[1]),
                 () if not labels else tuple((c, np.asarray(v, dtype=np.int64).tobytes())
-                                            for c, v in labels.items()))
+                                            for c, v in labels.items()), tuple(ordered))
         hit = self._calls.get(call)
         if hit is None:
-            hit = self._calls[call] = self._resolve(spec, a, b, out, labels, irreps)
+            hit = self._calls[call] = self._resolve(spec, a, b, out, labels, irreps, ordered)
         structure, plan = hit
         if not structure or (plan["count"] and not plan.get("fused") and _grouped_gemm() is None):
             if self.fallback is None:
@@ -796,8 +811,10 @@ class SymmetryBlocks:
                 np.int32(plan["rfast"])))
         return plan
 
-    def _resolve(self, spec, a, b, out, labels, irreps):
-        """(structure, plan) for one call signature, or (False, None) for the fallback."""
+    def _resolve(self, spec, a, b, out, labels, irreps, ordered=()):
+        """(structure, plan) for one call signature, or (False, None) for the fallback.
+        `ordered`: (letter, letter, strict) constraints on free output letters
+        (see `_composite`); the other output entries are not written."""
         current = self.labels if not labels else {**self.labels,
                                                    **{c: np.asarray(v, dtype=np.int64)
                                                       for c, v in labels.items()}}
@@ -809,11 +826,11 @@ class SymmetryBlocks:
         fixed = () if not labels else tuple(sorted(
             (c, self._labels_key(current[c])) for c in labels
             if c not in enumerated))
-        key = (spec, a.shape, a.strides, b.shape, b.strides, out.shape, out.strides, fixed)
+        key = (spec, a.shape, a.strides, b.shape, b.strides, out.shape, out.strides, fixed, tuple(ordered))
         structure = self._structures.get(key)
         if structure is None:
             ok = self._supported(a, b, out)
-            structure = (self._structure(spec, a, b, out, current) if ok else None) or False
+            structure = (self._structure(spec, a, b, out, current, ordered) if ok else None) or False
             self._structures[key] = structure
         if not structure:
             return False, None

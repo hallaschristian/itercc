@@ -41,7 +41,7 @@ from math import prod
 import numpy as np
 
 from . import _cpu_kernels
-from ._spin_quadruples_tiles import (_PACKED_TILE_BYTES, _packed_cuts, _tree_irrep, contraction_schedule,
+from ._spin_quadruples_tiles import (_PACKED_TILE_BYTES, _packed_cuts, ordered_letters, _tree_irrep, contraction_schedule,
                                      external_routes, routes)
 from ._tensor_scatter import SignedRows, _gather_steps
 
@@ -227,7 +227,7 @@ class SlotProgram:
         axes = (4, 5, 6, 7, 0, 1, 2, 3)
         return (ROWS, index, tuple(layout[a] for a in axes), tuple(steps[a] for a in axes), None)
 
-    def _contract(self, kind, spec, a, b, out, alpha, beta, selected, irreps):
+    def _contract(self, kind, spec, a, b, out, alpha, beta, selected, irreps, ordered=()):
         if a[0] == ROWS:                       # packed rows are read as the second operand
             if b[0] == ROWS:
                 raise Unsupported
@@ -247,13 +247,13 @@ class SlotProgram:
             labels.append((c, bound))
         irreps = (int(irreps[0]), int(irreps[1]))
         operands = tuple((x[0] == ROWS, x[2], x[3]) for x in (a, b, out))
-        identity = (spec, operands, tuple(labels), irreps)
+        identity = (spec, operands, tuple(labels), irreps, tuple(ordered))
         number = self._contractions.get(identity)
         if number is None:
             number = self._contractions[identity] = len(self._contraction_info)
             arrays = tuple(_rows_like(shape, strides) if rows else _like(shape, strides)
                            for rows, shape, strides in operands)
-            self._contraction_info.append([spec, arrays, tuple(labels), irreps, None])
+            self._contraction_info.append([spec, arrays, tuple(labels), irreps, None, tuple(ordered)])
         kind.code.append((CONTRACT, -1, -1, len(kind.contracts), a, b, out, float(alpha), beta))
         kind.contracts.append((number, tuple(positions)))
 
@@ -325,9 +325,11 @@ class SlotProgram:
                             return value
 
                         tile = (TILE, 0, tile_shape, tile_strides, None)
+                        # Only the entries the projection reads (`ordered_letters`).
+                        ordered = ordered_letters(self.groups[group][0], raw, output)
                         if len(names) == 2:
                             self._contract(kind, spec, operand(0), operand(1), tile, coefficient, 1.0,
-                                           selected, irreps)
+                                           selected, irreps, ordered)
                             continue
                         if len(names) < 2:
                             raise Unsupported
@@ -338,7 +340,7 @@ class SlotProgram:
                                 tuple(tile_strides[o] for o in order), None)
                         a, b = evaluate(left), evaluate(right)
                         self._contract(kind, binary, a, b, view, coefficient, 1.0, selected,
-                                       (_tree_irrep(left, irreps), _tree_irrep(right, irreps)))
+                                       (_tree_irrep(left, irreps), _tree_irrep(right, irreps)), ordered)
         return kind
 
     def _kind(self, group, raw):
@@ -356,11 +358,11 @@ class SlotProgram:
         if found is not None:
             return found
         info = self._contraction_info[number]
-        spec, arrays, labels, operand_irreps, structure = info
+        spec, arrays, labels, operand_irreps, structure, ordered = info
         occupied = self.occupied_irreps
         current = {c: (np.asarray([irreps[bound[1]]], dtype=np.int64) if bound[0] == _FIXED
                        else occupied[bound[0]:bound[1]]) for c, bound in labels}
-        found_structure, plan, _ = self.blocked._entry(spec, *arrays, current, operand_irreps)
+        found_structure, plan, _ = self.blocked._entry(spec, *arrays, current, operand_irreps, ordered)
         if not found_structure:
             raise Unsupported
         if structure is None:
@@ -620,7 +622,7 @@ class SlotProgram:
         self._arrays = arrays
 
     def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,
-            share_work=0, progress=None, slots=None):
+            share_work=0, progress=None, slots=None, partial_bytes=None):
         """Add the projected rank-four slots into `result` (zero on entry: the
         slots' rows get the Python loop's values). `slots` (increasing slot
         indices) runs only those slots, `slot_limit` the first ones; each slot
@@ -653,7 +655,7 @@ class SlotProgram:
         # Waves hold as many partial sums as the intermediate cache holds
         # bytes (at least 256 MiB): larger waves let more tiles that share
         # intermediates run together.
-        partial = max(_PARTIAL_DOUBLES, int(cache_bytes) // 8)
+        partial = max(_PARTIAL_DOUBLES, int(cache_bytes if partial_bytes is None else partial_bytes) // 8)
         status = self.library.triplet_slots(
             ctypes.byref(struct), nslots, partial, pointers.ctypes.data,
             None if ground is None else ground.ctypes.data,
