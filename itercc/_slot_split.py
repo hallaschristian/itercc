@@ -3,9 +3,10 @@
 Each slot of the rank-four action writes only its own rows, and the values
 it writes do not depend on which other slots run in the same process. So the
 slots can be divided between processes and the images added: the sum is the
-one-process action bit for bit. On one node a process per socket, each with
-its socket's cores and memory, nearly halves an action without any thread
-crossing a socket.
+one-process action bit for bit. The tiles of ranks two and three are dealt
+out too (`lower_part`; their sums then differ by rounding). On one node a
+process per socket, each with its socket's cores and memory, nearly halves
+an action without any thread crossing a socket.
 
 * `split_slots` deals the slots out in blocks.
 * `Partners` belongs to the process that runs the eigensolver. It starts the
@@ -77,11 +78,11 @@ class Partners:
         self.exchange = Path(exchange) if exchange is not None else Path(
             "/dev/shm" if Path("/dev/shm").is_dir() else ".") / f"itercc-split-{os.getpid()}"
         self.exchange.mkdir(parents=True)
-        rows = engine.space.slices[3]
+        rows = engine.space.size - engine.space.slices[1].start        # ranks two to four
         self.vector = np.lib.format.open_memmap(self.exchange / "vector.npy", mode="w+", dtype=np.float64,
                                                 shape=(engine.space.size,))
         self.images = [np.lib.format.open_memmap(self.exchange / f"image-{k}.npy", mode="w+",
-                                                 dtype=np.float64, shape=(rows.stop - rows.start,))
+                                                 dtype=np.float64, shape=(rows,))
                        for k in range(1, self.parts)]
         self.processes = []
         environment = dict(os.environ)
@@ -98,6 +99,7 @@ class Partners:
         self.action = 0
         self.seconds = []           # each action's wait for the workers after this share
         engine.rank_four_slots = split_slots(total, 0, self.parts, block)
+        engine.lower_part = (0, self.parts)
         engine.rank_four_partner = self
         import atexit
         atexit.register(self.close)
@@ -121,7 +123,7 @@ class Partners:
         os.replace(signal.with_suffix(".tmp"), signal)
 
     def finish(self):
-        """The workers' rank-four rows of the last vector, summed."""
+        """The workers' rows of ranks two to four for the last vector, summed."""
         started = time.perf_counter()
         pending = set(range(1, self.parts))
         while pending:
@@ -154,15 +156,18 @@ class Partners:
         self.processes = []
         self.engine.rank_four_partner = None
         self.engine.rank_four_slots = None
+        self.engine.lower_part = None
         shutil.rmtree(self.exchange, ignore_errors=True)
 
 
 def serve(engine, exchange, part, parts, block=BLOCK):
-    """A worker's loop: for every vector the solver sends, this part's rank-four rows."""
+    """A worker's loop: for every vector the solver sends, this part's rows of
+    ranks two to four (its lower tiles and rank-four slots)."""
     from . import _runtime
 
     exchange = Path(exchange)
     engine.rank_four_slots = split_slots(len(engine._direction_t4.slots), part, parts, block)
+    engine.lower_part = (part, parts)
     vector = np.load(exchange / "vector.npy", mmap_mode="r")
     image = np.load(exchange / f"image-{part}.npy", mmap_mode="r+")
     print(json.dumps(dict(event="slot_worker_ready", part=part, parts=parts,
@@ -177,7 +182,7 @@ def serve(engine, exchange, part, parts, block=BLOCK):
         action += 1
         started = time.perf_counter()
         with _runtime.thread_scope(engine.cpu_threads):
-            rows = engine._action(np.asarray(vector), ranks=(4,))
+            rows = engine._action(np.asarray(vector), ranks=(2, 3, 4))
         np.copyto(image, rows)
         image.flush()
         (exchange / f"done-{action}-{part}").write_text("")

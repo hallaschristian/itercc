@@ -190,7 +190,7 @@ def projection_diagrams(rank):
 
 
 @lru_cache(maxsize=None)
-def ordered_letters(equivalent, raw, output):
+def ordered_letters(equivalent, raw, output, holes=False):
     """Ordering constraints (letter, letter, strict) on the particle letters of
     a raw tile that its projection reads. A projection group takes only the
     coset permutations that keep each antisymmetric subset of external
@@ -198,12 +198,16 @@ def ordered_letters(equivalent, raw, output):
     raw letters x before y of a subset hold spin orbitals 2x + s_x < 2y + s_y,
     so x < y, or x <= y when s_x < s_y. A tile product forms only those entries
     (its other entries are never read): half of an antisymmetric pair, five
-    sixths of a triple."""
+    sixths of a triple. With `holes`, the occupied letters too (tiles whose
+    occupied axes are whole, as in ranks two and three; a rank-four slot
+    fixes them)."""
     rank = len(output) // 2
     found = []
-    for subset in equivalent[0]:
-        for p, q in zip(subset, subset[1:]):
-            found.append((output[p], output[q], not raw[p] < raw[q]))
+    for side, subsets in enumerate(equivalent[:2] if holes else equivalent[:1]):
+        for subset in subsets:
+            for p, q in zip(subset, subset[1:]):
+                p, q = p + side * rank, q + side * rank
+                found.append((output[p], output[q], not raw[p] < raw[q]))
     return tuple(found)
 
 
@@ -246,11 +250,12 @@ def _packed_cuts(holes, free, no, nv, budget, occupied_slab):
 
 def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                   labels=None, engine=None, occupied_slab=None, diagrams=None, intermediates=None,
-                  compiled_products=False, out=None, equivalent=None):
+                  compiled_products=False, out=None, equivalent=None, hole_order=False):
     """Raw virtual tile for one external spin pattern and occupied tuple
     (added into `out` when given: a zeroed array of the tile's shape). With
     the projection group's `equivalent` subsets, the blocked engine forms only
-    the entries the projection reads (`ordered_letters`)."""
+    the entries the projection reads (`ordered_letters`); with `hole_order`,
+    also among the occupied letters (whole occupied axes: ranks two and three)."""
     output_shape = (nv,) * rank + tuple(value.stop - value.start for value in fixed)
     if out is not None and out.shape != output_shape:
         raise ValueError("The output tile has the wrong shape")
@@ -314,8 +319,12 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                         return tile
 
                     operands = tuple(lambda i=i: fetch(i) for i in range(len(names)))
+                    # Occupied letters keep their order only in a whole tile
+                    # (a slab's local indices start elsewhere).
                     ordered = (() if equivalent is None or engine is None else
-                               ordered_letters(equivalent, raw, output))
+                               ordered_letters(equivalent, raw, output,
+                                               hole_order and all(selected[c] == s and not s.start
+                                                                  for c, s in cuts.items())))
                     if engine is not None and len(names) == 2:
                         engine.einsum(spec, *[op() for op in operands], target, alpha=coefficient,
                                       beta=1.0, labels=_tile_labels(labels["o"], selected),

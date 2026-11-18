@@ -130,19 +130,24 @@ On the CPU the rank-four slots then run as one compiled program: every raw
 tile of an action on its own thread, intermediates shared between tiles
 through the cache (large ones computed in pieces that waiting tiles help
 with), and the direct packed T4 terms by contexts (each context's T4 values
-gathered once, then dense dot products). Its waves of slots hold as many
-partial sums as the cache holds bytes, so budget about twice
-`intermediate_cache_gib` for them; without a cache setting the program takes
-half of what `memory_budget_gib` leaves beside the engine's estimate (which
-counts the program's tiles and buffers). Progress callbacks arrive after each
-wave. The action agrees with the earlier Python slot loop to round-off, and
+gathered once, the contexts of a symmetry class in one GEMM with their
+coefficient block). Tile products form only the entries their projection
+reads (letters of each antisymmetric subset in increasing spin-orbital
+order), in ranks two and three among the occupied letters as well. Its waves
+of slots hold `partial_sums_gib` of partial sums (default: as much as the
+cache, at most 32 GiB), so a cache can be as large as an action's distinct
+intermediates (262 GiB on CuF) without waves of that size; without a cache
+setting the program takes half of what `memory_budget_gib` leaves beside the
+engine's estimate (which counts the program's tiles and buffers). Progress
+callbacks arrive after each wave. The action agrees with the earlier Python slot loop to round-off, and
 bit for bit with `ITERCC_TRIPLET_FUSED=0`; the switches below fall back.
 An action can also be shared by processes, one per socket (or node):
 `itercc._slot_split.Partners(engine, builder, kwargs, parts=2)` starts
-workers that build the same engine, deals the rank-four slots out in blocks,
-and adds the workers' rows to each `sigma`, bit for bit the one-process
-action (the CuF triplet driver's `--sockets 2`, its launcher binding itself
-to NUMA node 0).
+workers that build the same engine, deals the rank-four slots out in blocks
+and the tiles of ranks two and three in turn, and adds the workers' rows to
+each `sigma`: the one-process action bit for bit in rank four, to rounding in
+ranks two and three (the CuF triplet driver's `--sockets 2`, its launcher
+binding itself to NUMA node 0).
 Packed T4 is read in place, so by default (`occupied_slab=None`) its summed
 occupied letters stay whole. A positive `occupied_slab`, for example 2, still
 cuts them into slabs of at most that width, which with packed T4 only repeats

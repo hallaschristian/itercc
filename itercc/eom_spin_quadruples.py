@@ -194,6 +194,10 @@ class TripletEOMCCSDTQ:
         # `_slot_split`): one action split over sockets or nodes.
         self.rank_four_slots = None
         self.rank_four_partner = None
+        # (part, parts): this process forms every parts-th tile of ranks two
+        # and three, from the part-th on, and part 0 alone their direct packed
+        # terms and rank one (None: all of them).
+        self.lower_part = None
         if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
         self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
@@ -423,16 +427,30 @@ class TripletEOMCCSDTQ:
         indices = space.indices[rank - 1]
         host = indices if xp is np else indices.get()
         if rank < 4:
-            diagrams = tuple(d for d in DIAGRAMS[rank] if d not in self._packed_diagrams.get(rank, ()))
-            for raw in product((0, 1), repeat=2 * rank):
-                if sum(raw[rank:]) - sum(raw[:rank]) != 1:
+            # One tile per projection group and spin pattern: the group's
+            # projection reads only entries ordered within its antisymmetric
+            # subsets of particle and hole letters, so only those are formed.
+            excluded = self._packed_diagrams.get(rank, ())
+            cuts = (slice(0, no),) * rank
+            part, parts = self.lower_part or (0, 1)
+            job = -1
+            for equivalent, multiplicity, diagrams in projection_diagrams(rank):
+                diagrams = tuple(d for d in diagrams if d not in excluded)
+                if not diagrams:
                     continue
-                cuts = (slice(0, no),) * rank
-                yield raw, contract_tile(xp, rank, raw, cuts, primal, tangent, no, nv,
+                for raw in product((0, 1), repeat=2 * rank):
+                    if sum(raw[rank:]) - sum(raw[:rank]) != 1:
+                        continue
+                    job += 1
+                    if job % parts != part:
+                        continue        # another process's tile (see `lower_part`)
+                    tile = contract_tile(xp, rank, raw, cuts, primal, tangent, no, nv,
                                          irrep=space.irrep, labels=self._spatial_labels,
                                          engine=self._symmetry_engine, diagrams=diagrams,
-                                         occupied_slab=self.occupied_slab,
-                                         intermediates=intermediates, compiled_products=self.packed_contractions)
+                                         occupied_slab=self.occupied_slab, intermediates=intermediates,
+                                         compiled_products=self.packed_contractions,
+                                         equivalent=equivalent, hole_order=True)
+                    yield (raw, equivalent, multiplicity), tile
             return
         groups = {}
         for index, values in enumerate(host.T):
@@ -532,7 +550,9 @@ class TripletEOMCCSDTQ:
         return True
 
     def _project_lower_tiles(self, rank, tiles):
-        """Accumulate antisymmetry directly in canonical coordinates for ranks 2 and 3."""
+        """Accumulate antisymmetry directly in canonical coordinates for ranks 2
+        and 3: each projection group's tile with the coset permutations of its
+        antisymmetric subsets (`external_routes`), times their multiplicity."""
         xp = self.xp
         indices = self.space.indices[rank - 1]
         if rank not in self._lower_projection:
@@ -540,21 +560,24 @@ class TripletEOMCCSDTQ:
             for row in indices:
                 signatures <<= 1
                 signatures |= (row & 1).astype(xp.uint8)
-            by_raw = {}
+            patterns = []
             for code in xp.unique(signatures).tolist():
                 bits = tuple((code >> bit) & 1 for bit in reversed(range(2 * rank)))
                 rows = xp.flatnonzero(signatures == code)
-                positions = tuple(indices[:, rows] // 2)
-                for raw, placements in external_routes(rank, bits):
-                    # The raw tile axes are those specified by the external permutation.
-                    by_raw.setdefault(raw, []).append((rows, positions, placements))
-            self._lower_projection[rank] = by_raw
-        by_raw = self._lower_projection[rank]
+                patterns.append((bits, rows, tuple(indices[:, rows] // 2)))
+            self._lower_projection[rank] = patterns, {}
+        patterns, by_group = self._lower_projection[rank]
         result = xp.zeros(indices.shape[1])
-        for raw, tile in tiles:
-            for rows, positions, placements in by_raw.get(raw, ()):
+        for (raw, equivalent, multiplicity), tile in tiles:
+            if equivalent not in by_group:
+                by_raw = by_group[equivalent] = {}
+                for bits, rows, positions in patterns:
+                    for routed, placements in external_routes(rank, bits, equivalent):
+                        # The raw tile axes are those specified by the external permutation.
+                        by_raw.setdefault(routed, []).append((rows, positions, placements))
+            for rows, positions, placements in by_group[equivalent].get(raw, ()):
                 permutations = tuple((p + tuple(rank + i for i in h), sign) for p, h, sign in placements)
-                self._accumulate_projection(result, rows, positions, permutations, tile, 1)
+                self._accumulate_projection(result, rows, positions, permutations, tile, multiplicity)
         return result / len(_permutations(rank))**2
 
     def _project_packed_tile(self, result, holes, groups, primal, tangent, intermediates=None):
@@ -689,7 +712,7 @@ class TripletEOMCCSDTQ:
                     for operands in product_directions(*(blocks[name] for name in names)):
                         einsum_into(xp, result, coefficient, spec, *operands)
                 outputs.append(_antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])])
-            if packed_action is not None and 1 < rank < 4:
+            if packed_action is not None and 1 < rank < 4 and not (self.lower_part or (0,))[0]:
                 packed_action.add(rank, self.space.indices[rank - 1].T, outputs[-1])
             if rank_finished is not None:
                 if xp is not np:
@@ -751,7 +774,9 @@ class TripletEOMCCSDTQ:
         if partner is not None:
             from ._cpu_quadruples import add_
 
-            add_(result[self.space.slices[3]], partner.finish())
+            # The partners' rows of ranks two to four (their share of the
+            # lower tiles and their rank-four slots).
+            add_(result[self.space.slices[1].start:], partner.finish())
         if not bool(self.xp.isfinite(result).all()):
             raise FloatingPointError("Nonfinite spin-flip Jacobian action")
         self.matvec_count += 1

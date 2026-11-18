@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Triplet EOM-CCSDTQ ranks two and three by projection groups: each group's
+  raw tiles hold only its diagrams and are formed only where the letters of
+  each antisymmetric subset, particles and holes alike (their occupied axes
+  are whole), are in increasing spin-orbital order; the projection takes the
+  group's coset permutations times their multiplicity, as rank four does.
+  Water cc-pVDZ: ranks one to three 0.62 -> 0.50 s, within 1.1e-15 of the
+  single dense group. Split actions also deal these tiles out to the
+  workers (`TripletEOMCCSDTQ.lower_part`; part 0 keeps rank one and the
+  direct packed terms), so the workers no longer wait while the solver's
+  process forms ranks one to three (142 s of a 1,620 s CuF action).
 - Triplet direct packed T4 terms (`itercc_spin_quad_dense`): the contexts of
   one symmetry class share their coefficient block, so they go into one GEMM
   (`indirect_gemm`, coefficient rows of the items' external values times

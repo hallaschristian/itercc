@@ -165,6 +165,20 @@ def test_rank_four_slot_parts_add_up_to_the_action(program):
     assert np.array_equal(summed, whole[engine.space.slices[3]])
 
 
+def test_lower_rank_tile_parts_add_up_to_the_action():
+    """Ranks two and three dealt out by tiles (`lower_part`): part 0 also
+    takes the direct packed terms; the parts add up to the whole to rounding."""
+    engine = _split_engine()
+    vector = np.random.default_rng(753).normal(size=engine.space.size)
+    whole = engine._action(vector, ranks=(2, 3))
+    summed = np.zeros_like(whole)
+    for part in range(3):
+        engine.lower_part = (part, 3)
+        summed += engine._action(vector, ranks=(2, 3))
+    engine.lower_part = None
+    np.testing.assert_allclose(summed, whole, rtol=1e-12, atol=1e-13 * np.abs(whole).max())
+
+
 def test_split_action_with_a_worker_process(tmp_path):
     """`Partners` runs part of every action in a worker process that builds
     the same engine; the solver's sigma is the one-process action."""
@@ -183,6 +197,23 @@ def test_split_action_with_a_worker_process(tmp_path):
     assert engine.rank_four_partner is None and not (tmp_path / "exchange").exists()
     for one, two in zip(whole, split):
         np.testing.assert_allclose(two, one, rtol=1e-12, atol=1e-12 * np.abs(one).max())
+
+
+def test_grouped_ordered_lower_ranks_keep_the_action(monkeypatch):
+    """Ranks two and three by projection groups, each tile formed only where
+    its particle and hole letters are ordered: the action of one group with
+    every diagram, dense tiles and every permutation."""
+    from itercc import eom_spin_quadruples
+    from itercc._spin_quadruples_diagrams import DIAGRAMS
+
+    engine = _split_engine()
+    vector = np.random.default_rng(751).normal(size=engine.space.size)
+    grouped = engine._action(vector, ranks=range(1, 4))
+    monkeypatch.setattr(eom_spin_quadruples, "projection_diagrams",
+                        lambda rank: ((((), ()), 1, DIAGRAMS[rank]),))
+    engine._lower_projection = {}
+    whole = engine._action(vector, ranks=range(1, 4))
+    np.testing.assert_allclose(grouped, whole, rtol=1e-13, atol=1e-13 * np.abs(whole).max())
 
 
 def test_ordered_tiles_and_wave_sizes_keep_the_action(monkeypatch):
