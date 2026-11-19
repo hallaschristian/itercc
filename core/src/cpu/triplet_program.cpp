@@ -402,6 +402,72 @@ void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, cons
     }
 }
 
+// The gathers of one part: rows[r] = sum over the terms k, in order, of
+// weights[k] * tile[offset of row r's coordinates under term k] (a compact
+// tile's chains through their rank tables). Terms run outermost, each over
+// every row with its steps, members and tables hoisted: row r's sum gets the
+// same additions in the same order as a row-by-row loop (from +0.0), so the
+// partial sums are those of itercc_permuted_gather_add bit for bit.
+template <int Chains, int First, int Second>
+void gather_terms(const itercc_slot_terms &t, const int32_t *coordinates, i64 count, const double *tile,
+                  double *rows)
+{
+    const i64 nv = t.nv;
+    for (i64 k = 0; k < t.count; ++k) {
+        const int64_t *step = t.offsets + 4 * k;
+        const i64 s0 = step[0], s1 = step[1], s2 = step[2], s3 = step[3];
+        const int64_t *m0 = t.members + 8 * k, *m1 = m0 + 4;
+        const int64_t *table0 = Chains > 0 ? t.tables[0] : nullptr, *table1 = Chains > 1 ? t.tables[1] : nullptr;
+        const i64 stride0 = Chains > 0 ? t.strides[0] : 0, stride1 = Chains > 1 ? t.strides[1] : 0;
+        const double w = t.weights[k];
+        for (i64 r = 0; r < count; ++r) {
+            const int32_t *c = coordinates + 4 * r;
+            i64 at = c[0] * s0 + c[1] * s1 + c[2] * s2 + c[3] * s3;
+            if constexpr (Chains > 0) {
+                i64 flat = c[m0[0]] * nv + c[m0[1]];
+                if constexpr (First == 3) flat = flat * nv + c[m0[2]];
+                at += table0[flat] * stride0;
+            }
+            if constexpr (Chains > 1) {
+                i64 flat = c[m1[0]] * nv + c[m1[1]];
+                if constexpr (Second == 3) flat = flat * nv + c[m1[2]];
+                at += table1[flat] * stride1;
+            }
+            rows[r] += w * tile[at];
+        }
+    }
+}
+
+void gather_part(const itercc_slot_terms &t, const int32_t *coordinates, i64 count, const double *tile,
+                 double *rows)
+{
+    std::fill(rows, rows + count, 0.0);
+    const i64 first = t.nchains > 0 ? t.lengths[0] : 0, second = t.nchains > 1 ? t.lengths[1] : 0;
+    if (t.nchains == 0) return gather_terms<0, 0, 0>(t, coordinates, count, tile, rows);
+    if (t.nchains == 1 && first == 2) return gather_terms<1, 2, 0>(t, coordinates, count, tile, rows);
+    if (t.nchains == 1 && first == 3) return gather_terms<1, 3, 0>(t, coordinates, count, tile, rows);
+    if (t.nchains == 2 && first == 2 && second == 2) return gather_terms<2, 2, 2>(t, coordinates, count, tile, rows);
+    if (t.nchains == 2 && first == 2 && second == 3) return gather_terms<2, 2, 3>(t, coordinates, count, tile, rows);
+    if (t.nchains == 2 && first == 3 && second == 2) return gather_terms<2, 3, 2>(t, coordinates, count, tile, rows);
+    // Any other chain shape (a chain of four, say): the general loop.
+    for (i64 r = 0; r < count; ++r) {
+        const int32_t *c = coordinates + 4 * r;
+        double sum = 0.;
+        for (i64 k = 0; k < t.count; ++k) {
+            const int64_t *step = t.offsets + 4 * k;
+            i64 at = c[0] * step[0] + c[1] * step[1] + c[2] * step[2] + c[3] * step[3];
+            for (i64 g = 0; g < t.nchains; ++g) {       // a compact tile's chains
+                const int64_t *member = t.members + 8 * k + 4 * g;
+                i64 flat = 0;
+                for (i64 j = 0; j < t.lengths[g]; ++j) flat = flat * t.nv + c[member[j]];
+                at += t.tables[g][flat] * t.strides[g];
+            }
+            sum += t.weights[k] * tile[at];
+        }
+        rows[r] = sum;
+    }
+}
+
 // One tile: its products, then its gathers into `partial`. With `fused`, the
 // products of fusion groups wait until the other instructions are done (the
 // intermediates they read stay bound) and run as fused GEMMs.
@@ -546,23 +612,7 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
     for (i64 e = 0; e < m.part_count; ++e) {
         const itercc_slot_part &part = p.parts[m.part_start + e];
         const itercc_slot_group &g = groups[part.group];
-        const itercc_slot_terms &t = p.terms[part.terms];
-        for (i64 r = 0; r < g.count; ++r) {
-            const int32_t *c = g.coordinates + 4 * r;
-            double sum = 0.;
-            for (i64 k = 0; k < t.count; ++k) {
-                const int64_t *step = t.offsets + 4 * k;
-                i64 at = c[0] * step[0] + c[1] * step[1] + c[2] * step[2] + c[3] * step[3];
-                for (i64 g = 0; g < t.nchains; ++g) {       // a compact tile's chains
-                    const int64_t *member = t.members + 8 * k + 4 * g;
-                    i64 flat = 0;
-                    for (i64 j = 0; j < t.lengths[g]; ++j) flat = flat * t.nv + c[member[j]];
-                    at += t.tables[g][flat] * t.strides[g];
-                }
-                sum += t.weights[k] * tile[at];
-            }
-            sums[r] = sum;
-        }
+        gather_part(p.terms[part.terms], g.coordinates, g.count, tile, sums);
         sums += g.count;
     }
 }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Triplet slot-program gathers (tile -> packed rows) run term by term over
+  every row of a part, with each term's steps, chain members and rank tables
+  hoisted and the common chain shapes (one or two chains of two or three
+  letters) compiled separately. Each row gets the same additions in the same
+  order, so the action is the same bit for bit. At CuF size the gathers read
+  2.8e10 tile entries for the first 1500 slots (2.4 per row) and took 278
+  thread-s on one Sapphire Rapids socket; 6o/24v synthetic model: gathers
+  70.7 -> 43.8 thread-s.
 - Triplet tile products sum an exchangeable pair once (`_spin_quadruples_tiles.
   exchange_pairs`, `paired_routes`). Two summed letters that every operand
   holding one holds both of, in one antisymmetric half (mn of g(oovv) T4,
