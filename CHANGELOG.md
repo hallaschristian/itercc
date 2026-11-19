@@ -7,7 +7,9 @@
   class instead of once per row of the other particles, and prefetch the
   amplitudes they gather (scattered over up to hundreds of slots) sixteen
   tuples ahead; the same values. 6o/24v synthetic model: the lower ranks'
-  gathers 4.3 -> 3.4 thread-s. Diagnostic phase timers:
+  gathers 4.3 -> 3.4 thread-s; CuF on one Sapphire Rapids socket, ranks two
+  and three's opened terms 8.1 -> 6.8 s (rank four's unchanged, 9.2 s), the
+  warm action 107.4 s (profiled). Diagnostic phase timers:
   `-DITERCC_PROFILE_OPENED` and `itercc_opened_profile`.
 - The triplet engine's rank-two and rank-three products keep their occupied
   letters inside the GEMMs (`TripletEOMCCSDTQ._lower_engine`, a blocked

@@ -162,7 +162,9 @@ engine's estimate (at least 256 MiB): with 256 MiB the cc-pVDZ slots took
 
 The CuF layout has 14,235 slots with about 445 tiles each (6.3 million tiles
 per action) and up to 10 million partial sums (79 MB) per slot; slots run in
-waves of at most 256 MiB of partial sums.
+waves of at most 256 MiB of partial sums. (After 0.8.0 each slot's tiles
+run on one thread and add their sums into the slot's rows right away, without
+partial sums or waves; `ITERCC_SLOT_WAVES=1` restores the waves.)
 
 CuF, the same 16-slot general-input quadruples sample as below (full
 checkpoint, 56 Sapphire Rapids cores, 160 GiB, 8 GiB intermediate cache,
