@@ -127,20 +127,23 @@ products are discarded between actions. `last_intermediate_cache` reports
 hits, misses and peak cached array bytes. Ground-state effective coefficients
 and canonical address maps are reused for the lifetime of the EOM engine.
 On the CPU the rank-four slots then run as one compiled program: every raw
-tile of an action on its own thread, intermediates shared between tiles
+tile of an action on one thread, each slot's tiles on the same thread in
+order with their sums added into the slot's rows right away, intermediates shared between tiles
 through the cache (large ones computed in pieces that waiting tiles help
 with), and the direct packed T4 terms by opened letters (for each tuple of
 the amplitude's occupied letters that come from the output row, the
 amplitude block gathered once per class of the row's other particles and
 one GEMM with the coefficient block; ranks two and three alike). Tile products form only the entries their projection
 reads (letters of each antisymmetric subset in increasing spin-orbital
-order), in ranks two and three among the occupied letters as well. Its waves
-of slots hold `partial_sums_gib` of partial sums (default: as much as the
-cache, at most 8 GiB; on CuF 1% slower than 32 GiB with 26 GB less memory), so a cache can be as large as an action's distinct
-intermediates (262 GiB on CuF) without waves of that size; without a cache
-setting the program takes half of what `memory_budget_gib` leaves beside the
+order), in ranks two and three among the occupied letters as well. With
+`ITERCC_SLOT_WAVES=1` tiles run instead in waves of slots whose
+`partial_sums_gib` of partial sums (default: as much as the cache, at most
+8 GiB) are added up at the end of each wave: the same values, but about 400
+partial sums per row cross memory twice. A cache can be as large as an
+action's distinct intermediates (262 GiB on CuF); without a cache setting
+the program takes half of what `memory_budget_gib` leaves beside the
 engine's estimate (which counts the program's tiles and buffers). Progress
-callbacks arrive after each wave. The action agrees with the earlier Python slot loop to round-off, and
+callbacks arrive every 1/64 of the slots (after each wave with waves). The action agrees with the earlier Python slot loop to round-off, and
 bit for bit with `ITERCC_TRIPLET_FUSED=0`; the switches below fall back.
 An action can also be shared by processes, one per socket (or node):
 `itercc._slot_split.Partners(engine, builder, kwargs, parts=2)` starts
@@ -301,7 +304,8 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_DIRECT_OPENED` | call | `0`: triplet rank-four direct packed T4 terms by contexts per output slot (`ITERCC_DIRECT_DENSE`) instead of one GEMM per hole tuple and class |
 | `ITERCC_SLOT_SHARE_WORK` | call | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
 | `ITERCC_SLOT_PROFILE` | core | `1`: slot-program phase timers (`itercc_triplet_profile`) |
-| `ITERCC_SLOT_SORT` | core | `0`: slot-program tiles in slot order (diagnostic) |
+| `ITERCC_SLOT_SORT` | core | `0`: with `ITERCC_SLOT_WAVES=1`, a wave's tiles in slot order (diagnostic) |
+| `ITERCC_SLOT_WAVES` | core | `1`: slot-program tiles run in waves of slots whose partial sums (`partial_sums_gib`) are added at the end of each wave, not slot by slot |
 | `ITERCC_TILE_RUNS` | core | `0`: slot-program tiles (dense or compact) cleared whole, not only where symmetry allows entries (diagnostic) |
 | `ITERCC_SYM_MIN_SHARE` | core | GEMM executor: least work per thread of a shared block |
 | `ITERCC_SYM_PARALLEL_WORK` | core | GEMM executor: work from which one block runs on all threads |

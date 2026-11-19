@@ -117,7 +117,10 @@ SWITCHES = {
         "", "call", "multiply-adds from which a slot-program intermediate is computed in shared "
         "pieces (default 2^22)"),
     "ITERCC_SLOT_PROFILE": Switch("", "core", "`1`: slot-program phase timers (`itercc_triplet_profile`)"),
-    "ITERCC_SLOT_SORT": Switch("", "core", "`0`: slot-program tiles in slot order (diagnostic)"),
+    "ITERCC_SLOT_SORT": Switch("", "core", "`0`: with `ITERCC_SLOT_WAVES=1`, a wave's tiles in slot order "
+                               "(diagnostic)"),
+    "ITERCC_SLOT_WAVES": Switch("0", "core", "`1`: slot-program tiles run in waves of slots whose partial sums "
+                                "(`partial_sums_gib`) are added at the end of each wave, not slot by slot"),
     "ITERCC_TILE_RUNS": Switch("", "core", "`0`: slot-program tiles (dense or compact) cleared whole, not only "
                                "where symmetry allows entries (diagnostic)"),
     # The CPU GEMM executor (read once by the core)

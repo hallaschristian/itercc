@@ -739,6 +739,90 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
     }
     Cache cache(cache_bytes);
     const double *const vectors[2] = {ground, direction};
+    auto report = [&]() {
+        if (stats != nullptr) {
+            stats[0] = cache.hits();
+            stats[1] = cache.misses();
+            stats[2] = cache.peak();
+            stats[3] = cache.shared();
+            stats[4] = cache.helped();
+        }
+    };
+    // Slot by slot (the default; ITERCC_SLOT_WAVES=1 runs the waves below):
+    // one thread runs every tile of a slot in order, each tile's gathers into
+    // a buffer of its rows that is added into the slot's rows right away. A
+    // row gets the same additions in the same order as from the waves'
+    // partial sums, which were written to memory and read back (about 400 per
+    // row: 17 GiB per action on the 6o/24v model, a terabyte at CuF size), and
+    // no thread waits at the end of a wave. The intermediate cache keeps what
+    // neighbouring slots share (at CuF size waves of 2 and 8 GiB missed as
+    // often); the slots run in their order, so threads work on neighbours.
+    static const bool waves = [] {
+        const char *value = std::getenv("ITERCC_SLOT_WAVES");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!waves) {
+        std::atomic<bool> failed{false};
+        std::atomic<i64> finished{0};
+        const i64 step = std::max<i64>(1, nslots / 64);
+        i64 reported = 0;   // on thread 0, the calling thread
+#pragma omp parallel num_threads(threads)
+        {
+            Worker w;
+            std::vector<Tile> mine;
+            std::vector<double> sums;
+            double *tile = nullptr;
+            try {
+                tile = itercc::scratch(4).get(size_t(nv4));
+            } catch (const std::bad_alloc &) {
+                failed = true;
+            }
+#pragma omp for schedule(dynamic, 1)
+            for (i64 s = 0; s < nslots; ++s) {
+                if (failed.load(std::memory_order_relaxed)) continue;
+                const itercc_slot_info &x = p->slots[s];
+                const itercc_slot_group *groups = p->groups + p->key_group_start[x.key];
+                double *out = result + x.start;
+                i64 at = 0;
+                mine.clear();
+                slot_tiles(*p, s, at, mine);
+                for (const Tile &job : mine) {
+                    const itercc_slot_template &m = p->templates[job.tmpl];
+                    try {
+                        sums.resize(size_t(tile_rows(*p, m, groups)));
+                        run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, sums.data(), fused != 0,
+                                 threads, share_work);
+                    } catch (const std::bad_alloc &) {
+                        const itercc_slot_intermediate *inters = p->intermediates + p->inter_start[m.kind];
+                        for (size_t k = 0; k < w.owner.size(); ++k)
+                            if (w.owner[k]) cache.abandon(key_of(inters[k], job.fixed));
+                        w.bound.clear();
+                        w.owner.clear();
+                        failed = true;
+                        break;
+                    }
+                    const Phase timing(6);
+                    const double *from = sums.data();
+                    for (i64 e = 0; e < m.part_count; ++e) {
+                        const itercc_slot_group &g = groups[p->parts[m.part_start + e].group];
+                        for (i64 r = 0; r < g.count; ++r) out[g.rows[r]] += from[r];
+                        from += g.count;
+                    }
+                }
+                if (failed.load(std::memory_order_relaxed)) continue;
+                for (i64 r = 0; r < x.length; ++r) out[r] /= kDivisor;
+                const i64 done = finished.fetch_add(1) + 1;
+                if (progress != nullptr && omp_get_thread_num() == 0 && done - reported >= step) {
+                    reported = done;
+                    progress(done, nslots);
+                }
+            }
+        }
+        if (failed.load()) return 2;
+        if (progress != nullptr) progress(nslots, nslots);
+        report();
+        return 0;
+    }
     std::vector<i64> first;   // each slot's first tile in the wave, then the end
     std::vector<i64> order;   // the wave's tiles in the order they run
     // Every partial sum is written by its tile before its slot reads it, so
@@ -833,13 +917,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
         s0 = s1;
         if (progress != nullptr) progress(s0, nslots);   // between waves, on the calling thread
     }
-    if (stats != nullptr) {
-        stats[0] = cache.hits();
-        stats[1] = cache.misses();
-        stats[2] = cache.peak();
-        stats[3] = cache.shared();
-        stats[4] = cache.helped();
-    }
+    report();
     return 0;
 }
 

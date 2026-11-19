@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The triplet slot program runs each slot's tiles on one thread, in order,
+  adding each tile's gathered sums into the slot's rows right away
+  (`itercc_triplet_slots`; `ITERCC_SLOT_WAVES=1` keeps the waves). The waves
+  wrote about 400 partial sums per row to memory and read them back (17 GiB
+  per action on the 6o/24v synthetic model, roughly a terabyte at CuF size),
+  and their threads waited at each wave's end; each row now gets the same
+  additions in the same order, so the action is the same bit for bit, and no
+  partial-sum buffer is allocated (8 GiB at CuF by default). 6o/24v, 12
+  threads, warm: rank four 11.06 -> 6.62 s (gathers 29.1 -> 15.5 thread-s,
+  slot sums 4.6 -> 2.1, intermediates 14.4 -> 10.1).
 - The triplet engine's rank-two and rank-three tiles (one per projection
   group and spin pattern, 135 per action, 429 MB each at CuF size) are one
   reused array stored with its occupied axes outermost
@@ -12,7 +22,9 @@
   entries 17 KB apart; holes first they are one 195 KB run. Warm products of
   the replay 10.3 -> 7.0 s; 6o/24v synthetic model: ranks two and three
   2.04 -> 1.69 s, the same action bit for bit. `ITERCC_LOWER_TILE_REUSE=0`
-  restores fresh tiles.
+  restores fresh tiles. CuF on one Sapphire Rapids socket (second action):
+  rank three 49.9 -> 14.5 s (its blocked products 35.9 -> 6.5 s), the action
+  161.5 -> 131.7 s, bit for bit.
 - The triplet slot program's waves hold at most 8 GiB of partial sums by
   default (was 32 GiB). CuF on one Sapphire Rapids socket, 64 GiB cache,
   second action: 32 GiB 161.5 s and 151 GB peak, 8 GiB 163.5 s and 125 GB,

@@ -287,12 +287,11 @@ class TripletEOMCCSDTQ:
         if not np.isfinite(intermediate_cache_gib) or intermediate_cache_gib < 0:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
         self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
-        # The slot program's waves hold this many bytes of partial sums (default:
-        # as many as the cache, at most 8 GiB). Tiles sharing intermediates run
-        # in the same wave; a cache larger than the waves still keeps
-        # intermediates between them (CuF: 262 GiB of distinct intermediates).
-        # CuF, one socket, 64 GiB cache: 32 GiB of partial sums 161.5 s per
-        # action, 8 GiB 163.5 s with 26 GB less peak memory, 2 GiB 173.7 s.
+        # With ITERCC_SLOT_WAVES=1 the slot program's waves hold this many
+        # bytes of partial sums (default: as many as the cache, at most 8 GiB;
+        # by default slots run one by one, without them). CuF, one socket,
+        # 64 GiB cache: 32 GiB of partial sums 161.5 s per action, 8 GiB
+        # 163.5 s with 26 GB less peak memory, 2 GiB 173.7 s.
         if partial_sums_gib is not None and (not np.isfinite(partial_sums_gib) or partial_sums_gib <= 0):
             raise ValueError("Partial sums need a positive finite budget")
         self.partial_sums_bytes = (None if partial_sums_gib is None else int(partial_sums_gib * 2**30))
@@ -308,7 +307,8 @@ class TripletEOMCCSDTQ:
             # products; the packed T4, R4 and image vectors are added below.
             # CuF (13o/29v, one socket, T3 and R3 as spin blocks): 25 GB after
             # setup, 125 GB at the end of an action with a 64 GiB cache and
-            # 8 GiB of partial sums (190 GB with T3 and R3 dense and 32 GiB).
+            # waves of 8 GiB of partial sums (190 GB with T3 and R3 dense and
+            # 32 GiB).
             rank_three = (0.75 if backend == "cpu" and occupied_tiles and self._packed_direction
                           and _runtime.enabled("ITERCC_SPIN_BLOCKED_T3") else 2.5)
             self._fixed_bytes = int(8 * (rank_three * (4 * no * nv)**3 + 6 * (2 * (no + nv))**4
@@ -700,7 +700,10 @@ class TripletEOMCCSDTQ:
 
     def _partial_bytes(self, cache):
         """Bytes of partial sums per wave of the slot program (at least the
-        program's 256 MiB)."""
+        program's 256 MiB); none when slots run one by one (the default: each
+        tile's sums are added into its slot's rows right away)."""
+        if not _runtime.enabled("ITERCC_SLOT_WAVES"):
+            return 0
         if self.partial_sums_bytes is not None:
             return max(self.partial_sums_bytes, 2**28)
         return max(min(int(cache), 8 * 2**30), 2**28)

@@ -255,18 +255,55 @@ def test_partners_clean_up_after_a_failed_start(tmp_path):
     assert not (tmp_path / "exchange").exists()
 
 
-def test_slot_budget_leaves_room_for_the_davidson_vectors():
-    """A default slot-program cache and its partial sums take only what the
-    memory budget leaves beside the fixed working set and a solve's Davidson
-    vectors; an explicit cache counts in the Davidson working set."""
+def test_slot_budget_leaves_room_for_the_davidson_vectors(monkeypatch):
+    """A default slot-program cache (and with waves, its partial sums) take
+    only what the memory budget leaves beside the fixed working set and a
+    solve's Davidson vectors; an explicit cache counts in the Davidson
+    working set."""
     engine = _triplet_engine(packed_spin=True, memory_budget_gib=8)
     vectors = (2 * 7 + 6) * engine.space.size * 8
     assert engine.davidson_working_bytes(7) == engine._fixed_bytes + vectors
     cache, partial = engine._slot_budget()
-    assert engine._fixed_bytes + vectors + cache + partial <= engine.memory_budget_bytes
+    assert partial == 0 and engine._fixed_bytes + vectors + cache <= engine.memory_budget_bytes
     explicit = _triplet_engine(packed_spin=True, memory_budget_gib=8, intermediate_cache_gib=1)
+    assert explicit._slot_budget() == (2**30, 0)
+    assert explicit.davidson_working_bytes(7) == explicit._fixed_bytes + vectors + 2**30
+    monkeypatch.setenv("ITERCC_SLOT_WAVES", "1")
     assert explicit._slot_budget() == (2**30, 2**30)
     assert explicit.davidson_working_bytes(7) == explicit._fixed_bytes + vectors + 2 * 2**30
+    cache, partial = engine._slot_budget()
+    assert engine._fixed_bytes + vectors + cache + partial <= engine.memory_budget_bytes
+
+
+def test_slot_waves_give_the_same_action(tmp_path):
+    """Slots run one by one by default, each tile's sums added into its
+    slot's rows right away; with ITERCC_SLOT_WAVES=1 (read once by the core:
+    another process) in waves, here of one slot's partial sums each. The
+    same action bit for bit."""
+    import os
+    import subprocess
+    import sys
+
+    script = """
+import sys
+import numpy as np
+from test_native_triplet_tiles import _split_engine
+engine = _split_engine()
+engine.partial_sums_bytes = 1
+vector = np.random.default_rng(753).normal(size=engine.space.size)
+np.save(sys.argv[1], engine.sigma(vector))
+"""
+    tests = Path(__file__).resolve().parent
+    env = dict(os.environ, ITERCC_SLOT_WAVES="1", PYTHONPATH=os.pathsep.join(
+        [str(tests.parent), str(tests), os.environ.get("PYTHONPATH", "")]))
+    saved = tmp_path / "waves.npy"
+    run = subprocess.run([sys.executable, "-c", script, str(saved)], capture_output=True, text=True, env=env,
+                         cwd=tests)
+    assert run.returncode == 0, run.stderr
+    engine = _split_engine()
+    vector = np.random.default_rng(753).normal(size=engine.space.size)
+    np.testing.assert_array_equal(engine.sigma(vector), np.load(saved))
+    assert engine._slot_programs and all(p is not None for p in engine._slot_programs.values())
 
 
 def test_complex_vectors_run_the_compiled_program():

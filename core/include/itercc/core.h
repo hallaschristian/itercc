@@ -832,11 +832,13 @@ typedef struct {
     const struct itercc_slot_tile_axes_s *tile_axes;
 } itercc_slot_program;
 
-/* Slots 0 .. nslots - 1 of `result` (zero on entry), in waves whose partial
+/* Slots 0 .. nslots - 1 of `result` (zero on entry), each on one thread: its
+ * tiles in order, each tile's gathers added into the slot's rows right away,
+ * then divided by (4!)^2. With ITERCC_SLOT_WAVES=1, in waves whose partial
  * sums stay within partial_limit doubles (or one slot): every tile on one
  * thread (a wave's tiles in order of their occupied tuples, positions 2, 3,
  * 0, 1), then each slot's rows get its tiles' partial sums in order, divided
- * by (4!)^2. Intermediates are shared through a cache of cache_bytes, the
+ * by (4!)^2: the same values. Intermediates are shared through a cache of cache_bytes, the
  * pieces of those of at least share_work multiply-adds (0: 2^22) also with
  * the tiles waiting for them (the same values whoever runs them); stats (five
  * entries) gets the cache's hits, misses and peak bytes, the intermediates
@@ -845,7 +847,7 @@ typedef struct {
  * per block of output rows and columns (other sums, so other rounding);
  * without, every product runs in place, as the Python loop does. The results
  * do not depend on the thread count. `progress` (may be NULL) gets the slots
- * done after each wave, on the calling thread. Returns 0, or 1 (nothing done)
+ * done after each wave, or every 1/64 of the slots, on the calling thread. Returns 0, or 1 (nothing done)
  * for a tile without a plan. */
 int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
                          const double *const *bases, const double *ground, const double *direction,
