@@ -138,10 +138,42 @@ def tile_product(xp, spec, operands, target, coefficient, no, nv, fixed=(), *, k
                       ordered=tuple(ordered) + node)
 
 
+class SpinBlocks:
+    """A spin-orbital tensor (interleaved spin: index 2p + s) kept as its
+    nonzero spin blocks: signature -> the spatial block (any strides). A
+    rank-three amplitude has 20 such blocks of 64, so the triplet engine's T3
+    takes 31% of the dense tensor (8.6 instead of 27 GB at CuF size).
+    `spin_blocks` hands it out like the views of the dense tensor; an absent
+    signature reads as zeros."""
+
+    def __init__(self, blocks, shape):
+        self.blocks = {tuple(signature): block for signature, block in blocks.items()}
+        self.shape = tuple(int(n) for n in shape)
+        self.ndim = len(self.shape)
+        self.dtype = next(iter(self.blocks.values())).dtype
+        self._zero = None
+
+    def __getitem__(self, signature):
+        block = self.blocks.get(tuple(signature))
+        if block is not None:
+            return block
+        if self._zero is None:
+            self._zero = np.zeros(tuple((n + 1) // 2 for n in self.shape), dtype=self.dtype)
+            self._zero.flags.writeable = False
+        return self._zero
+
+    @property
+    def nbytes(self):
+        return sum(block.nbytes for block in self.blocks.values())
+
+
 def spin_blocks(tensor):
-    """Views of interleaved spin tensors indexed by their alpha/beta signatures."""
+    """Views of interleaved spin tensors indexed by their alpha/beta signatures
+    (a `SpinBlocks` tensor is its own)."""
     if tensor is None:
         return None
+    if isinstance(tensor, SpinBlocks):
+        return tensor
     return {signature: tensor[tuple(slice(s, None, 2) for s in signature)]
             for signature in product((0, 1), repeat=tensor.ndim)}
 

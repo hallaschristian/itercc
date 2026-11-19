@@ -87,6 +87,9 @@ SWITCHES = {
     "ITERCC_SLOT_POSITIONS": Switch(
         "1", "call", "`0`: triplet slot-program intermediates and tiles keep virtual axes in orbital "
         "order, not irrep order"),
+    "ITERCC_SPIN_BLOCKED_T3": Switch(
+        "1", "construction", "`0`: the triplet engine keeps T3 as a dense spin-orbital tensor, not its nonzero "
+        "spin blocks"),
     "ITERCC_HOLES_FIRST": Switch(
         "1", "call", "`0`: triplet dense rank-three tensors with the occupied axes innermost, not outermost"),
     "ITERCC_PAIR_SUMS": Switch(

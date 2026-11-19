@@ -65,7 +65,7 @@ import numpy as np
 
 from . import _cpu_kernels, _runtime
 from ._spin_quadruples_tiles import (_PACKED_TILE_BYTES, _packed_cuts, ordered_letters, _tree_irrep, contraction_schedule,
-                                     exchange_pairs, external_routes, node_sums, routes, tile_routes)
+                                     SpinBlocks, exchange_pairs, external_routes, node_sums, routes, tile_routes)
 from ._tensor_scatter import SignedRows, _gather_steps
 from .symmetry_blocks import OffsetGroup, PositionedView
 
@@ -200,14 +200,22 @@ class SlotProgram:
         self.groups = groups                   # projection groups with their tile diagrams
         self.presence = presence
         self.signature = self._signature(blocks)
+        # Dense operands: one base per array, or per spin block of a
+        # `SpinBlocks` tensor (name, side, signature).
         self._bases, self._base_shapes = {}, {}
         for name, pair in sorted(blocks.items()):
             for side, array in enumerate((pair.value, pair.tangent)):
-                if array is not None:
-                    if array.dtype != np.float64:
-                        raise Unsupported
-                    self._bases[name, side] = len(self._bases)
-                    self._base_shapes[name, side] = (array.shape, array.strides)
+                if array is None:
+                    continue
+                if array.dtype != np.float64:
+                    raise Unsupported
+                if isinstance(array, SpinBlocks):
+                    for signature, block in sorted(array.blocks.items()):
+                        self._bases[name, side, signature] = len(self._bases)
+                        self._base_shapes[name, side, signature] = (block.shape, block.strides)
+                    continue
+                self._bases[name, side] = len(self._bases)
+                self._base_shapes[name, side] = (array.shape, array.strides)
         self._rows = {}                        # T4 row descriptors
         self._templates = {}                   # intermediate expressions
         self._kinds, self._kind_of = [], {}
@@ -224,7 +232,11 @@ class SlotProgram:
 
     @staticmethod
     def _signature(blocks):
-        return tuple((name, side, array.shape, array.strides, array.dtype.char)
+        def layout(array):
+            if isinstance(array, SpinBlocks):
+                return tuple((signature, block.shape, block.strides) for signature, block in sorted(array.blocks.items()))
+            return array.shape, array.strides
+        return tuple((name, side, layout(array), array.dtype.char)
                      for name, pair in sorted(blocks.items())
                      for side, array in enumerate((pair.value, pair.tangent)) if array is not None)
 
@@ -234,6 +246,9 @@ class SlotProgram:
     # ---- recording tile kinds -------------------------------------------
 
     def _dense(self, name, side, signature, letters, selected):
+        blocked = self._base_shapes.get((name, side, tuple(signature)))
+        if blocked is not None:
+            return self._dense_block(name, side, tuple(signature), letters, selected, *blocked)
         array_shape, array_strides = self._base_shapes.get((name, side), (None, None))
         if array_shape is None or len(array_shape) != len(letters):
             raise Unsupported
@@ -256,6 +271,29 @@ class SlotProgram:
                 shape.append(bound[1] - bound[0])
             strides.append(8 * step)
         return (DENSE, self._bases[name, side], tuple(shape), tuple(strides), tuple(coef))
+
+    def _dense_block(self, name, side, signature, letters, selected, block_shape, block_strides):
+        """`_dense` for a spin block stored on its own (a `SpinBlocks` tensor):
+        its spatial axes, no spin offset."""
+        if len(block_shape) != len(letters):
+            raise Unsupported
+        coef = [0] * 5
+        shape, strides = [], []
+        for c, n, step in zip(letters, block_shape, block_strides):
+            if step % 8 or step < 0:
+                raise Unsupported
+            step //= 8
+            bound = selected.get(c)
+            if bound is None:
+                shape.append(n)
+            elif bound[0] == _FIXED:
+                coef[1 + bound[1]] += step
+                shape.append(1)
+            else:
+                coef[0] += step * bound[0]
+                shape.append(bound[1] - bound[0])
+            strides.append(8 * step)
+        return (DENSE, self._bases[name, side, signature], tuple(shape), tuple(strides), tuple(coef))
 
     def _t4(self, which, signature, letters, selected):
         cuts = []
@@ -1092,7 +1130,11 @@ class SlotProgram:
         pointers = np.zeros(max(1, len(self._bases)), dtype=np.int64)
         for name, pair in blocks.items():
             for side, array in enumerate((pair.value, pair.tangent)):
-                if (name, side) in self._bases:
+                if isinstance(array, SpinBlocks):
+                    for signature, block in array.blocks.items():
+                        if (name, side, signature) in self._bases:
+                            pointers[self._bases[name, side, signature]] = block.ctypes.data
+                elif (name, side) in self._bases:
                     pointers[self._bases[name, side]] = array.ctypes.data
         for vector in (ground, direction):
             if vector is not None and not (vector.dtype == np.float64 and vector.flags.c_contiguous):

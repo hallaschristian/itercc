@@ -360,9 +360,32 @@ def test_holes_first_rank_three_keeps_the_action(monkeypatch):
     monkeypatch.setenv("ITERCC_HOLES_FIRST", "1")
     engine = _split_engine()
     t3 = engine.amplitudes[2]
-    assert t3.strides[3] > t3.strides[0]            # occupied axes outermost
-    np.testing.assert_array_equal(t3, plain_engine.amplitudes[2])
+    for signature, block in t3.blocks.items():
+        assert block.strides[3] > block.strides[0]            # occupied axes outermost
+        np.testing.assert_array_equal(block, plain_engine.amplitudes[2][signature])
     np.testing.assert_allclose(engine.sigma(vector), plain, rtol=1e-12, atol=1e-13 * np.abs(plain).max())
+
+
+def test_spin_blocked_t3_keeps_the_action(monkeypatch):
+    """T3 kept as its nonzero spin blocks (20 of 64): the blocks of the dense
+    tensor, the same action bit for bit, under a third of the bytes."""
+    from itercc._spin_quadruples_tiles import SpinBlocks, spin_blocks
+
+    monkeypatch.setenv("ITERCC_SPIN_BLOCKED_T3", "0")
+    dense_engine = _split_engine()
+    vector = np.random.default_rng(773).normal(size=dense_engine.space.size)
+    dense = dense_engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_SPIN_BLOCKED_T3", "1")
+    engine = _split_engine()
+    t3 = engine.amplitudes[2]
+    assert isinstance(t3, SpinBlocks) and len(t3.blocks) == 20
+    assert 3 * t3.nbytes < dense_engine.amplitudes[2].nbytes
+    views = spin_blocks(dense_engine.amplitudes[2])
+    for signature, view in views.items():
+        np.testing.assert_array_equal(t3[signature], view)
+    np.testing.assert_array_equal(engine.sigma(vector), dense)
+    engine.slot_program = False                      # the Python loop takes the blocks too
+    np.testing.assert_allclose(engine.sigma(vector), dense, rtol=1e-12, atol=1e-13 * np.abs(dense).max())
 
 
 def test_exchangeable_pairs_are_summed_once(monkeypatch):

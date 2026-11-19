@@ -55,14 +55,43 @@ def _restricted_amplitude(xp, spatial, nocc, nvir, rank):
     return result
 
 
-def _ground_amplitudes(solver, amplitudes, xp, packed_layout=None):
+def _restricted_blocks(spatial, nocc, nvir, rank, holes_first=False):
+    """`_restricted_amplitude` as its nonzero spin blocks (`SpinBlocks`, on
+    the CPU), each the same values in the same order of additions; with
+    `holes_first`, each block keeps its occupied axes outermost."""
+    from ._spin_quadruples_tiles import SpinBlocks
+
+    shape = (nvir,) * rank + (nocc,) * rank
+    order_first = tuple(range(rank, 2 * rank)) + tuple(range(rank))
+    blocks = {}
+    for holes in product(range(2), repeat=rank):
+        for order, sign in _permutations(rank):
+            signature = tuple(holes[p] for p in order) + holes
+            block = blocks.get(signature)
+            if block is None:
+                block = (np.zeros(tuple(shape[a] for a in order_first)).transpose(np.argsort(order_first))
+                         if holes_first else np.zeros(shape))
+                blocks[signature] = block
+            axes = order + tuple(range(rank, 2 * rank))
+            if sign > 0:
+                block += spatial.transpose(axes)
+            else:
+                block -= spatial.transpose(axes)
+    return SpinBlocks(blocks, (2 * nvir,) * rank + (2 * nocc,) * rank)
+
+
+def _ground_amplitudes(solver, amplitudes, xp, packed_layout=None, blocked=(), holes_first=()):
+    """T1..T3 in spin orbitals (the ranks in `blocked` as `SpinBlocks`, those
+    in `holes_first` with the occupied axes outermost) and T4 (packed with a
+    layout)."""
     no, nv = solver.nocc, solver.nvir
     lower = []
     for rank, a in enumerate(amplitudes[:3], 1):
         if xp is np and hasattr(a, "get"):
             a = a.get()
         lower.append(xp.asarray(a).transpose((*range(rank, 2 * rank), *range(rank))))
-    result = [_restricted_amplitude(xp, a, no, nv, rank)
+    result = [_restricted_blocks(a, no, nv, rank, rank in holes_first) if rank in blocked
+              else _restricted_amplitude(xp, a, no, nv, rank)
               for rank, a in enumerate(lower, 1)]
     if packed_layout is not None:
         return (*result, packed_layout.from_restricted(solver, amplitudes[3], xp))
@@ -239,7 +268,9 @@ class TripletEOMCCSDTQ:
             # products; the packed T4, R4 and image vectors are added below.
             # CuF (13o/29v, one socket): 71 GB after rank three, 173 GB at the
             # end of an action with a 64 GiB cache and 32 GiB of partial sums.
-            self._fixed_bytes = int(8 * (2.5 * (4 * no * nv)**3 + 6 * (2 * (no + nv))**4
+            rank_three = (1.5 if backend == "cpu" and occupied_tiles and self._packed_direction
+                          and _runtime.enabled("ITERCC_SPIN_BLOCKED_T3") else 2.5)
+            self._fixed_bytes = int(8 * (rank_three * (4 * no * nv)**3 + 6 * (2 * (no + nv))**4
                                          + 2 * no**3 * nv**3 + 128 * nv**4))
         elif occupied_tiles:
             self._fixed_bytes = 8 * (10 * (4 * no * nv)**3 +
@@ -339,7 +370,9 @@ class TripletEOMCCSDTQ:
             cache, partial = self._slot_budget()
             self.estimated_dense_bytes = self._fixed_bytes + cache + partial
         self.amplitudes = _ground_amplitudes(solver, amplitudes, xp,
-                                            self._ground_t4 if occupied_tiles else None)
+                                            self._ground_t4 if occupied_tiles else None,
+                                            blocked=(3,) if self._spin_blocked_t3() else (),
+                                            holes_first=self._holes_first_ranks())
         if self._holes_first_ranks():
             # Rank three with the occupied axes outermost: a tile fixes two of
             # them, and with them innermost (spin-interleaved) its slice of the
@@ -362,6 +395,12 @@ class TripletEOMCCSDTQ:
             for holes, (key, window) in self._direction_t4.slots.items():
                 values = [order[(*p, *holes)] for p in self._direction_t4.groups[key]]
                 self._tiled_r4_order[window] = xp.asarray(values, dtype=np.int32)
+
+    def _spin_blocked_t3(self):
+        """Whether T3 is kept as its nonzero spin blocks (the CPU occupied-tile
+        engine, unless ITERCC_SPIN_BLOCKED_T3=0)."""
+        return (self.xp is np and self.occupied_tiles and self._packed_direction
+                and _runtime.enabled("ITERCC_SPIN_BLOCKED_T3"))
 
     def _holes_first_ranks(self):
         """Ranks whose dense tensors keep the occupied axes outermost (the CPU
