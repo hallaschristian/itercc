@@ -288,9 +288,11 @@ class TripletEOMCCSDTQ:
             raise ValueError("Intermediate cache budget must be finite and nonnegative")
         self.intermediate_cache_bytes = int(intermediate_cache_gib * 2**30)
         # The slot program's waves hold this many bytes of partial sums (default:
-        # as many as the cache, at most 32 GiB). Tiles sharing intermediates run
+        # as many as the cache, at most 8 GiB). Tiles sharing intermediates run
         # in the same wave; a cache larger than the waves still keeps
         # intermediates between them (CuF: 262 GiB of distinct intermediates).
+        # CuF, one socket, 64 GiB cache: 32 GiB of partial sums 161.5 s per
+        # action, 8 GiB 163.5 s with 26 GB less peak memory, 2 GiB 173.7 s.
         if partial_sums_gib is not None and (not np.isfinite(partial_sums_gib) or partial_sums_gib <= 0):
             raise ValueError("Partial sums need a positive finite budget")
         self.partial_sums_bytes = (None if partial_sums_gib is None else int(partial_sums_gib * 2**30))
@@ -304,8 +306,9 @@ class TripletEOMCCSDTQ:
             # T3 and R3 dense (two copies of T3 while it is laid out, the R3 of
             # an action), the dressed integrals, a rank-three tile with its
             # products; the packed T4, R4 and image vectors are added below.
-            # CuF (13o/29v, one socket): 71 GB after rank three, 173 GB at the
-            # end of an action with a 64 GiB cache and 32 GiB of partial sums.
+            # CuF (13o/29v, one socket, T3 and R3 as spin blocks): 25 GB after
+            # setup, 125 GB at the end of an action with a 64 GiB cache and
+            # 8 GiB of partial sums (190 GB with T3 and R3 dense and 32 GiB).
             rank_three = (0.75 if backend == "cpu" and occupied_tiles and self._packed_direction
                           and _runtime.enabled("ITERCC_SPIN_BLOCKED_T3") else 2.5)
             self._fixed_bytes = int(8 * (rank_three * (4 * no * nv)**3 + 6 * (2 * (no + nv))**4
@@ -396,6 +399,7 @@ class TripletEOMCCSDTQ:
             raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
         self.action_only = action_only
         self._lower_projection = {}
+        self._lower_tile_buffers = {}       # `_lower_tile`
         self.native_projection = True
         self._gather_plans = {}
         self.space = SpinFlipSpace(no, nv, labels, irrep, xp,
@@ -557,6 +561,7 @@ class TripletEOMCCSDTQ:
                                          engine=self._symmetry_engine, diagrams=diagrams,
                                          occupied_slab=self.occupied_slab, intermediates=intermediates,
                                          compiled_products=self.packed_contractions,
+                                         out=self._lower_tile(rank),
                                          equivalent=equivalent, hole_order=True)
                     yield (raw, equivalent, multiplicity), tile
             return
@@ -698,7 +703,7 @@ class TripletEOMCCSDTQ:
         program's 256 MiB)."""
         if self.partial_sums_bytes is not None:
             return max(self.partial_sums_bytes, 2**28)
-        return max(min(int(cache), 32 * 2**30), 2**28)
+        return max(min(int(cache), 8 * 2**30), 2**28)
 
     def _slot_budget(self):
         """(intermediate cache, partial sums) bytes of the slot program: the
@@ -711,7 +716,7 @@ class TripletEOMCCSDTQ:
         cache = self.intermediate_cache_bytes
         if not cache:
             # Half of what remains: the partial sums (as many bytes as the
-            # cache, at most 32 GiB) fit beside it.
+            # cache, at most 8 GiB) fit beside it.
             cache = (self.memory_budget_bytes - self._fixed_bytes - self._davidson_reserve) // 2
         cache = max(int(cache), 2**28)
         return cache, self._partial_bytes(cache)
@@ -727,6 +732,27 @@ class TripletEOMCCSDTQ:
         if tile is None:
             tile = self._raw_tile = np.empty((self.nvir,) * 4 + (1,) * 4)
         tile.fill(0.0)
+        return tile
+
+    def _lower_tile(self, rank):
+        """A zeroed rank-two or rank-three tile (whole occupied axes), reused
+        across tiles and actions and stored with its occupied axes outermost
+        (None on the GPU, or with ITERCC_LOWER_TILE_REUSE=0): each tile is
+        projected before the next one is formed. At CuF size a fresh tile
+        (429 MB) per projection group and spin pattern paid its page faults
+        inside the products that first wrote it, 5-20 times their warm time;
+        and with the occupied axes outermost a block of the products (one
+        occupied tuple) writes one contiguous 195 KB run instead of entries
+        17 KB apart. 13o/29v replay, 12 threads: 10.3 s of products with a warm
+        letter-order tile, 7.0 s holes first."""
+        if self.xp is not np or not _runtime.enabled("ITERCC_LOWER_TILE_REUSE"):
+            return None
+        tile = self._lower_tile_buffers.get(rank)
+        if tile is None:
+            stored = np.empty((self.nocc,) * rank + (self.nvir,) * rank)
+            tile = self._lower_tile_buffers[rank] = stored.transpose(tuple(range(rank, 2 * rank)) + tuple(range(rank)))
+        from ._cpu_quadruples import scale_
+        scale_(tile.base, 0.0)
         return tile
 
     def _accumulate_projection(self, destination, rows, particles, permutations, tile, multiplicity):

@@ -87,6 +87,9 @@ SWITCHES = {
     "ITERCC_SLOT_POSITIONS": Switch(
         "1", "call", "`0`: triplet slot-program intermediates and tiles keep virtual axes in orbital "
         "order, not irrep order"),
+    "ITERCC_LOWER_TILE_REUSE": Switch(
+        "1", "call", "`0`: the triplet engine's rank-two and rank-three tiles are fresh arrays in letter order, not "
+        "one reused tile with its occupied axes outermost"),
     "ITERCC_SPIN_BLOCKED_T3": Switch(
         "1", "construction", "`0`: the triplet engine keeps T3 and each action's R3 as dense spin-orbital "
         "tensors, not their nonzero spin blocks"),

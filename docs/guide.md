@@ -136,7 +136,7 @@ one GEMM with the coefficient block; ranks two and three alike). Tile products f
 reads (letters of each antisymmetric subset in increasing spin-orbital
 order), in ranks two and three among the occupied letters as well. Its waves
 of slots hold `partial_sums_gib` of partial sums (default: as much as the
-cache, at most 32 GiB), so a cache can be as large as an action's distinct
+cache, at most 8 GiB; on CuF 1% slower than 32 GiB with 26 GB less memory), so a cache can be as large as an action's distinct
 intermediates (262 GiB on CuF) without waves of that size; without a cache
 setting the program takes half of what `memory_budget_gib` leaves beside the
 engine's estimate (which counts the program's tiles and buffers). Progress
@@ -289,6 +289,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TRIPLET_FUSED` | call | `0`: triplet slot program adds products into a tile one by one (the loop's action bit for bit) |
 | `ITERCC_DIRECT_DENSE` | call | `0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
 | `ITERCC_SLOT_POSITIONS` | call | `0`: triplet slot-program intermediates and tiles keep virtual axes in orbital order, not irrep order |
+| `ITERCC_LOWER_TILE_REUSE` | call | `0`: the triplet engine's rank-two and rank-three tiles are fresh arrays in letter order, not one reused tile with its occupied axes outermost |
 | `ITERCC_SPIN_BLOCKED_T3` | construction | `0`: the triplet engine keeps T3 and each action's R3 as dense spin-orbital tensors, not their nonzero spin blocks |
 | `ITERCC_HOLES_FIRST` | call | `0`: triplet dense rank-three tensors with the occupied axes innermost, not outermost |
 | `ITERCC_PAIR_SUMS` | call | `0`: triplet tile products sum both orders of an exchangeable pair of summed letters instead of x < y twice |

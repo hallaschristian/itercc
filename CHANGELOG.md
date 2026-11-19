@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- The triplet engine's rank-two and rank-three tiles (one per projection
+  group and spin pattern, 135 per action, 429 MB each at CuF size) are one
+  reused array stored with its occupied axes outermost
+  (`TripletEOMCCSDTQ._lower_tile`), not fresh arrays in letter order. A fresh
+  tile paid its page faults inside the blocked products that first wrote it
+  (13o/29v replay, 12 threads: 150-420 ms per product instead of 10-60 ms),
+  and in letter order a block of the products (one occupied tuple) wrote
+  entries 17 KB apart; holes first they are one 195 KB run. Warm products of
+  the replay 10.3 -> 7.0 s; 6o/24v synthetic model: ranks two and three
+  2.04 -> 1.69 s, the same action bit for bit. `ITERCC_LOWER_TILE_REUSE=0`
+  restores fresh tiles.
+- The triplet slot program's waves hold at most 8 GiB of partial sums by
+  default (was 32 GiB). CuF on one Sapphire Rapids socket, 64 GiB cache,
+  second action: 32 GiB 161.5 s and 151 GB peak, 8 GiB 163.5 s and 125 GB,
+  2 GiB 173.7 s (the wave barrier grows), the same action bit for bit. The
+  same run measured this release's earlier changes on the full action: 161.5 s
+  against 219 s at eb539a9; intermediates in letter order 179.0 s (tile
+  products 3584 -> 2760 thread-s with chains innermost); T3 and R3 dense
+  168.6 s, 190 GB peak and 158 s of setup (spin blocks: 82 s).
 - The triplet engine keeps T3, and each action's R3, as their nonzero spin
   blocks (`_spin_quadruples_tiles.SpinBlocks`: 20 and 15 of 64 signatures,
   each a spatial array with its occupied axes outermost; R3 straight from the
