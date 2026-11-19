@@ -400,148 +400,12 @@ void pack_b_side(const FusedSide &x, const i64 *bk, const i64 *cols, i64 kn, i64
     }
 }
 
-// Rows of a fused GEMM that skinny_driver takes: two vectors of eight.
-constexpr i64 kSkinnyRows = 16;
-
-// ITERCC_GEMM_SKINNY: "0" neither skinny path, "fused" or "packed" only
-// that one, else both (read once).
-int skinny_mode()
-{
-    static const int mode = [] {
-        const char *text = std::getenv("ITERCC_GEMM_SKINNY");
-        if (text == nullptr || text[0] == ' ') return 3;
-        const std::string value(text);
-        return value == "0" ? 0 : value == "fused" ? 1 : value == "packed" ? 2 : 3;
-    }();
-    return mode;
-}
-
-bool skinny_enabled()
-{
-    return (skinny_mode() & 1) != 0;
-}
-
-#if defined(ITERCC_GEMM_AVX512) || defined(ITERCC_GEMM_AVX2)
-#if defined(ITERCC_GEMM_AVX512)
-using SkinnyVec = __m512d;
-constexpr int kLanes = 8;
-inline SkinnyVec vzero() { return _mm512_setzero_pd(); }
-inline SkinnyVec vload(const double *p) { return _mm512_loadu_pd(p); }
-inline SkinnyVec vset1(double x) { return _mm512_set1_pd(x); }
-inline SkinnyVec vfma(SkinnyVec a, SkinnyVec b, SkinnyVec c) { return _mm512_fmadd_pd(a, b, c); }
-inline void vstore(double *p, SkinnyVec x) { _mm512_store_pd(p, x); }
-#else
-using SkinnyVec = __m256d;
-constexpr int kLanes = 4;
-inline SkinnyVec vzero() { return _mm256_setzero_pd(); }
-inline SkinnyVec vload(const double *p) { return _mm256_loadu_pd(p); }
-inline SkinnyVec vset1(double x) { return _mm256_set1_pd(x); }
-inline SkinnyVec vfma(SkinnyVec a, SkinnyVec b, SkinnyVec c) { return _mm256_fmadd_pd(a, b, c); }
-inline void vstore(double *p, SkinnyVec x) { _mm256_store_pd(p, x); }
-#endif
-
-// One chunk of sums [pc, pc + kc) of skinny_driver with V vectors of rows.
-template <int V>
-void skinny_chunk(i64 m, i64 n, const i64 *cm, const i64 *cn, double *c, i64 nseg, const FusedSide *bs,
-                  const i64 *start, i64 pc, i64 kc, const double *ap, bool rows_run)
-{
-    constexpr i64 kAhead = 8;   // columns between a column's prefetch and its use
-    for (i64 j = 0; j < n; ++j) {
-        if (j + kAhead < n) {
-            for (i64 s = 0; s < nseg; ++s) {
-                const i64 lo = std::max(pc, start[s]);
-                if (lo < std::min(pc + kc, start[s + 1]))
-                    __builtin_prefetch(bs[s].v + bs[s].r[j + kAhead] + bs[s].k[lo - start[s]], 0, 3);
-            }
-            __builtin_prefetch(c + cm[0] + cn[j + kAhead], 1, 3);
-        }
-        SkinnyVec acc[V];
-        for (int v = 0; v < V; ++v) acc[v] = vzero();
-        for (i64 s = 0; s < nseg; ++s) {
-            const i64 lo = std::max(pc, start[s]), hi = std::min(pc + kc, start[s + 1]);
-            const FusedSide &y = bs[s];
-            const double *col = y.v + y.r[j];
-            const i64 *bk = y.k - start[s];
-            const double *a = ap + (lo - pc) * kSkinnyRows;
-            if (y.alpha != 1.0) {
-                for (i64 k = lo; k < hi; ++k, a += kSkinnyRows) {
-                    const SkinnyVec b = vset1(y.alpha * col[bk[k]]);
-                    for (int v = 0; v < V; ++v) acc[v] = vfma(vload(a + v * kLanes), b, acc[v]);
-                }
-            } else {
-                for (i64 k = lo; k < hi; ++k, a += kSkinnyRows) {
-                    const SkinnyVec b = vset1(col[bk[k]]);
-                    for (int v = 0; v < V; ++v) acc[v] = vfma(vload(a + v * kLanes), b, acc[v]);
-                }
-            }
-        }
-        alignas(64) double out[V * kLanes];
-        for (int v = 0; v < V; ++v) vstore(out + v * kLanes, acc[v]);
-        if (rows_run) {
-            double *o = c + cm[0] + cn[j];
-            for (i64 i = 0; i < m; ++i) o[i] = o[i] + out[i];
-        } else {
-            for (i64 i = 0; i < m; ++i) c[cm[i] + cn[j]] = c[cm[i] + cn[j]] + out[i];
-        }
-    }
-}
-
-// fused_driver for m <= kSkinnyRows rows of doubles. With so few rows each B
-// value is used once (one row block), so packing B would only copy it: B is
-// read in place, column by column (a column's sums run along memory in the
-// tile products, a few dozen values), against A packed [k][kSkinnyRows]. The
-// arithmetic is the micro kernel's: per chunk of KC sums, fused multiply-adds
-// in order of k from zero over the values scaled as the packers scale them,
-// then C = C + acc. The skinny tile products of the triplet slot program
-// (2998 x 7 x 7 blocks, 7 x 965 x 30, ...) spent most of their time packing
-// B.
-void skinny_driver(i64 m, i64 n, const i64 *cm, const i64 *cn, double *c, i64 nseg, const FusedSide *as,
-                   const FusedSide *bs, const i64 *start)
-{
-    const i64 depth = start[nseg];
-    const i64 kc_max = std::min(KC, depth);
-    double *ap = scratch(3).get(size_t(kc_max * kSkinnyRows));
-    const bool rows_run = consecutive(cm, m);
-    const i64 vectors = (m + kLanes - 1) / kLanes;
-    for (i64 pc = 0; pc < depth; pc += KC) {
-        const i64 kc = std::min(KC, depth - pc);
-        for (i64 s = 0; s < nseg; ++s) {
-            const i64 lo = std::max(pc, start[s]), hi = std::min(pc + kc, start[s + 1]);
-            const FusedSide &x = as[s];
-            for (i64 k = lo; k < hi; ++k) {
-                const double *src = x.v + x.k[k - start[s]];
-                double *d = ap + (k - pc) * kSkinnyRows;
-                for (i64 i = 0; i < m; ++i) d[i] = x.alpha != 1.0 ? x.alpha * src[x.r[i]] : src[x.r[i]];
-                for (i64 i = m; i < kSkinnyRows; ++i) d[i] = 0.0;
-            }
-        }
-        switch (vectors) {
-        case 1: skinny_chunk<1>(m, n, cm, cn, c, nseg, bs, start, pc, kc, ap, rows_run); break;
-        case 2: skinny_chunk<2>(m, n, cm, cn, c, nseg, bs, start, pc, kc, ap, rows_run); break;
-#if !defined(ITERCC_GEMM_AVX512)
-        case 3: skinny_chunk<3>(m, n, cm, cn, c, nseg, bs, start, pc, kc, ap, rows_run); break;
-        case 4: skinny_chunk<4>(m, n, cm, cn, c, nseg, bs, start, pc, kc, ap, rows_run); break;
-#endif
-        default: break;
-        }
-    }
-}
-#define ITERCC_GEMM_SKINNY 1
-#endif
-
 // C(r, c) += sum over the segments of A_s(r, k) B_s(k, c) for r < m, c < n,
 // C(r, c) = c[cm[r] + cn[c]], A_s and B_s given as sides (B's "rows" are its
 // columns), sums laid end to end in chunks of KC.
 void fused_driver(i64 m, i64 n, const i64 *cm, const i64 *cn, double *c, i64 nseg, const FusedSide *as,
                   const FusedSide *bs, const i64 *start, i64 nc_hint)
 {
-#if defined(ITERCC_GEMM_SKINNY)
-    if (m <= kSkinnyRows && skinny_enabled() && !ITERCC_KO(32)) {
-        bool doubles = true;
-        for (i64 s = 0; s < nseg; ++s) doubles = doubles && !as[s].f32 && !bs[s].f32;
-        if (doubles) return skinny_driver(m, n, cm, cn, c, nseg, as, bs, start);
-    }
-#endif
     const i64 depth = start[nseg];
     const i64 kc_max = std::min(KC, depth);
     const i64 ncb = column_block(m, depth, nc_hint);
@@ -620,22 +484,10 @@ void fused_gemm(const FusedGemm &g)
     // products and their order are the same either way (alpha stays on A's
     // values and fused multiply-adds commute), so the results are identical.
     const int mode = orientation.load(std::memory_order_relaxed);
-    // A side of at most kSkinnyRows goes to the rows (skinny_driver reads the
-    // other in place); otherwise whichever fills the register tiles better.
-#if defined(ITERCC_GEMM_SKINNY)
-    const bool skinny = std::min(g.m, n) <= kSkinnyRows && skinny_enabled();
-#else
-    const bool skinny = false;
-#endif
-    if (mode == 2 || (mode == 0 && (skinny ? n < g.m : tiled(n, g.m) > tiled(g.m, n))))
+    if (mode == 2 || (mode == 0 && tiled(n, g.m) > tiled(g.m, n)))
         fused_driver(n, g.m, g.cc + g.j0, g.cr, g.c, g.nseg, ys.data(), xs.data(), start.data(), g.nc);
     else
         fused_driver(g.m, n, g.cr, g.cc + g.j0, g.c, g.nseg, xs.data(), ys.data(), start.data(), g.nc);
-}
-
-bool skinny_gemm()
-{
-    return (skinny_mode() & 2) != 0;
 }
 
 void set_fused_orientation(int mode)

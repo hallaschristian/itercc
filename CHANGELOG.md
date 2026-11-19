@@ -10,19 +10,12 @@
   cache line; a chain's irrep is a run of hundreds of ranks. On one Sapphire
   Rapids socket the clearing took the same wall time on 28 and 56 threads.
   6o/24v synthetic model: clearing 6.5 -> 3.8 thread-s, gathers 37.9 -> 34.8,
-  rank four 14.7 -> 13.9 s, the same action bit for bit.
+  rank four 14.7 -> 13.9 s, the same action bit for bit. Sapphire Rapids (one
+  socket, 56 threads, CuF, first 1500 slots, one node): 20.8 s with tiles
+  cleared whole, 20.5 s in letter order, 18.6 s (clearing 81 -> 49
+  thread-s, gathers 168 -> 141, tile products 390 -> 343).
   `ITERCC_TILE_CHAINS_INNER=0` keeps letter order, `ITERCC_TILE_RUNS=0`
   clears tiles whole.
-- GEMMs of at most 16 rows read B in place (`ITERCC_GEMM_SKINNY`): fused
-  GEMMs (`skinny_driver`) and packed-T4 blocks (`packed_skinny`). With so few
-  rows each B value is used once, so packing it only copied it, and the g T4
-  intermediates' packed gathers ran sums outermost, nv^2 or more map entries
-  apart per value. B is read column by column with the micro kernel's
-  arithmetic, so results are the same bit for bit. The triplet slot
-  program's skinny tile products (2998 x 7 x 7 blocks, 7 x 965 x 30, ...)
-  took 228 of its 369 tile-product thread-s and the g T4 intermediates 146 of
-  its 254 intermediate thread-s on one Sapphire Rapids socket at CuF size.
-  CCSDTQ tile programs: unchanged (6o/29v, 7.2 s per evaluation).
 - Triplet slot-program gathers (tile -> packed rows) run term by term over
   every row of a part, with each term's steps, chain members and rank tables
   hoisted and the common chain shapes (one or two chains of two or three

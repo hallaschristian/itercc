@@ -28,7 +28,6 @@
 // into tasks freely: tasks follow the thread count, results do not. No BLAS is
 // called, so there is no second thread pool to contend with.
 #include <algorithm>
-#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -314,92 +313,6 @@ void shallow_block(const Plan &p, const Block &g)
     }
 }
 
-// Rows of a packed-B block that packed_skinny takes.
-constexpr i64 kSkinnyRows = 16;
-
-// A packed-B block of at most kSkinnyRows rows (the g T4 intermediates of the
-// triplet slot program: one occupied or virtual letter of one irrep against
-// hundreds of columns). Each B value is used once, so it is read in place
-// instead of gathered into a panel that the GEMM then packs again: column by
-// column, a column's sums along each row's map (the sums are the dense
-// address's last letters; columns lie nv^2 or more map entries apart, a new
-// cache line of a map of megabytes per value when sums run outermost). The
-// arithmetic is indirect_gemm's: per chunk of kGemmKc sums, fused
-// multiply-adds in order from zero, then C = C + alpha * acc. False (nothing
-// done) when the columns span packed rows.
-// One sum's packed row in packed_skinny.
-struct SumRow {
-    const int32_t *map;   // null: the row is absent (zero)
-    const double *from;
-    double sign;
-};
-
-// The column loop of packed_skinny with L accumulator lanes (L >= rows).
-template <int L>
-void packed_skinny_columns(const SumRow *sums, const double *ap, i64 kc, i64 rows, i64 cols, const i64 *bc, double *c,
-                           const i64 *cr, const i64 *cc, double alpha)
-{
-    static const double zero = 0.0;
-    for (i64 j = 0; j < cols; ++j) {
-        const i64 e = bc[j];
-        double acc[L] = {};
-        for (i64 k = 0; k < kc; ++k) {
-            const SumRow &u = sums[k];
-            double value = 0.0;
-            if (u.map != nullptr) {
-                // The signed one-based index without branches (its sign is a
-                // permutation's parity: unpredictable); +0.0 where it is 0, as
-                // itercc_signed_gather_rows has it.
-                const int32_t index = u.map[e];
-                const int64_t at = index < 0 ? -int64_t(index) : int64_t(index);
-                const double *x = at ? u.from + at - 1 : &zero;
-                const double sign = index < 0 ? -u.sign : index > 0 ? u.sign : 1.0;
-                value = sign * *x;
-            }
-            const double *a = ap + k * 16;
-            for (int r = 0; r < L; ++r) acc[r] = std::fma(a[r], value, acc[r]);
-        }
-        for (i64 r = 0; r < rows; ++r) c[cr[r] + cc[j]] = c[cr[r] + cc[j]] + alpha * acc[r];
-    }
-}
-
-bool packed_skinny(const Plan &p, const Block &g, i64 k1, i64 k2, double *c, const i64 *cr, const i64 *cc,
-                   double alpha)
-{
-    const itercc::PackedRows &v = *p.packed_b;
-    const i64 rows = g.rows, cols = g.cols, depth = k2 - k1;
-    const i64 *bc = p.b_cols + g.c0;
-    for (i64 j = 0; j < cols; ++j)
-        if (bc[j] >= v.width || bc[j] < 0) return false;
-    const double *a = p.a + g.a_base;
-    const i64 *ar = p.a_rows + g.r0, *ak = p.a_sum + g.k0 + k1, *bs = p.b_sum + g.k0 + k1;
-    const i64 kc_max = std::min<i64>(itercc::kGemmKc, depth);
-    thread_local std::vector<double> ap;
-    thread_local std::vector<SumRow> sums;
-    ap.resize(size_t(kc_max * kSkinnyRows));
-    sums.resize(size_t(kc_max));
-    for (i64 pc = 0; pc < depth; pc += itercc::kGemmKc) {
-        const i64 kc = std::min<i64>(itercc::kGemmKc, depth - pc);
-        for (i64 k = 0; k < kc; ++k) {
-            double *d = ap.data() + k * kSkinnyRows;
-            for (i64 r = 0; r < rows; ++r) d[r] = a[ar[r] + ak[pc + k]];
-            for (i64 r = rows; r < kSkinnyRows; ++r) d[r] = 0.0;
-            const i64 address = g.b_base + bs[pc + k], row = address / v.width, entry = address - row * v.width;
-            const i64 b = v.bases[row];
-            sums[size_t(k)] = SumRow{b ? reinterpret_cast<const int32_t *>(static_cast<intptr_t>(v.maps[row])) + entry
-                                       : nullptr,
-                                     v.source + ((b < 0 ? -b : b) - 1), b < 0 ? -1. : 1.};
-        }
-        if (rows <= 4)
-            packed_skinny_columns<4>(sums.data(), ap.data(), kc, rows, cols, bc, c, cr, cc, alpha);
-        else if (rows <= 8)
-            packed_skinny_columns<8>(sums.data(), ap.data(), kc, rows, cols, bc, c, cr, cc, alpha);
-        else
-            packed_skinny_columns<16>(sums.data(), ap.data(), kc, rows, cols, bc, c, cr, cc, alpha);
-    }
-    return true;
-}
-
 // The indirect GEMM of block g over sums [k1, k2) with B from packed rows: B
 // is gathered in panels of columns (about 512 KB, in cache) and each panel is
 // one indirect GEMM over all the sums, so every output entry gets the same sum
@@ -412,7 +325,6 @@ void packed_indirect(const Plan &p, const Block &g, i64 k1, i64 k2, bool swap, d
 {
     const i64 depth = k2 - k1;
     if (depth <= 0 || g.rows <= 0 || g.cols <= 0) return;
-    if (g.rows <= kSkinnyRows && itercc::skinny_gemm() && packed_skinny(p, g, k1, k2, c, cr, cc, alpha)) return;
     const i64 width = std::min(g.cols, std::max<i64>(64, kPanel / depth));
     double *panel = scratch(6).get(size_t(depth * width));
     thread_local std::vector<i64> ks, cs;

@@ -302,7 +302,6 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TILE_RUNS` | core | `0`: slot-program tiles (dense or compact) cleared whole, not only where symmetry allows entries (diagnostic) |
 | `ITERCC_SYM_MIN_SHARE` | core | GEMM executor: least work per thread of a shared block |
 | `ITERCC_SYM_PARALLEL_WORK` | core | GEMM executor: work from which one block runs on all threads |
-| `ITERCC_GEMM_SKINNY` | core | `0`: GEMMs of at most 16 rows pack or gather B like the others instead of reading it in place; `fused` or `packed`: only fused GEMMs or only packed-T4 blocks read it in place |
 | `ITERCC_GEMM_NC` | core | `auto`: narrower GEMM column blocks for deep products (experiment) |
 | `ITERCC_GEMM_KNOCKOUT` | core | GEMM micro-kernel stages to skip (timing diagnostic only) |
 | `ITERCC_GEMM_AUTOTUNE` | import | `0`: CUDA GEMM routes chosen statically instead of timed |

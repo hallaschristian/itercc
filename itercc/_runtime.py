@@ -115,9 +115,6 @@ SWITCHES = {
     "ITERCC_SYM_MIN_SHARE": Switch("", "core", "GEMM executor: least work per thread of a shared block"),
     "ITERCC_SYM_PARALLEL_WORK": Switch(
         "", "core", "GEMM executor: work from which one block runs on all threads"),
-    "ITERCC_GEMM_SKINNY": Switch(
-        "", "core", "`0`: GEMMs of at most 16 rows pack or gather B like the others instead of reading it in "
-        "place; `fused` or `packed`: only fused GEMMs or only packed-T4 blocks read it in place"),
     "ITERCC_GEMM_NC": Switch("", "core", "`auto`: narrower GEMM column blocks for deep products (experiment)"),
     "ITERCC_GEMM_KNOCKOUT": Switch("", "core", "GEMM micro-kernel stages to skip (timing diagnostic only)"),
     # CUDA
