@@ -168,44 +168,25 @@ void packed_gather(const itercc::PackedRows &v, i64 base, const i64 *ks, i64 n, 
         const double sign = b < 0 ? -1. : 1.;
         return index > 0 ? sign * from[index - 1] : index < 0 ? -sign * from[-int64_t(index) - 1] : 0.;
     };
-    if (!one_row) {
-        for (i64 k = 0; k < n; ++k) {
-            const i64 address = base + ks[k], row = address / v.width, entry = address - row * v.width;
-            double *d = dst + k * ldk;
+    for (i64 k = 0; k < n; ++k) {
+        const i64 address = base + ks[k], row = address / v.width, entry = address - row * v.width;
+        double *d = dst + k * ldk;
+        if (!one_row) {
             for (i64 c = 0; c < m; ++c) d[c * ldc] = value(row + col_row[size_t(c)], entry + entries[c]);
-        }
-        return;
-    }
-    // Runs of sums in one dense row (one packed slot), each run column by
-    // column: a column's entries for consecutive sums sit side by side in the
-    // row's map (its sum letters vary fastest there), so the map is read in
-    // lines rather than one line per value, and the run's slot stays in cache.
-    thread_local std::vector<i64> run_entry;
-    for (i64 k0 = 0; k0 < n;) {
-        const i64 row = (base + ks[k0]) / v.width;
-        i64 k1 = k0 + 1;
-        while (k1 < n && (base + ks[k1]) / v.width == row) ++k1;
-        const i64 b = v.bases[row];
-        if (!b) {
-            for (i64 k = k0; k < k1; ++k)
-                for (i64 c = 0; c < m; ++c) dst[k * ldk + c * ldc] = 0.;
-            k0 = k1;
             continue;
         }
-        run_entry.resize(size_t(k1 - k0));
-        for (i64 k = k0; k < k1; ++k) run_entry[size_t(k - k0)] = base + ks[k] - row * v.width;
-        const int32_t *map = reinterpret_cast<const int32_t *>(static_cast<intptr_t>(v.maps[row]));
+        const i64 b = v.bases[row];
+        if (!b) {
+            for (i64 c = 0; c < m; ++c) d[c * ldc] = 0.;
+            continue;
+        }
+        const int32_t *map = reinterpret_cast<const int32_t *>(static_cast<intptr_t>(v.maps[row])) + entry;
         const double *from = v.source + ((b < 0 ? -b : b) - 1);
         const double sign = b < 0 ? -1. : 1.;
         for (i64 c = 0; c < m; ++c) {
-            const int32_t *column = map + entries[c];
-            double *d = dst + c * ldc;
-            for (i64 k = k0; k < k1; ++k) {
-                const int32_t index = column[run_entry[size_t(k - k0)]];
-                d[k * ldk] = index > 0 ? sign * from[index - 1] : index < 0 ? -sign * from[-int64_t(index) - 1] : 0.;
-            }
+            const int32_t index = map[entries[c]];
+            d[c * ldc] = index > 0 ? sign * from[index - 1] : index < 0 ? -sign * from[-int64_t(index) - 1] : 0.;
         }
-        k0 = k1;
     }
 }
 
