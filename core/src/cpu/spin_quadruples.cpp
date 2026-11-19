@@ -298,6 +298,37 @@ extern "C" void itercc_spin_quad_dense(int64_t count, const int32_t *coordinates
 // particles B (a slot's T4 values for every summed letter), multiplies it with
 // the coefficient block in one GEMM, and adds the products into every target
 // slot J + x_h of this process.
+//
+// Diagnostic thread time of both kernels by phase (build with
+// -DITERCC_PROFILE_OPENED; itercc_opened_profile prints and resets it).
+#ifdef ITERCC_PROFILE_OPENED
+#include <atomic>
+#include <cstdio>
+#include <omp.h>
+namespace {
+std::atomic<double> opened_time[8];
+inline void opened_add(int i, double &mark)
+{
+    const double now = omp_get_wtime();
+    double old = opened_time[i].load();
+    while (!opened_time[i].compare_exchange_weak(old, old + now - mark)) {
+    }
+    mark = now;
+}
+}  // namespace
+extern "C" void itercc_opened_profile()
+{
+    const char *names[8] = {"targets", "numbering", "Y gather", "GEMM", "scatter", "kp0 gemm", "kp0 add", "-"};
+    for (int i = 0; i < 8; ++i)
+        std::fprintf(stderr, "  opened %-10s %8.2f thread-s\n", names[i], opened_time[i].load());
+    for (int i = 0; i < 8; ++i) opened_time[i] = 0.0;
+}
+#define OPENED_MARK double opened_mark = omp_get_wtime()
+#define OPENED_ADD(i) opened_add((i), opened_mark)
+#else
+#define OPENED_MARK (void)0
+#define OPENED_ADD(i) (void)0
+#endif
 namespace {
 
 inline int64_t binomial4(int64_t k) { return k == 0 ? 1 : k == 1 ? 4 : 6; }
@@ -317,6 +348,36 @@ struct OpenedTarget {
     double *out;           // the target's rows in the output or in its buffer
     int64_t beta[2];       // positions of x_h in the slot (labels order)
 };
+
+// Y[i][k] (i < nb, k < K): the amplitude of slot hk[k] (signed offset + 1, 0
+// for none) at the position of row i of `rows` (npf signed positions + 1 per
+// B), column pk[k]. The tuples' slots and particle columns are looked up once
+// per class, not once per B, and each row's reads (scattered over up to
+// hundreds of slots) are prefetched kAhead tuples ahead.
+inline void gather_y(int64_t nb, int64_t K, int64_t npf, const int32_t *rows, const int64_t *hk, const int64_t *pk,
+                     const double *vector, double *y)
+{
+    constexpr int64_t kAhead = 16;
+    for (int64_t i = 0; i < nb; ++i) {
+        const int32_t *vrow = rows + i * npf;
+        double *yi = y + i * K;
+        for (int64_t k = 0; k < K; ++k) {
+            if (k + kAhead < K) {
+                const int64_t hn = hk[k + kAhead];
+                const int32_t vn = vrow[pk[k + kAhead]];
+                if (hn && vn) __builtin_prefetch(vector + (std::abs(hn) - 1 + std::abs(vn) - 1));
+            }
+            const int64_t h = hk[k];
+            const int32_t v = vrow[pk[k]];
+            if (!h || !v) {
+                yi[k] = 0.0;
+                continue;
+            }
+            const double value = vector[std::abs(h) - 1 + std::abs(v) - 1];
+            yi[k] = (h < 0) != (v < 0) ? -value : value;
+        }
+    }
+}
 
 inline int64_t opened_alpha(const int32_t *v, int64_t n)
 {
@@ -358,7 +419,8 @@ extern "C" void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *la
     }
     #pragma omp parallel num_threads(threads)
     {
-        std::vector<int64_t> hvec(static_cast<size_t>(nh)), zoff(40), znb(40), zc(40), rows_m, cols, ar, ak, bk, bc, cr, cc;
+        std::vector<int64_t> hvec(static_cast<size_t>(nh)), zoff(40), znb(40), zc(40), rows_m, cols, ar, ak, bk, bc, cr, cc,
+            hk, pk;
         std::vector<int32_t> m_of_x(size_t(nxflat), -1);
         std::vector<int64_t> touched, target_of(size_t(nh), -1);
         std::vector<double> y, z, a, coefs;
@@ -366,6 +428,7 @@ extern "C" void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *la
         std::vector<OpenedTarget> targets;
         #pragma omp for schedule(dynamic, 1)
         for (int64_t u = 0; u < nunits; ++u) {
+            OPENED_MARK;
             const int32_t *J = units + 4 * u;
             const int64_t alphaJ = opened_alpha(J, nj), irrepJ = opened_irrep(L.occupied_irrep, J, nj);
             // Amplitude slots J + s_h (signed offset + 1) and this process's target slots J + x_h.
@@ -401,6 +464,7 @@ extern "C" void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *la
                 target_of[size_t(f)] = int64_t(targets.size());
                 targets.push_back(target);
             }
+            OPENED_ADD(0);
             if (targets.empty()) continue;
             if (kp == 0) {
                 // B is the row: Z[x, rows] = sum_s W'[x, s] T(slot J + s_h)[rows], in column chunks.
@@ -467,15 +531,18 @@ extern "C" void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *la
                             cc[size_t(j)] = j;
                         }
                         std::fill(z.begin(), z.end(), 0.0);
+                        OPENED_ADD(0);
                         itercc::IndirectGemm gemm{M, nc, K, a.data(), ar.data(), ak.data(), false,
                                                   F.vector, bk.data(), bc.data(), false,
                                                   z.data(), cr.data(), cc.data(), 1.0};
                         itercc::indirect_gemm(gemm);
+                        OPENED_ADD(5);
                         for (int64_t m = 0; m < M; ++m) {
                             double *d = dests[size_t(m)] + j0;
                             const double *zm = z.data() + m * chunk;
                             for (int64_t j = 0; j < nc; ++j) d[j] += zm[j];
                         }
+                        OPENED_ADD(6);
                     }
                 }
                 continue;
@@ -524,27 +591,22 @@ extern "C" void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *la
                 }
             }
             z.resize(size_t(ztotal));
+            OPENED_ADD(1);
             for (int64_t cb = 0; cb < 40; ++cb) {
                 if (zoff[size_t(cb)] < 0) continue;
                 const int64_t c = zc[size_t(cb)], nb = znb[size_t(cb)], b0 = F.b_start[cb];
                 const int64_t s0 = F.sigma_start[c], K = F.sigma_start[c + 1] - s0;
                 // Y[B, s] over this class of B and the class's summed tuples.
                 y.resize(size_t(nb * K));
-                for (int64_t i = 0; i < nb; ++i) {
-                    const int32_t *vrow = F.v_table + (b0 + i) * npf;
-                    double *yi = y.data() + i * K;
-                    for (int64_t k = 0; k < K; ++k) {
-                        const int32_t *s = F.sigma + 4 * (s0 + k);
-                        const int64_t h = hvec[size_t(x_hole(s))];
-                        const int32_t v = vrow[x_particle(s)];
-                        if (!h || !v) {
-                            yi[k] = 0.0;
-                            continue;
-                        }
-                        const double value = F.vector[std::abs(h) - 1 + std::abs(v) - 1];
-                        yi[k] = (h < 0) != (v < 0) ? -value : value;
-                    }
+                hk.resize(size_t(K));
+                pk.resize(size_t(K));
+                for (int64_t k = 0; k < K; ++k) {
+                    const int32_t *s = F.sigma + 4 * (s0 + k);
+                    hk[size_t(k)] = hvec[size_t(x_hole(s))];
+                    pk[size_t(k)] = x_particle(s);
                 }
+                gather_y(nb, K, npf, F.v_table + b0 * npf, hk.data(), pk.data(), F.vector, y.data());
+                OPENED_ADD(2);
                 ar.clear();
                 for (int64_t m = F.x_start[c]; m < F.x_start[c + 1]; ++m)
                     if (target_of[size_t(x_hole(F.x + 4 * m))] >= 0)
@@ -566,6 +628,7 @@ extern "C" void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *la
                                           y.data(), bk.data(), bc.data(), true,
                                           z.data(), cr.data(), cc.data(), 1.0};
                 itercc::indirect_gemm(gemm);
+                OPENED_ADD(3);
             }
             // Every row of every target: its terms' products, in term order.
             for (const OpenedTarget &target : targets) {
@@ -596,6 +659,7 @@ extern "C" void itercc_spin_quad_opened(const itercc_spin_quad_opened_layout *la
                 }
             }
             for (int64_t flat : touched) m_of_x[size_t(flat)] = -1;
+            OPENED_ADD(4);
         }
     }
     // The buffers' contributions, in order of their position sets.
@@ -656,12 +720,13 @@ extern "C" void itercc_spin_quad_opened_lower(const itercc_spin_quad_opened_rows
     };
     #pragma omp parallel num_threads(threads)
     {
-        std::vector<int64_t> hvec(static_cast<size_t>(nsh)), zoff(40), znb(40), zc(40), ar, ak, bk, bc, cr, cc;
+        std::vector<int64_t> hvec(static_cast<size_t>(nsh)), zoff(40), znb(40), zc(40), ar, ak, bk, bc, cr, cc, hk, pk;
         std::vector<int64_t> hole_of(static_cast<size_t>(nxh)), touched;
         std::vector<int32_t> m_of_x(size_t(nxp * nxh), -1);
         std::vector<double> y, z;
         #pragma omp for schedule(dynamic, 1)
         for (int64_t u = 0; u < nunits; ++u) {
+            OPENED_MARK;
             const int32_t *J = units + 4 * u;
             int64_t alphaJ = 0, irrepJ = 0;
             for (int64_t i = 0; i < nj; ++i) {
@@ -699,6 +764,7 @@ extern "C" void itercc_spin_quad_opened_lower(const itercc_spin_quad_opened_rows
                 hole_of[size_t(f)] = distinct && L.hole_pos[flat] >= 0 ? flat : -1;
                 any |= hole_of[size_t(f)] >= 0;
             }
+            OPENED_ADD(0);
             if (!any) continue;
             // Z blocks by class of B (B: the output's particles but x_p).
             int64_t ztotal = 0;
@@ -733,26 +799,21 @@ extern "C" void itercc_spin_quad_opened_lower(const itercc_spin_quad_opened_rows
                 }
             }
             z.resize(size_t(ztotal));
+            OPENED_ADD(1);
             for (int64_t cb = 0; cb < 40; ++cb) {
                 if (zoff[size_t(cb)] < 0) continue;
                 const int64_t c = zc[size_t(cb)], nb = znb[size_t(cb)], b0 = F.b_start[cb];
                 const int64_t s0 = F.sigma_start[c], K = F.sigma_start[c + 1] - s0;
                 y.resize(size_t(nb * K));
-                for (int64_t i = 0; i < nb; ++i) {
-                    const int32_t *vrow = F.v_table + (b0 + i) * nsp;
-                    double *yi = y.data() + i * K;
-                    for (int64_t k = 0; k < K; ++k) {
-                        const int32_t *s = F.sigma + 4 * (s0 + k);
-                        const int64_t h = hvec[size_t(s_hole(s))];
-                        const int32_t v = vrow[s_particle(s)];
-                        if (!h || !v) {
-                            yi[k] = 0.0;
-                            continue;
-                        }
-                        const double value = F.vector[std::abs(h) - 1 + std::abs(v) - 1];
-                        yi[k] = (h < 0) != (v < 0) ? -value : value;
-                    }
+                hk.resize(size_t(K));
+                pk.resize(size_t(K));
+                for (int64_t k = 0; k < K; ++k) {
+                    const int32_t *s = F.sigma + 4 * (s0 + k);
+                    hk[size_t(k)] = hvec[size_t(s_hole(s))];
+                    pk[size_t(k)] = s_particle(s);
                 }
+                gather_y(nb, K, nsp, F.v_table + b0 * nsp, hk.data(), pk.data(), F.vector, y.data());
+                OPENED_ADD(2);
                 ar.clear();
                 for (int64_t m = F.x_start[c]; m < F.x_start[c + 1]; ++m)
                     if (hole_of[size_t(x_hole(F.x + 4 * m))] >= 0)
@@ -774,6 +835,7 @@ extern "C" void itercc_spin_quad_opened_lower(const itercc_spin_quad_opened_rows
                                           y.data(), bk.data(), bc.data(), true,
                                           z.data(), cr.data(), cc.data(), 1.0};
                 itercc::indirect_gemm(gemm);
+                OPENED_ADD(3);
             }
             // Every output row with holes J + x_h: its terms' products, in term order.
             for (int64_t f = 0; f < nxh; ++f) {
@@ -825,6 +887,7 @@ extern "C" void itercc_spin_quad_opened_lower(const itercc_spin_quad_opened_rows
                 }
             }
             for (int64_t flat : touched) m_of_x[size_t(flat)] = -1;
+            OPENED_ADD(4);
         }
     }
     if (nbuffers) {

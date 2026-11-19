@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The direct packed-T4 terms by opened letters (`itercc_spin_quad_opened`
+  and `_lower`) look up each summed tuple's slot and particle column once per
+  class instead of once per row of the other particles, and prefetch the
+  amplitudes they gather (scattered over up to hundreds of slots) sixteen
+  tuples ahead; the same values. 6o/24v synthetic model: the lower ranks'
+  gathers 4.3 -> 3.4 thread-s. Diagnostic phase timers:
+  `-DITERCC_PROFILE_OPENED` and `itercc_opened_profile`.
 - The triplet engine's rank-two and rank-three products keep their occupied
   letters inside the GEMMs (`TripletEOMCCSDTQ._lower_engine`, a blocked
   einsum without enumerated letters; `ITERCC_LOWER_WHOLE_HOLES=0` keeps one
@@ -11,6 +18,10 @@
   operands are now formed too and never read. 13o/29v replay, 12 threads: six
   of the largest products 10.8 -> 1.8 s; 6o/24v synthetic model, warm ranks
   one to three 1.71 -> 1.12 s, the action moving at rounding (1.4e-14 of 58).
+  CuF, one Sapphire Rapids socket: these products 6.9 -> 1.2 s, rank three
+  14.5 -> 9.1 s, the warm action 114.7 -> 108.5 s (profiled). With slots one
+  by one the 64 GiB cache still pays: 32 GiB 151.1 s (2.2M misses, peak
+  96 GB), 48 GiB 118.3 s (1.16M, 108 GB).
   A warm CuF action on one Sapphire Rapids socket before this change (cProfile,
   114.7 s): slot program 86.2 s, rank-four opened terms 9.2 s, ranks two and
   three's opened terms 8.1 s and blocked products 6.9 s, R3 unpacking 1.8 s.
