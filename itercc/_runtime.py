@@ -96,6 +96,9 @@ SWITCHES = {
         "1", "call", "`0`: triplet slot-program tiles stored whole (nv^4), not only their ordered entries"),
     "ITERCC_TILE_CHAINS_INNER": Switch(
         "1", "call", "`0`: compact slot-program tiles store their axes in letter order, not chains innermost"),
+    "ITERCC_INTER_CHAINS_INNER": Switch(
+        "1", "call", "`0`: compact slot-program intermediates store their axes in letter order, not chains "
+        "innermost"),
     "ITERCC_COMPACT_INTERMEDIATES": Switch(
         "1", "call", "`0`: triplet slot-program intermediates stored whole, not only their ordered entries"),
     "ITERCC_ORDERED_INTERMEDIATES": Switch(

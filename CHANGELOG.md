@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Compact triplet slot-program intermediates store their chains innermost too
+  (`ITERCC_INTER_CHAINS_INNER`): a tile product that takes a chain of a cached
+  intermediate as its GEMM columns (the skinny products' 2998 x 7 blocks of
+  abcfij, say) packs it as consecutive runs instead of one value per cache
+  line, and an intermediate is formed once but read about 60 times. Only
+  offsets change: the same action bit for bit. 6o/24v synthetic model: tile
+  products 55 -> 43 thread-s, rank four 13.6 -> 12.7 s.
 - Audit of the triplet EOM-CCSDTQ slot program and engine (no wrong results
   found; these were crashes, hazards and estimates):
   * A complex vector (Davidson certifying a root with a tiny imaginary part)

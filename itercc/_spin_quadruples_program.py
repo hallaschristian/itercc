@@ -172,7 +172,8 @@ class SlotProgram:
     # Switches read while a program is recorded (an engine keys its cached
     # programs by their values).
     RECORDING_SWITCHES = ("ITERCC_SLOT_POSITIONS", "ITERCC_COMPACT_TILES", "ITERCC_TILE_CHAINS_INNER",
-                          "ITERCC_ORDERED_INTERMEDIATES", "ITERCC_COMPACT_INTERMEDIATES", "ITERCC_PAIR_SUMS")
+                          "ITERCC_ORDERED_INTERMEDIATES", "ITERCC_COMPACT_INTERMEDIATES", "ITERCC_PAIR_SUMS",
+                          "ITERCC_INTER_CHAINS_INNER")
 
     def __init__(self, engine, blocks, groups, presence):
         self.library = _cpu_kernels.library()
@@ -514,6 +515,10 @@ class SlotProgram:
                 elif g not in placed:
                     placed.add(g)
                     axes.append((g, tables[g][3]))
+            if _runtime.enabled("ITERCC_INTER_CHAINS_INNER"):
+                # Chains innermost (as in compact tiles): a reader that takes
+                # a chain as its GEMM columns packs them as consecutive runs.
+                axes.sort(key=lambda axis: isinstance(axis[0], int))
             steps, step = {}, 1
             for axis, size in reversed(axes):
                 steps[axis] = step
