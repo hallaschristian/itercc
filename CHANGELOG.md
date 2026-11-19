@@ -11,7 +11,12 @@
   action changes at rounding (1.5e-16 relative); unfused products, waves and
   `ITERCC_MERGE_TILES=0` keep every tile on its own. 6o/24v, 12 threads, warm
   rank four 6.50 -> 6.02 s (gathers 15.2 -> 7.9 thread-s, clearing 1.4 ->
-  0.9, slot sums 2.2 -> 1.2, tile products 31.3 -> 33.5).
+  0.9, slot sums 2.2 -> 1.2, tile products 31.3 -> 33.5). CuF on one
+  Sapphire Rapids socket, one process, second actions: 106.7 s with every
+  tile on its own, 97.0 s merged (gathers 1139 -> 558 thread-s, clearing 184
+  -> 109, slot sums 192 -> 110, tile products 2658 -> 2750), the actions
+  4.3e-17 apart (relative norm). One warm CuF action on one socket has gone
+  161.5 -> 97.0 s since 83ae0ff, and its peak memory 151 -> 121 GB.
 
 - The direct packed-T4 terms by opened letters (`itercc_spin_quad_opened`
   and `_lower`) look up each summed tuple's slot and particle column once per
