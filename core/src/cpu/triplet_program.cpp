@@ -26,6 +26,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <thread>
 #include <tuple>
@@ -193,6 +194,18 @@ class Cache {
             const Phase timing(5);
             ready_.wait(lock);
         }
+    }
+
+    // A registered key whose producer failed (out of memory): the entry goes,
+    // and a waiting tile becomes its producer instead.
+    void abandon(const Key &key)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto found = map_.find(key);
+            if (found != map_.end() && !found->second.ready) map_.erase(found);
+        }
+        ready_.notify_all();
     }
 
     // One piece of any intermediate being produced; false when none is left.
@@ -765,7 +778,8 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
         first.push_back(i64(tiles.size()));
         if (capacity < used) {
             partial.reset();
-            partial.reset(new double[size_t(used)]);
+            partial.reset(new (std::nothrow) double[size_t(used)]);
+            if (!partial) return 2;
             capacity = used;
         }
         // Tiles run by occupied tuple, T4 hole pair (positions 2 and 3) first:
@@ -785,27 +799,50 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
             return std::tie(u[2], u[3], u[0], u[1]) < std::tie(v[2], v[3], v[0], v[1]);
         });
         const i64 ntiles = i64(tiles.size()), nwave = s1 - s0;
+        // Out of memory in a tile (an intermediate, a thread's scratch): the
+        // keys it was producing are abandoned (their waiters produce them),
+        // the remaining tiles are skipped, and the call returns 2.
+        std::atomic<bool> failed{false};
 #pragma omp parallel num_threads(threads)
         {
             Worker w;
-            double *tile = itercc::scratch(4).get(size_t(nv4));
+            double *tile = nullptr;
+            try {
+                tile = itercc::scratch(4).get(size_t(nv4));
+            } catch (const std::bad_alloc &) {
+                failed = true;
+            }
 #pragma omp for schedule(dynamic, 1) nowait
             for (i64 j = 0; j < ntiles; ++j) {
+                if (failed.load(std::memory_order_relaxed)) continue;
                 const Tile &job = tiles[size_t(order[size_t(j)])];
-                run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, partial.get() + job.partial,
-                         fused != 0, threads, share_work);
+                try {
+                    run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, partial.get() + job.partial,
+                             fused != 0, threads, share_work);
+                } catch (const std::bad_alloc &) {
+                    const itercc_slot_template &m = p->templates[job.tmpl];
+                    const itercc_slot_intermediate *inters = p->intermediates + p->inter_start[m.kind];
+                    for (size_t k = 0; k < w.owner.size(); ++k)
+                        if (w.owner[k]) cache.abandon(key_of(inters[k], job.fixed));
+                    w.bound.clear();
+                    w.owner.clear();
+                    failed = true;
+                }
             }
             {
                 const Phase timing(8);
 #pragma omp barrier
             }
+            if (!failed.load()) {
 #pragma omp for schedule(dynamic, 1)
-            for (i64 s = 0; s < nwave; ++s) {
-                const Phase timing(6);
-                finish_slot(*p, p->slots[s0 + s], tiles.data() + first[size_t(s)],
-                            first[size_t(s + 1)] - first[size_t(s)], partial.get(), result);
+                for (i64 s = 0; s < nwave; ++s) {
+                    const Phase timing(6);
+                    finish_slot(*p, p->slots[s0 + s], tiles.data() + first[size_t(s)],
+                                first[size_t(s + 1)] - first[size_t(s)], partial.get(), result);
+                }
             }
         }
+        if (failed.load()) return 2;
         s0 = s1;
         if (progress != nullptr) progress(s0, nslots);   // between waves, on the calling thread
     }

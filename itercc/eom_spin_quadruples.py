@@ -230,24 +230,28 @@ class TripletEOMCCSDTQ:
         self._packed_direction = packed_spin or action_only
         if self._packed_direction and not occupied_tiles:
             raise ValueError("The packed spin layout requires occupied tiling")
-        self.estimated_dense_bytes = 8 * (5 * (4 * no * nv)**4 + 6 * (2 * (no + nv))**4)
-        if action_only:
-            # The rank-four probe keeps T3 and R3 dense, a bounded virtual
-            # tile, and the compact spin/irrep T4, R4, and image vectors.
-            self.estimated_dense_bytes = int(8 * (2.5 * (4 * no * nv)**3
-                                                 + 6 * (2 * (no + nv))**4
-                                                 + 128 * nv**4))
+        # The fixed working set: everything but the slot program's intermediate
+        # cache and partial sums (`_slot_budget`) and the Davidson vectors.
+        self._fixed_bytes = 8 * (5 * (4 * no * nv)**4 + 6 * (2 * (no + nv))**4)
+        if action_only or (occupied_tiles and self._packed_direction):
+            # T3 and R3 dense (two copies of T3 while it is laid out, the R3 of
+            # an action), the dressed integrals, a rank-three tile with its
+            # products; the packed T4, R4 and image vectors are added below.
+            # CuF (13o/29v, one socket): 71 GB after rank three, 173 GB at the
+            # end of an action with a 64 GiB cache and 32 GiB of partial sums.
+            self._fixed_bytes = int(8 * (2.5 * (4 * no * nv)**3 + 6 * (2 * (no + nv))**4
+                                         + 2 * no**3 * nv**3 + 128 * nv**4))
         elif occupied_tiles:
-            self.estimated_dense_bytes = 8 * (10 * (4 * no * nv)**3 +
-                                              4 * no**3 * nv**4 + 6 * (2 * (no + nv))**4)
-        self.estimated_dense_bytes += self.intermediate_cache_bytes
+            self._fixed_bytes = 8 * (10 * (4 * no * nv)**3 +
+                                     4 * no**3 * nv**4 + 6 * (2 * (no + nv))**4)
         if occupied_tiles and backend == "cpu":
             # Shared signed virtual maps: <=16 spin signatures x 8 irreps,
             # each with nv**4 int32 entries. No second copy for the R4 sector.
-            self.estimated_dense_bytes += 512 * nv**4
+            self._fixed_bytes += 512 * nv**4
         self.memory_budget_bytes = int(memory_budget_gib * 2**30)
-        if self.estimated_dense_bytes > memory_budget_gib * 2**30:
-            raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
+        # Davidson vectors the default cache leaves room for (exact once a
+        # solve asks for `davidson_working_bytes`): 20, those of max_space 7.
+        self._davidson_reserve = 0
         ref = solver._reference
         # Integrals are stored internally in irrep order for packed ground states.
         order = np.r_[np.arange(no), no + (np.arange(nv) if solver._virtual_inverse is None
@@ -302,22 +306,25 @@ class TripletEOMCCSDTQ:
             self._ground_t4 = PackedSpinQuadruples(labels[:no], labels[no:], 0, 0)
             self._direction_t4 = PackedSpinQuadruples(labels[:no], labels[no:], irrep, 1)
             self._direction_t4.share_virtual_maps(self._ground_t4)
+        if occupied_tiles and self._packed_direction:
+            # The packed ground T4, the action's R4 and its image, and a spare.
+            self._fixed_bytes += 4 * 8 * self._direction_t4.size
         if occupied_tiles and self._packed_direction and self.packed_contractions:
             # The compiled rank-four slot program (_compiled_slots): a raw tile
-            # per thread, the dense direct terms' per-slot buffers (72 terms and
-            # 16 contexts per row at most), and the waves' partial sums
-            # (`_partial_bytes` of an explicit cache; a default cache takes
-            # half of what remains, the partial sums the other half).
+            # per thread and the dense direct terms' per-slot buffers (72 terms
+            # and 16 contexts per row at most); its cache and partial sums are
+            # `_slot_budget`.
             rows = max((len(p) for p in self._direction_t4.groups.values()), default=0)
             threads = _runtime.cpu_threads(self.cpu_threads)
             # Direct terms by opened letters: five buffers of the output's
             # rows (oooo ladders: six sets of hole positions) and per-thread
             # amplitude and product blocks of one hole tuple.
-            self.estimated_dense_bytes += (threads * (8 * nv**4 + rows * (72 * 8 + 16 * 24 + 64 * 8))
-                                           + 5 * 8 * self._direction_t4.size
-                                           + self._partial_bytes(self.intermediate_cache_bytes))
-            if self.estimated_dense_bytes > self.memory_budget_bytes:
-                raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
+            self._fixed_bytes += (threads * (8 * nv**4 + rows * (72 * 8 + 16 * 24 + 64 * 8))
+                                  + 5 * 8 * self._direction_t4.size)
+        cache, partial = self._slot_budget()
+        self.estimated_dense_bytes = self._fixed_bytes + cache + partial
+        if self.estimated_dense_bytes > self.memory_budget_bytes:
+            raise MemoryError(f"Spin-flip tensor estimate is {self.estimated_dense_bytes / 2**30:.1f} GiB")
         self.action_only = action_only
         self._lower_projection = {}
         self.native_projection = True
@@ -325,6 +332,12 @@ class TripletEOMCCSDTQ:
         self.space = SpinFlipSpace(no, nv, labels, irrep, xp,
                                    packed=self._direction_t4 if self._packed_direction else None,
                                    project_spin=not action_only)
+        if not action_only:
+            # A default cache leaves room for a solve's Davidson vectors (20:
+            # max_space 7; `davidson_working_bytes` sets the exact count).
+            self._davidson_reserve = 20 * 8 * self.space.size
+            cache, partial = self._slot_budget()
+            self.estimated_dense_bytes = self._fixed_bytes + cache + partial
         self.amplitudes = _ground_amplitudes(solver, amplitudes, xp,
                                             self._ground_t4 if occupied_tiles else None)
         if self._holes_first_ranks():
@@ -499,7 +512,9 @@ class TripletEOMCCSDTQ:
 
         presence = {name: pair.tangent is not None for name, pair in blocks.items()}
         presence["t4"] = direction is not None
-        key = tuple(sorted(presence.items())), SlotProgram._signature(blocks)
+        # Switches read while a program is recorded select another program.
+        key = (tuple(sorted(presence.items())), SlotProgram._signature(blocks),
+               tuple(_runtime.switch(name) for name in SlotProgram.RECORDING_SWITCHES))
         if key not in self._slot_programs:
             groups = [(equivalent, multiplicity, tuple(d for d in diagrams if d not in self._packed_diagrams[4]))
                       for equivalent, multiplicity, diagrams in projection_diagrams(4)]
@@ -519,15 +534,7 @@ class TripletEOMCCSDTQ:
         if slot_limit is None and self.rank_four_slots is not None:
             chosen = np.asarray(self.rank_four_slots, dtype=np.int64)
             done = total = len(chosen)
-        # Shared intermediates: the configured budget, else half of what the
-        # memory budget leaves beside the estimate (which counts the program's
-        # tiles and direct-term buffers), at least 256 MiB. The waves' partial
-        # sums take `_partial_bytes` (as much as the cache, at most 32 GiB).
-        cache = self.intermediate_cache_bytes
-        if not cache:
-            cache = (self.memory_budget_bytes - self.estimated_dense_bytes) // 2
-        cache = max(cache, 2**28)
-        partial = self._partial_bytes(cache)
+        cache, partial = self._slot_budget()
         # Fused tile products (other rounding); ITERCC_TRIPLET_FUSED=0 keeps
         # the loop's products, bit for bit.
         fused = self.fused_tiles and _runtime.enabled("ITERCC_TRIPLET_FUSED")
@@ -610,10 +617,27 @@ class TripletEOMCCSDTQ:
         result /= len(_permutations(rank))**2
 
     def _partial_bytes(self, cache):
-        """Bytes of partial sums per wave of the slot program."""
+        """Bytes of partial sums per wave of the slot program (at least the
+        program's 256 MiB)."""
         if self.partial_sums_bytes is not None:
-            return self.partial_sums_bytes
-        return min(int(cache), 32 * 2**30)
+            return max(self.partial_sums_bytes, 2**28)
+        return max(min(int(cache), 32 * 2**30), 2**28)
+
+    def _slot_budget(self):
+        """(intermediate cache, partial sums) bytes of the slot program: the
+        configured cache, else half of what the memory budget leaves beside
+        the fixed working set and the Davidson vectors; at least 256 MiB each
+        (none without the compiled program). At CuF size a 64 GiB cache was as
+        fast as 192 GiB (hits 22.0M, misses 0.53M), 32 GiB 27% slower."""
+        if not (self.occupied_tiles and self._packed_direction and self.packed_contractions):
+            return self.intermediate_cache_bytes, 0
+        cache = self.intermediate_cache_bytes
+        if not cache:
+            # Half of what remains: the partial sums (as many bytes as the
+            # cache, at most 32 GiB) fit beside it.
+            cache = (self.memory_budget_bytes - self._fixed_bytes - self._davidson_reserve) // 2
+        cache = max(int(cache), 2**28)
+        return cache, self._partial_bytes(cache)
 
     def _zeroed_tile(self):
         """A zeroed rank-four raw tile for one occupied tuple, reused: each tile
@@ -662,6 +686,10 @@ class TripletEOMCCSDTQ:
 
     def _action(self, vector, *, ranks=range(1, 5), slot_limit=None, rank_finished=None, slot_finished=None):
         xp = self.xp
+        if xp is np:
+            # The compiled pieces read the packed rows in place: a strided view
+            # (the real part of a complex vector, say) becomes a copy.
+            vector = np.ascontiguousarray(vector, dtype=np.float64)
         self._gather_plans = {}
         no = self.proxy.hamiltonian.nocc
         nonzero = (tuple(bool(xp.any(vector[section])) for section in self.space.slices)
@@ -733,6 +761,8 @@ class TripletEOMCCSDTQ:
         """Measure a bounded prefix of occupied rank-four slots."""
         if not self.action_only or slots < 1:
             raise ValueError("Rank-four probing needs the action-only packed layout and positive slots")
+        if self.rank_four_partner is not None:
+            raise ValueError("A split engine's probes would cover only its own share")
         return self._action(vector, ranks=(4,), slot_limit=slots)
 
     @_runtime.threaded
@@ -744,21 +774,34 @@ class TripletEOMCCSDTQ:
         """
         if not self.action_only:
             raise ValueError("The feedback probe needs the action-only packed layout")
+        if self.rank_four_partner is not None:
+            raise ValueError("A split engine's probes would cover only its own share")
         return self._action(vector, ranks=range(1, 4))
 
     @_runtime.threaded
     def solve(self, *args, **options):
         if self.action_only:
             raise ValueError("The action-only layout has no large-system triplet spin projector")
+        budget = options.get("memory_budget_gib")
+        if budget is not None and np.isfinite(budget) and budget > 0:
+            # A default slot-program cache takes half of what the tighter of
+            # the two budgets leaves (`_slot_budget`).
+            self.memory_budget_bytes = min(self.memory_budget_bytes, int(budget * 2**30))
         return EOMSinglet.solve(self, *args, **options)
 
     def davidson_working_bytes(self, max_space):
         """Conservative tensor workspace plus packed Davidson vectors.
 
         The logical rank-four shape is not a dense allocation on the packed
-        path. Reuse the constructor's tiled estimate, including its cache.
+        path. An explicit slot-program cache counts with its partial sums; a
+        default one takes half of what the memory budget leaves beside this
+        working set (`_slot_budget`), which from now on reserves these vectors.
         """
-        estimate = int(self.estimated_dense_bytes) + (2 * max_space + 6) * self.space.size * 8
+        vectors = (2 * max_space + 6) * self.space.size * 8
+        self._davidson_reserve = vectors
+        estimate = int(self._fixed_bytes) + vectors
+        if self.intermediate_cache_bytes:
+            estimate += sum(self._slot_budget())
         if not self._packed_direction:
             estimate += 7 * sum(int(np.prod(shape)) for shape in self.space.shapes) * 8
         return estimate
@@ -768,7 +811,8 @@ class TripletEOMCCSDTQ:
         if self.action_only:
             raise ValueError("Use probe_rank_four for the action-only layout")
         if self.xp.iscomplexobj(vector):
-            return self.sigma(vector.real) + 1j * self.sigma(vector.imag)
+            return (self.sigma(self.xp.ascontiguousarray(vector.real))
+                    + 1j * self.sigma(self.xp.ascontiguousarray(vector.imag)))
         start = perf_counter()
         partner = self.rank_four_partner
         if partner is not None:

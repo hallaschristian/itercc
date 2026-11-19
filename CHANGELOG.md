@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Audit of the triplet EOM-CCSDTQ slot program and engine (no wrong results
+  found; these were crashes, hazards and estimates):
+  * A complex vector (Davidson certifying a root with a tiny imaginary part)
+    crashed the compiled slot program, which needs contiguous rows: actions
+    now take contiguous copies of strided vectors.
+  * Switches read while a slot program is recorded
+    (`SlotProgram.RECORDING_SWITCHES`) key the engine's cached programs; a
+    changed switch no longer reuses the stale program.
+  * The planner's caches keyed positioned operands by object identity, which
+    a freed offset group could hand to another one: positions and
+    `OffsetGroup`s are now keyed by content (a digest of the rank table). The
+    CUDA engine's call key now includes the positions too.
+  * Out of memory inside the compiled slot program terminated the process:
+    the tile abandons the intermediates it was producing (their waiters
+    produce them), the rest of the wave is skipped and Python raises
+    `MemoryError`. A recorded kind whose instructions could read an
+    intermediate skipped by another one's cache hit is refused (none is).
+  * `Partners` removes its exchange files and workers if a worker fails to
+    start, workers stop when the solver dies, split engines refuse probes
+    (they would cover one share) and CUDA engines.
+  * Memory: the triplet engine's working set is now calibrated (CuF on one
+    socket: 71 GB after rank three, 173 GB at the end of an action with a
+    64 GiB cache and 32 GiB of partial sums, against an estimate of 417 GiB
+    before), apart from the slot program's cache and partial sums; a default
+    cache takes half of what the budget leaves beside the working set and
+    a solve's Davidson vectors, and a solve's memory budget bounds it.
+- One full CuF action (13o/29v, B1 triplet, 3.6e8 parameters) on one Sapphire
+  Rapids socket now takes 216 s (rank three 54 s, 33 s once planned; rank
+  four 158 s), where the production solve at 6bc25cc took about 900 s per
+  action on both sockets. A 64 GiB intermediate cache is as fast as 192 GiB
+  (32 GiB: 276 s), and the action is the same bit for bit with any of them.
 - `itercc_permuted_gather_add` (the ranks two and three projections, the
   packed-row gathers of the Python paths) runs blocks of 2048 rows term by
   term with each term's strides set up once per block, as the slot program's

@@ -157,3 +157,26 @@ def test_fused_plans_run_without_grouped_gemm(cuda, monkeypatch):
         symmetry_blocks.SymmetryBlocks(labels, "ijklmn", 4, fallback=fallback).einsum(spec, a, b, out, -1.0, 0.5)
         np.testing.assert_allclose(cp.asnumpy(out), cp.asnumpy(expected), rtol=1e-12, atol=1e-12)
         assert bool(calls) == (fused == 0)
+
+
+def test_position_keys_follow_content_not_identity():
+    """Plans are cached by the operands' positions: two offset groups with other
+    tables never share a key, even when one takes the other's address after
+    it is freed, and equal positions share one."""
+    import gc
+
+    from itercc.symmetry_blocks import OffsetGroup, _position_key
+
+    strict = np.full(9, -1)
+    strict[[1, 2, 5]] = np.arange(3)          # b < c over 3 x 3
+    loose = np.full(9, -1)
+    loose[[0, 1, 2, 4, 5, 8]] = np.arange(6)  # b <= c
+    first = OffsetGroup((3, 3), strict, 1)
+    key = _position_key((first, 0))
+    del first
+    gc.collect()
+    second = OffsetGroup((3, 3), loose, 1)
+    assert _position_key((second, 0)) != key
+    assert _position_key((OffsetGroup((3, 3), strict, 1), 0)) == key
+    assert _position_key(np.arange(4)) == _position_key(np.arange(4))
+    assert _position_key(np.arange(4)) != _position_key(np.arange(4)[::-1].copy())

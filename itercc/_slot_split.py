@@ -73,25 +73,37 @@ class Partners:
                  python=sys.executable, log=None, block=BLOCK):
         if parts < 2:
             raise ValueError("Splitting needs at least two parts")
+        if engine.xp is not np:
+            raise ValueError("Split actions run on the CPU")
         self.engine, self.parts = engine, int(parts)
+        self.processes = []
         total = len(engine._direction_t4.slots)
         self.exchange = Path(exchange) if exchange is not None else Path(
             "/dev/shm" if Path("/dev/shm").is_dir() else ".") / f"itercc-split-{os.getpid()}"
         self.exchange.mkdir(parents=True)
+        try:
+            self._start(engine, builder, kwargs, total, threads=threads, bind=bind, python=python, log=log,
+                        block=block)
+        except BaseException:
+            self.close()
+            raise
+        import atexit
+        atexit.register(self.close)
+
+    def _start(self, engine, builder, kwargs, total, *, threads, bind, python, log, block):
         rows = engine.space.size - engine.space.slices[1].start        # ranks two to four
         self.vector = np.lib.format.open_memmap(self.exchange / "vector.npy", mode="w+", dtype=np.float64,
                                                 shape=(engine.space.size,))
         self.images = [np.lib.format.open_memmap(self.exchange / f"image-{k}.npy", mode="w+",
                                                  dtype=np.float64, shape=(rows,))
                        for k in range(1, self.parts)]
-        self.processes = []
         environment = dict(os.environ)
         if threads is not None:
             environment["ITERCC_CPU_THREADS"] = str(int(threads))
         for k in range(1, self.parts):
             command = [python, "-m", "itercc._slot_split", "--builder", builder, "--kwargs", json.dumps(kwargs),
                        "--exchange", str(self.exchange), "--part", str(k), "--parts", str(self.parts),
-                       "--block", str(int(block))]
+                       "--block", str(int(block)), "--parent", str(os.getpid())]
             if bind:
                 command = ["numactl", f"--cpunodebind={k}", f"--membind={k}", *command]
             self.processes.append(subprocess.Popen(command, env=environment, stdout=log,
@@ -101,8 +113,6 @@ class Partners:
         engine.rank_four_slots = split_slots(total, 0, self.parts, block)
         engine.lower_part = (0, self.parts)
         engine.rank_four_partner = self
-        import atexit
-        atexit.register(self.close)
 
     def _check(self):
         for k, process in enumerate(self.processes, 1):
@@ -144,8 +154,6 @@ class Partners:
 
     def close(self):
         """Stop the workers and remove the exchange files."""
-        if not self.processes:
-            return
         if self.exchange.exists():
             (self.exchange / "stop").write_text("")
         for process in self.processes:
@@ -154,15 +162,18 @@ class Partners:
             except subprocess.TimeoutExpired:
                 process.kill()
         self.processes = []
-        self.engine.rank_four_partner = None
-        self.engine.rank_four_slots = None
-        self.engine.lower_part = None
+        if self.engine.rank_four_partner is self:
+            self.engine.rank_four_partner = None
+            self.engine.rank_four_slots = None
+            self.engine.lower_part = None
         shutil.rmtree(self.exchange, ignore_errors=True)
 
 
-def serve(engine, exchange, part, parts, block=BLOCK):
+def serve(engine, exchange, part, parts, block=BLOCK, parent=None):
     """A worker's loop: for every vector the solver sends, this part's rows of
-    ranks two to four (its lower tiles and rank-four slots)."""
+    ranks two to four (its lower tiles and rank-four slots). It returns when
+    told to stop, when the exchange is gone, or when its parent process (the
+    solver; `parent`, its pid) has died."""
     from . import _runtime
 
     exchange = Path(exchange)
@@ -176,6 +187,8 @@ def serve(engine, exchange, part, parts, block=BLOCK):
     while True:
         if (exchange / "stop").exists() or not exchange.exists():
             return
+        if parent is not None and os.getppid() != parent:
+            return                      # the solver died without stopping its workers
         if not (exchange / f"go-{action + 1}").exists():
             time.sleep(_POLL)
             continue
@@ -205,11 +218,12 @@ def main(argv=None):
     parser.add_argument("--part", type=int, required=True)
     parser.add_argument("--parts", type=int, required=True)
     parser.add_argument("--block", type=int, default=BLOCK)
+    parser.add_argument("--parent", type=int, help="the solver's pid: stop when it is gone")
     args = parser.parse_args(argv)
     exchange = Path(args.exchange)
     try:
         engine = _builder(args.builder)(**json.loads(args.kwargs))
-        serve(engine, exchange, args.part, args.parts, args.block)
+        serve(engine, exchange, args.part, args.parts, args.block, args.parent)
     except BaseException:
         if exchange.exists():
             (exchange / f"error-{args.part}").write_text(traceback.format_exc())

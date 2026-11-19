@@ -243,6 +243,56 @@ def test_split_action_with_a_worker_process(tmp_path):
         np.testing.assert_allclose(two, one, rtol=1e-12, atol=1e-12 * np.abs(one).max())
 
 
+def test_partners_clean_up_after_a_failed_start(tmp_path):
+    """A worker that cannot start leaves no exchange files and no split engine."""
+    from itercc._slot_split import Partners
+
+    engine = _split_engine()
+    with pytest.raises(OSError):
+        Partners(engine, f"{Path(__file__).resolve()}:_split_engine", {}, parts=2,
+                 exchange=tmp_path / "exchange", bind=False, python=str(tmp_path / "no-python"))
+    assert engine.rank_four_partner is None and engine.lower_part is None
+    assert not (tmp_path / "exchange").exists()
+
+
+def test_slot_budget_leaves_room_for_the_davidson_vectors():
+    """A default slot-program cache and its partial sums take only what the
+    memory budget leaves beside the fixed working set and a solve's Davidson
+    vectors; an explicit cache counts in the Davidson working set."""
+    engine = _triplet_engine(packed_spin=True, memory_budget_gib=8)
+    vectors = (2 * 7 + 6) * engine.space.size * 8
+    assert engine.davidson_working_bytes(7) == engine._fixed_bytes + vectors
+    cache, partial = engine._slot_budget()
+    assert engine._fixed_bytes + vectors + cache + partial <= engine.memory_budget_bytes
+    explicit = _triplet_engine(packed_spin=True, memory_budget_gib=8, intermediate_cache_gib=1)
+    assert explicit._slot_budget() == (2**30, 2**30)
+    assert explicit.davidson_working_bytes(7) == explicit._fixed_bytes + vectors + 2 * 2**30
+
+
+def test_complex_vectors_run_the_compiled_program():
+    """The real and imaginary parts of a complex vector are strided views: the
+    compiled slot program gets contiguous copies."""
+    engine = _split_engine()
+    rng = np.random.default_rng(769)
+    v, w = rng.normal(size=(2, engine.space.size))
+    expected = engine.sigma(v) + 1e-9j * engine.sigma(w)
+    np.testing.assert_allclose(engine.sigma(v + 1e-9j * w), expected, rtol=1e-12, atol=1e-13)
+
+
+def test_recording_switches_select_another_program(monkeypatch):
+    """A switch read while the slot program is recorded keys the engine's cached
+    programs: changing it records another program, not the stale one."""
+    engine = _split_engine()
+    vector = np.random.default_rng(771).normal(size=engine.space.size)
+    compact = engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_COMPACT_TILES", "0")
+    dense = engine.sigma(vector)
+    programs = [p for p in engine._slot_programs.values() if p is not None]
+    assert len(programs) == 2
+    assert any(p._tile_layouts for p in programs) and not all(p._tile_layouts for p in programs)
+    np.testing.assert_array_equal(dense, compact)
+
+
 def test_grouped_ordered_lower_ranks_keep_the_action(monkeypatch):
     """Ranks two and three by projection groups, each tile formed only where
     its particle and hole letters are ordered: the action of one group with

@@ -29,6 +29,7 @@ and scatter passes each cross memory. Those plans run as one fused kernel
 instead, reading the operands in place through the same offset tables and
 adding the products straight into ``out`` (see `_FUSED_DEPTH`).
 """
+import hashlib
 import ctypes
 import glob
 import os
@@ -455,15 +456,20 @@ class OffsetGroup:
     def __init__(self, extents, table, stride):
         self.extents = tuple(int(n) for n in extents)
         self.table, self.stride = np.ascontiguousarray(table, dtype=np.int64), int(stride)
+        # Plans are cached by content: a group freed with its program must not
+        # lend its key to another one at the same address.
+        self.key = (self.extents, self.stride, hashlib.blake2b(self.table.tobytes(), digest_size=16).digest())
 
 
 def _position_key(p):
-    """A cache key of one axis's positions (arrays and groups by identity)."""
+    """A cache key of one axis's positions, by content (an object's identity
+    can be reused once it is freed, while plans outlive it)."""
     if p is None:
         return None
     if isinstance(p, tuple):
-        return id(p[0]), p[1]
-    return id(p)
+        return p[0].key, p[1]
+    p = np.asarray(p)
+    return p.dtype.str, p.tobytes()
 
 
 class PositionedView(np.ndarray):
@@ -484,8 +490,8 @@ class PositionedView(np.ndarray):
 
 
 def positions_key(array):
-    """A cache key of an operand's positions (ids of the arrays, which the
-    caller keeps alive), or None for a plain operand."""
+    """A cache key of an operand's positions (by content), or None for a
+    plain operand."""
     positions = getattr(array, "positions", None)
     if not positions:
         return None
@@ -810,7 +816,8 @@ class SymmetryBlocks:
         call = (spec, a.shape, a.strides, a.dtype.char, b.shape, b.strides, b.dtype.char,
                 out.shape, out.strides, out.dtype.char, int(irreps[0]), int(irreps[1]),
                 () if not labels else tuple((c, np.asarray(v, dtype=np.int64).tobytes())
-                                            for c, v in labels.items()), tuple(ordered))
+                                            for c, v in labels.items()), tuple(ordered),
+                positions_key(a), positions_key(b), positions_key(out))
         hit = self._calls.get(call)
         if hit is None:
             hit = self._calls[call] = self._resolve(spec, a, b, out, labels, irreps, ordered)

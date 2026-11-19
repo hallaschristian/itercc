@@ -169,6 +169,11 @@ class SlotProgram:
     program (see the module docstring). Built for one set of tangent operands
     present and one set of operand shapes (`matches`)."""
 
+    # Switches read while a program is recorded (an engine keys its cached
+    # programs by their values).
+    RECORDING_SWITCHES = ("ITERCC_SLOT_POSITIONS", "ITERCC_COMPACT_TILES", "ITERCC_TILE_CHAINS_INNER",
+                          "ITERCC_ORDERED_INTERMEDIATES", "ITERCC_COMPACT_INTERMEDIATES", "ITERCC_PAIR_SUMS")
+
     def __init__(self, engine, blocks, groups, presence):
         self.library = _cpu_kernels.library()
         if self.library is None or not hasattr(self.library, "triplet_slots"):
@@ -702,7 +707,28 @@ class SlotProgram:
                         self._contract(kind, binary, a, b, view, coefficient * factor, 1.0, selected,
                                        (_tree_irrep(left, irreps), _tree_irrep(right, irreps)),
                                        ordered + node_sums(binary, sums))
+        self._check_lookups(kind)
         return kind
+
+    @staticmethod
+    def _check_lookups(kind):
+        """Raise Unsupported if an instruction could read an unbound
+        intermediate: a cache hit on an intermediate skips the instructions
+        that form it (LOOKUP .. PUBLISH), so another intermediate first formed
+        there must not be read past them (an intermediate reused within a kind
+        is not looked up again). No recorded program does this; the guard
+        keeps it from reaching the core, which would read a null buffer."""
+        lookup_at = {x[1]: pc for pc, x in enumerate(kind.code) if x[0] == LOOKUP}
+        ranges = [(pc, x[2]) for pc, x in enumerate(kind.code) if x[0] == LOOKUP]
+        for pc, x in enumerate(kind.code):
+            if x[0] != CONTRACT:
+                continue
+            for operand in (x[4], x[5]):
+                if operand[0] != INTER:
+                    continue
+                at = lookup_at[operand[1]]
+                if any(start < at < end and not start < pc < end for start, end in ranges):
+                    raise Unsupported
 
     def _kind(self, group, raw):
         number = self._kind_of.get((group, raw))
@@ -1097,6 +1123,9 @@ class SlotProgram:
             None if direction is None else direction.ctypes.data,
             result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads), int(bool(fused)),
             int(share_work), ctypes.cast(callback, ctypes.c_void_p) if callback is not None else None)
+        if status == 2:
+            raise MemoryError("The compiled slot program ran out of memory (a smaller intermediate cache "
+                              "or fewer partial sums need less)")
         if status != 0:
             raise RuntimeError(f"The compiled slot program failed (status {status})")
         return dict(hits=int(stats[0]), misses=int(stats[1]), peak_bytes=int(stats[2]), shared=int(stats[3]),
