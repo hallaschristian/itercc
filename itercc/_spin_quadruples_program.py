@@ -85,7 +85,9 @@ INSTRUCTION = np.dtype([("op", _i8), ("inter", _i8), ("next", _i8), ("plan", _i8
 INTERMEDIATE = np.dtype([("key", _i8), ("size", _i8), ("nvars", _i8), ("positions", _i8, 4)])
 ROWS_DESCRIPTOR = np.dtype([("which", _i8), ("spins", _i8, 4), ("fixed", _i8, 4), ("start", _i8, 4),
                             ("count", _i8, 4), ("pointers", _i8)])
-TEMPLATE = np.dtype([("kind", _i8), ("positions", _i8, 4), ("part_start", _i8), ("part_count", _i8)])
+TEMPLATE = np.dtype([("kind", _i8), ("positions", _i8, 4), ("part_start", _i8), ("part_count", _i8),
+                     ("merge_flags", _i8), ("merge_sign", _i8), ("merge_part_start", _i8),
+                     ("merge_part_count", _i8)])
 PART = np.dtype([("group", _i8), ("terms", _i8)])
 TERMS = np.dtype([("offsets", _i8), ("weights", _i8), ("count", _i8), ("nchains", _i8), ("members", _i8),
                   ("tables", _i8, 2), ("strides", _i8, 2), ("lengths", _i8, 2), ("nv", _i8)])
@@ -104,7 +106,8 @@ class ProgramStruct(ctypes.Structure):
     """itercc_slot_program of core.h."""
     _fields_ = ([("nv", ctypes.c_int64), ("holes", ctypes.c_int64), ("nirrep", ctypes.c_int64)]
                 + [(name, ctypes.c_void_p) for name in _ARRAYS] + [("tile_irrep", ctypes.c_int64),
-                                                                   ("tile_axes", ctypes.c_void_p)])
+                                                                   ("tile_axes", ctypes.c_void_p),
+                                                                   ("merge_order", ctypes.c_void_p)])
 
 
 _PROGRESS = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64)
@@ -860,6 +863,35 @@ class SlotProgram:
                 tiles.append((kind, fixed, parts))
         return tiles
 
+    @staticmethod
+    def _merge_tiles(tiles, templates, first, inverse):
+        """Merged tiles of a slot class (templates[first ..] are its tiles):
+        tiles of one kind whose gathers are the same up to one sign share one
+        tile, their products scaled by that sign relative to the group's first
+        tile, whose gathers the group's last tile runs. Sets the templates'
+        merge fields and returns the class's tiles grouped, groups in order of
+        their first tile (about half as many tiles to clear and gather)."""
+        groups = {}
+        for t, (kind, _, own) in enumerate(tiles):
+            described, sign = [], 0
+            for number, terms in sorted(own):
+                weights = inverse[terms]
+                if not sign:
+                    sign = 1 if weights[0][1] > 0 else -1
+                described.append((number, tuple((p, w * sign) for p, w in weights)))
+            groups.setdefault((kind, tuple(described)), []).append((t, sign))
+        order = []
+        for members in groups.values():
+            lead, lead_sign = members[0]
+            base = templates[first + lead]
+            for i, (t, sign) in enumerate(members):
+                record = templates[first + t]
+                record[4] = (1 if i == 0 else 0) | (2 if i == len(members) - 1 else 0)
+                record[5] = sign * lead_sign
+                record[6], record[7] = base[2], base[3]
+                order.append(first + t)
+        return order
+
     def _prepare(self, engine):
         layout = engine._direction_t4
         nv, n = self.nv, self.nirrep
@@ -886,14 +918,17 @@ class SlotProgram:
                 self._compact_intermediates(self._found_constraints)
         # Plans for every (kind, irrep pattern) the slots need.
         plan_id = np.full((max(1, len(self._kinds)), n**4), -1, dtype=np.int64)
-        templates, parts, class_start, class_count = [], [], [], []
+        templates, parts, class_start, class_count, merge_order = [], [], [], [], []
         weights = np.array([n**3, n**2, n, 1], dtype=np.int64)
+        inverse = {number: terms for (terms, _), number in terms_of.items()}
         for c, tiles in enumerate(class_tiles):
             class_start.append(len(templates))
             class_count.append(len(tiles))
+            first = len(templates)
             for kind, fixed, own in tiles:
-                templates.append((kind, fixed, len(parts), len(own)))
+                templates.append([kind, fixed, len(parts), len(own), 3, 1, len(parts), len(own)])
                 parts.extend(own)
+            merge_order.extend(self._merge_tiles(tiles, templates, first, inverse))
             if not tiles or not self.nslots:
                 continue
             members = slots[:self.nslots][slots["cls"][:self.nslots] == c]
@@ -909,10 +944,10 @@ class SlotProgram:
         self.slots = slots
         self.templates = np.zeros(max(1, len(templates)), dtype=TEMPLATE)
         if templates:
-            self.templates["kind"] = [t[0] for t in templates]
-            self.templates["positions"] = [t[1] for t in templates]
-            self.templates["part_start"] = [t[2] for t in templates]
-            self.templates["part_count"] = [t[3] for t in templates]
+            for f, field in enumerate(("kind", "positions", "part_start", "part_count", "merge_flags",
+                                       "merge_sign", "merge_part_start", "merge_part_count")):
+                self.templates[field] = [t[f] for t in templates]
+        self.merge_order = np.asarray(merge_order or [0], dtype=np.int64)
         self.parts = np.array(parts or [(0, 0)], dtype=PART)
         self.class_start = np.asarray(class_start or [0], dtype=np.int64)
         self.class_count = np.asarray(class_count or [0], dtype=np.int64)
@@ -1111,12 +1146,14 @@ class SlotProgram:
             for a, values in enumerate(starts):
                 tile_axes[k]["starts"][a][:len(values)] = values
         arrays["tile_axes"] = tile_axes
+        arrays["merge_order"] = self.merge_order
         for name, array in arrays.items():
             if not array.flags.c_contiguous:
                 raise ValueError(f"{name} is not contiguous")
         self.struct = ProgramStruct(nv=self.nv, holes=n, nirrep=self.nirrep,
                                     **{name: arrays[name].ctypes.data for name in _ARRAYS},
-                                    tile_irrep=int(self.irrep), tile_axes=tile_axes.ctypes.data)
+                                    tile_irrep=int(self.irrep), tile_axes=tile_axes.ctypes.data,
+                                    merge_order=self.merge_order.ctypes.data)
         self._arrays = arrays
 
     def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,
@@ -1144,10 +1181,18 @@ class SlotProgram:
         if not (result.dtype == np.float64 and result.flags.c_contiguous):
             raise ValueError("The rank-four result must be a contiguous float64 array")
         struct = self.struct
+        # Merged tiles (`_merge_tiles`): with fused products only (other
+        # rounding than the loop's anyway) and slots one by one; else every
+        # tile is cleared and gathered on its own, as the loop does.
+        merged = (fused and _runtime.enabled("ITERCC_MERGE_TILES")
+                  and not _runtime.enabled("ITERCC_SLOT_WAVES"))
+        if not merged:
+            struct = ProgramStruct.from_buffer_copy(self.struct)
+            struct.merge_order = None
         if slots is not None:
             # The program walks the slot records it is given: a table of the chosen ones.
             chosen = np.ascontiguousarray(self.slots[np.asarray(slots, dtype=np.int64)])
-            struct = ProgramStruct.from_buffer_copy(self.struct)
+            struct = ProgramStruct.from_buffer_copy(struct)
             struct.slots = chosen.ctypes.data
             nslots = len(chosen)
         else:

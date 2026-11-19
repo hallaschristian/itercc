@@ -122,6 +122,9 @@ SWITCHES = {
     "ITERCC_SLOT_PROFILE": Switch("", "core", "`1`: slot-program phase timers (`itercc_triplet_profile`)"),
     "ITERCC_SLOT_SORT": Switch("", "core", "`0`: with `ITERCC_SLOT_WAVES=1`, a wave's tiles in slot order "
                                "(diagnostic)"),
+    "ITERCC_MERGE_TILES": Switch(
+        "1", "call", "`0`: with fused slot-program products, every tile is cleared and gathered on its own, "
+        "not merged with the tiles of its kind whose gathers agree up to a sign"),
     "ITERCC_SLOT_WAVES": Switch("0", "core", "`1`: slot-program tiles run in waves of slots whose partial sums "
                                 "(`partial_sums_gib`) are added at the end of each wave, not slot by slot"),
     "ITERCC_TILE_RUNS": Switch("", "core", "`0`: slot-program tiles (dense or compact) cleared whole, not only "

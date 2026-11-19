@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 38
+#define ITERCC_CORE_ABI 39
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -752,9 +752,14 @@ typedef struct {
  * of the tile's occupied indices, and its gathers parts[part_start ..
  * + part_count]. A gather adds, for each row r of the slot's spin group
  * `group` (rows and four virtual coordinates c), sum_t weights[t]
- * tile[c . offsets[t]] over the terms of `terms` to the slot's row rows[r]. */
+ * tile[c . offsets[t]] over the terms of `terms` to the slot's row rows[r].
+ * Merged tiles (see merge_order): tiles of one kind whose gathers agree up to
+ * a sign merge_sign share one tile, their products scaled by merge_sign;
+ * merge_flags bit 0 marks the first (it clears the tile), bit 1 the last (its
+ * gathers are parts[merge_part_start .. + merge_part_count]). */
 typedef struct {
     int64_t kind, positions[4], part_start, part_count;
+    int64_t merge_flags, merge_sign, merge_part_start, merge_part_count;
 } itercc_slot_template;
 
 typedef struct {
@@ -830,6 +835,10 @@ typedef struct {
      * product times tile_irrep, so only those are cleared (null, or naxes 0
      * for a kind whose irreps are not runs: its tile_sizes[kind] doubles). */
     const struct itercc_slot_tile_axes_s *tile_axes;
+    /* Merged tiles (null: none): class c runs templates merge_order[class_start[c]
+     * .. + class_count[c]], each merged group's tiles together, slot by slot
+     * only. Other sums than tile by tile, so other rounding. */
+    const int64_t *merge_order;
 } itercc_slot_program;
 
 /* Slots 0 .. nslots - 1 of `result` (zero on entry), each on one thread: its

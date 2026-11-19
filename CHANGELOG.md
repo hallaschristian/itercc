@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- With fused products (the default), the triplet slot program merges a slot's
+  tiles of one kind whose gathers agree up to a sign
+  (`SlotProgram._merge_tiles`, `itercc_slot_program.merge_order`, core ABI
+  39): their products add into one tile, scaled by that sign, which is
+  cleared once and gathered once, so about half as many tiles are cleared and
+  gathered (219,600 -> 106,870 per action on the 6o/24v synthetic model). The
+  action changes at rounding (1.5e-16 relative); unfused products, waves and
+  `ITERCC_MERGE_TILES=0` keep every tile on its own. 6o/24v, 12 threads, warm
+  rank four 6.50 -> 6.02 s (gathers 15.2 -> 7.9 thread-s, clearing 1.4 ->
+  0.9, slot sums 2.2 -> 1.2, tile products 31.3 -> 33.5).
+
 - The direct packed-T4 terms by opened letters (`itercc_spin_quad_opened`
   and `_lower`) look up each summed tuple's slot and particle column once per
   class instead of once per row of the other particles, and prefetch the

@@ -275,11 +275,11 @@ def test_slot_budget_leaves_room_for_the_davidson_vectors(monkeypatch):
     assert engine._fixed_bytes + vectors + cache + partial <= engine.memory_budget_bytes
 
 
-def test_slot_waves_give_the_same_action(tmp_path):
+def test_slot_waves_give_the_same_action(tmp_path, monkeypatch):
     """Slots run one by one by default, each tile's sums added into its
     slot's rows right away; with ITERCC_SLOT_WAVES=1 (read once by the core:
     another process) in waves, here of one slot's partial sums each. The
-    same action bit for bit."""
+    same action bit for bit (tiles not merged: waves never merge them)."""
     import os
     import subprocess
     import sys
@@ -300,10 +300,27 @@ np.save(sys.argv[1], engine.sigma(vector))
     run = subprocess.run([sys.executable, "-c", script, str(saved)], capture_output=True, text=True, env=env,
                          cwd=tests)
     assert run.returncode == 0, run.stderr
+    monkeypatch.setenv("ITERCC_MERGE_TILES", "0")
     engine = _split_engine()
     vector = np.random.default_rng(753).normal(size=engine.space.size)
     np.testing.assert_array_equal(engine.sigma(vector), np.load(saved))
     assert engine._slot_programs and all(p is not None for p in engine._slot_programs.values())
+
+
+def test_merged_tiles_keep_the_action(monkeypatch):
+    """Tiles of a kind whose gathers agree up to a sign share one tile with
+    fused products (`SlotProgram._merge_tiles`): fewer tiles cleared and
+    gathered, the action to rounding; unfused products keep every tile."""
+    engine = _split_engine()
+    vector = np.random.default_rng(757).normal(size=engine.space.size)
+    merged = engine.sigma(vector)
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    templates = program.templates
+    assert np.count_nonzero(templates["merge_flags"] & 2) < len(templates)      # some tiles merge
+    assert sorted(program.merge_order) == list(range(len(templates)))
+    monkeypatch.setenv("ITERCC_MERGE_TILES", "0")
+    separate = engine.sigma(vector)
+    np.testing.assert_allclose(merged, separate, rtol=0, atol=1e-13 * np.abs(separate).max())
 
 
 def test_complex_vectors_run_the_compiled_program():

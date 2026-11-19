@@ -411,7 +411,7 @@ struct Tile {
 // same entries) become the segments of one GEMM, in instruction order.
 void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, const Tile &job, i64 group,
                const itercc_slot_instruction *code, const int64_t *tables, const int64_t *counts,
-               const double *const *bases, double *tile, Worker &w)
+               const double *const *bases, double *tile, Worker &w, double scale)
 {
     const int64_t *g = p.fuse_groups + 2 * (p.fuse_start[m.kind] + group);
     w.pieces.clear();
@@ -441,7 +441,7 @@ void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, cons
             const int64_t *t = u.block;   // rows, cols, depth, r0, c0, k0, a_base, b_base, o_base
             itercc::GemmSegment segment{u.a + t[6], u.x->a_rows + t[3], u.x->a_sum + t[5], (u.x->flags & 1) != 0,
                                         u.b + t[7], u.x->b_sum + t[5], u.x->b_cols + t[4], (u.x->flags & 2) != 0,
-                                        t[2], u.x->alpha};
+                                        t[2], scale * u.x->alpha};
             w.segments.push_back(segment);
             ++j;
         }
@@ -542,11 +542,14 @@ void gather_part(const itercc_slot_terms &t, const int32_t *coordinates, i64 cou
 // intermediates they read stay bound) and run as fused GEMMs.
 void run_tile(const itercc_slot_program &p, const Tile &job, const double *const *bases,
               const double *const *vectors, Cache &cache, i64 cacheable, double *tile, Worker &w,
-              double *partial, bool fused, int workers, i64 share_work)
+              double *partial, bool fused, int workers, i64 share_work, bool merged = false)
 {
     const i64 nv = p.nv, nv4 = nv * nv * nv * nv;
     const itercc_slot_template &m = p.templates[job.tmpl];
-    {
+    // A merged tile (merge_order): cleared by its group's first tile, its
+    // products into the tile scaled by merge_sign, gathered by the last.
+    const double scale = merged ? double(m.merge_sign) : 1.0;
+    if (!merged || (m.merge_flags & 1)) {
         const Phase timing(0);
         static const bool runs = [] {
             const char *value = std::getenv("ITERCC_TILE_RUNS");
@@ -613,7 +616,8 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
         }
         itercc::ContractPlan plan = itercc::contract_plan(
             operand(x.a, job.fixed, bases, w, tile), operand(x.b, job.fixed, bases, w, tile), out, x.a_rows,
-            x.a_sum, x.b_sum, x.b_cols, x.rpos, x.cpos, x.alpha, x.flags);
+            x.a_sum, x.b_sum, x.b_cols, x.rpos, x.cpos, x.out.kind == kInter ? x.alpha : scale * x.alpha,
+            x.flags);
         itercc::PackedRows rows{};
         if (x.b.kind == kRows) {
             const Phase timing(3);
@@ -657,25 +661,32 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
     if (fused) {
         const Phase timing(1);
         for (i64 group = 0; group < p.fuse_count[m.kind]; ++group)
-            run_fused(p, m, job, group, code, tables, counts, bases, tile, w);
+            run_fused(p, m, job, group, code, tables, counts, bases, tile, w, scale);
     }
+    if (merged && !(m.merge_flags & 2)) return;   // the group's last tile gathers
     // Gathers in the order and arithmetic of itercc_permuted_gather_add.
     const Phase timing(4);
     const itercc_slot_group *groups = p.groups + p.key_group_start[p.slots[job.slot].key];
+    const i64 start = merged ? m.merge_part_start : m.part_start;
+    const i64 count = merged ? m.merge_part_count : m.part_count;
     double *sums = partial;
-    for (i64 e = 0; e < m.part_count; ++e) {
-        const itercc_slot_part &part = p.parts[m.part_start + e];
+    for (i64 e = 0; e < count; ++e) {
+        const itercc_slot_part &part = p.parts[start + e];
         const itercc_slot_group &g = groups[part.group];
         gather_part(p.terms[part.terms], g.coordinates, g.count, tile, sums);
         sums += g.count;
     }
 }
 
-// The partial sums of one tile (its gathers' rows).
-i64 tile_rows(const itercc_slot_program &p, const itercc_slot_template &m, const itercc_slot_group *groups)
+// The partial sums of one tile (its gathers' rows; a merged group's last
+// tile gathers for the group).
+i64 tile_rows(const itercc_slot_program &p, const itercc_slot_template &m, const itercc_slot_group *groups,
+              bool merged = false)
 {
+    const i64 start = merged ? m.merge_part_start : m.part_start;
+    const i64 count = merged ? m.merge_part_count : m.part_count;
     i64 rows = 0;
-    for (i64 e = 0; e < m.part_count; ++e) rows += groups[p.parts[m.part_start + e].group].count;
+    for (i64 e = 0; e < count; ++e) rows += groups[p.parts[start + e].group].count;
     return rows;
 }
 
@@ -699,12 +710,13 @@ void finish_slot(const itercc_slot_program &p, const itercc_slot_info &x, const 
 
 // The tiles of slot s: template, occupied tuple, plan set and partial sums
 // from `at` on. False when a tile has no plan.
-bool slot_tiles(const itercc_slot_program &p, i64 s, i64 &at, std::vector<Tile> &tiles)
+bool slot_tiles(const itercc_slot_program &p, i64 s, i64 &at, std::vector<Tile> &tiles, bool merged = false)
 {
     const itercc_slot_info &x = p.slots[s];
     const itercc_slot_group *groups = p.groups + p.key_group_start[x.key];
     const i64 n = p.nirrep, codes = n * n * n * n;
-    for (i64 t = p.class_start[x.cls]; t < p.class_start[x.cls] + p.class_count[x.cls]; ++t) {
+    for (i64 j = p.class_start[x.cls]; j < p.class_start[x.cls] + p.class_count[x.cls]; ++j) {
+        const i64 t = merged ? p.merge_order[j] : j;   // merged groups together
         const itercc_slot_template &m = p.templates[t];
         Tile tile{s, t, at, 0, {0, 0, 0, 0}};
         i64 code = 0;
@@ -762,6 +774,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
         return value != nullptr && value[0] == '1';
     }();
     if (!waves) {
+        const bool merged = p->merge_order != nullptr;
         std::atomic<bool> failed{false};
         std::atomic<i64> finished{0};
         const i64 step = std::max<i64>(1, nslots / 64);
@@ -785,13 +798,13 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
                 double *out = result + x.start;
                 i64 at = 0;
                 mine.clear();
-                slot_tiles(*p, s, at, mine);
+                slot_tiles(*p, s, at, mine, merged);
                 for (const Tile &job : mine) {
                     const itercc_slot_template &m = p->templates[job.tmpl];
                     try {
-                        sums.resize(size_t(tile_rows(*p, m, groups)));
+                        sums.resize(size_t(tile_rows(*p, m, groups, merged)));
                         run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, sums.data(), fused != 0,
-                                 threads, share_work);
+                                 threads, share_work, merged);
                     } catch (const std::bad_alloc &) {
                         const itercc_slot_intermediate *inters = p->intermediates + p->inter_start[m.kind];
                         for (size_t k = 0; k < w.owner.size(); ++k)
@@ -801,10 +814,13 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
                         failed = true;
                         break;
                     }
+                    if (merged && !(m.merge_flags & 2)) continue;   // gathered with its group's last tile
                     const Phase timing(6);
                     const double *from = sums.data();
-                    for (i64 e = 0; e < m.part_count; ++e) {
-                        const itercc_slot_group &g = groups[p->parts[m.part_start + e].group];
+                    const i64 start = merged ? m.merge_part_start : m.part_start;
+                    const i64 count = merged ? m.merge_part_count : m.part_count;
+                    for (i64 e = 0; e < count; ++e) {
+                        const itercc_slot_group &g = groups[p->parts[start + e].group];
                         for (i64 r = 0; r < g.count; ++r) out[g.rows[r]] += from[r];
                         from += g.count;
                     }
