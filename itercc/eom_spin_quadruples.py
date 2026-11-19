@@ -83,6 +83,16 @@ def _raise_spin(mask, spatial_orbital):
     return mask ^ (3 * bit) if mask & (3 * bit) == 2 * bit else None
 
 
+def holes_first_layout(tensor):
+    """`tensor` (particle axes, then occupied axes) stored with its occupied
+    axes outermost, viewed with the usual axes: the same values, other strides."""
+    if tensor is None or not isinstance(tensor, np.ndarray):
+        return tensor
+    rank = tensor.ndim // 2
+    order = tuple(range(rank, 2 * rank)) + tuple(range(rank))
+    return np.ascontiguousarray(tensor.transpose(order)).transpose(np.argsort(order))
+
+
 class SpinFlipSpace:
     """Canonical M_S=+1 coordinates in one spatial irrep, projected onto S=1."""
 
@@ -130,11 +140,20 @@ class SpinFlipSpace:
                                                     np.array(target, dtype=np.int32)))
         self._phase = xp.asarray(np.array(phases, dtype=np.float64))[self._source]
 
-    def unpack(self, vector, *, max_rank=4, nonzero=None):
+    def unpack(self, vector, *, max_rank=4, nonzero=None, holes_first=()):
+        """Dense antisymmetric tensors of each rank; for the ranks in
+        `holes_first`, stored with the occupied axes outermost (a transposed
+        view of the usual axes, see `holes_first_layout`)."""
         for rank, (shape, indices, section) in enumerate(
                 zip(self.shapes[:max_rank], self.indices, self.slices), 1):
             if nonzero is not None and not nonzero[rank - 1]:
                 yield None
+                continue
+            if rank in holes_first and self.xp is np:
+                order = tuple(range(rank, 2 * rank)) + tuple(range(rank))
+                stored = unpack_antisymmetric(vector[section], indices[list(order)],
+                                              tuple(shape[a] for a in order), xp=self.xp)
+                yield stored.transpose(np.argsort(order))
                 continue
             yield unpack_antisymmetric(vector[section], indices, shape, xp=self.xp)
 
@@ -308,6 +327,13 @@ class TripletEOMCCSDTQ:
                                    project_spin=not action_only)
         self.amplitudes = _ground_amplitudes(solver, amplitudes, xp,
                                             self._ground_t4 if occupied_tiles else None)
+        if self._holes_first_ranks():
+            # Rank three with the occupied axes outermost: a tile fixes two of
+            # them, and with them innermost (spin-interleaved) its slice of the
+            # dense T3 was scattered over the whole array.
+            amplitudes_list = list(self.amplitudes)
+            amplitudes_list[2] = holes_first_layout(amplitudes_list[2])
+            self.amplitudes = tuple(amplitudes_list)
         t1 = self.amplitudes[0]
         self.fock, self.integrals, self.one_body = self.proxy._dressed(t1, one_body=True)
         self.ground_energy = self.proxy.reference_energy + self.proxy._correlation_energy(self.amplitudes)
@@ -323,6 +349,13 @@ class TripletEOMCCSDTQ:
             for holes, (key, window) in self._direction_t4.slots.items():
                 values = [order[(*p, *holes)] for p in self._direction_t4.groups[key]]
                 self._tiled_r4_order[window] = xp.asarray(values, dtype=np.int32)
+
+    def _holes_first_ranks(self):
+        """Ranks whose dense tensors keep the occupied axes outermost (the CPU
+        occupied-tile engine, unless ITERCC_HOLES_FIRST=0)."""
+        if self.xp is not np or not self.occupied_tiles or not _runtime.enabled("ITERCC_HOLES_FIRST"):
+            return ()
+        return (3,)
 
     def _orbital_diagonal(self):
         xp, space = self.xp, self.space
@@ -633,7 +666,8 @@ class TripletEOMCCSDTQ:
         no = self.proxy.hamiltonian.nocc
         nonzero = (tuple(bool(xp.any(vector[section])) for section in self.space.slices)
                    if self.occupied_tiles else None)
-        r1, *direction = self.space.unpack(vector, max_rank=3 if self.occupied_tiles else 4, nonzero=nonzero)
+        r1, *direction = self.space.unpack(vector, max_rank=3 if self.occupied_tiles else 4, nonzero=nonzero,
+                                           holes_first=self._holes_first_ranks())
         dg = df = None
         if r1 is not None:
             dg = dress_direction(self.integrals, r1, no, xp)

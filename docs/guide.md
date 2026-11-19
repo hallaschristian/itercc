@@ -289,6 +289,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TRIPLET_FUSED` | call | `0`: triplet slot program adds products into a tile one by one (the loop's action bit for bit) |
 | `ITERCC_DIRECT_DENSE` | call | `0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
 | `ITERCC_SLOT_POSITIONS` | call | `0`: triplet slot-program intermediates and tiles keep virtual axes in orbital order, not irrep order |
+| `ITERCC_HOLES_FIRST` | call | `0`: triplet dense rank-three tensors with the occupied axes innermost, not outermost |
 | `ITERCC_COMPACT_TILES` | call | `0`: triplet slot-program tiles stored whole (nv^4), not only their ordered entries |
 | `ITERCC_COMPACT_INTERMEDIATES` | call | `0`: triplet slot-program intermediates stored whole, not only their ordered entries |
 | `ITERCC_ORDERED_INTERMEDIATES` | call | `0`: triplet slot-program intermediates formed at every entry, not only where their readers read |

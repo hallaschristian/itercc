@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Triplet dense rank-three tensors (ground T3 and each action's R3) are stored
+  with the occupied axes outermost and viewed with the usual axes
+  (`eom_spin_quadruples.holes_first_layout`; R3 is unpacked that way at no
+  extra cost). A tile fixes two occupied indices; with them innermost and
+  spin-interleaved, its slice of a 27 GB CuF T3 lay scattered over the whole
+  array, and packing it for the tile GEMMs was 65% of their time on Sapphire
+  Rapids. 6o/24v synthetic model: rank four 19.6 -> 16.8 s; the action moves
+  at rounding (the planner orders composite letters by stride).
+  `ITERCC_HOLES_FIRST=0` keeps the usual layout.
 - Triplet slot-program tiles store only the entries their kind's products
   form and its gathers read: each chain of ordered particle letters (from one
   antisymmetric subset of the projection group, so always within one

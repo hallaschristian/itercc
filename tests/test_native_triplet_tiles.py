@@ -299,6 +299,22 @@ def test_compact_intermediates_keep_the_action(monkeypatch):
     assert program._offset_groups and program.intermediates["size"].sum() < dense
 
 
+def test_holes_first_rank_three_keeps_the_action(monkeypatch):
+    """Dense T3 and R3 stored with the occupied axes outermost (a tile fixes
+    two of them): the same values through other strides, the action to
+    rounding."""
+    monkeypatch.setenv("ITERCC_HOLES_FIRST", "0")
+    plain_engine = _split_engine()
+    vector = np.random.default_rng(765).normal(size=plain_engine.space.size)
+    plain = plain_engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_HOLES_FIRST", "1")
+    engine = _split_engine()
+    t3 = engine.amplitudes[2]
+    assert t3.strides[3] > t3.strides[0]            # occupied axes outermost
+    np.testing.assert_array_equal(t3, plain_engine.amplitudes[2])
+    np.testing.assert_allclose(engine.sigma(vector), plain, rtol=1e-12, atol=1e-13 * np.abs(plain).max())
+
+
 def test_compact_tiles_keep_the_action(monkeypatch):
     """Tiles store only the entries their kind's products form and its
     gathers read (each chain of ordered particle letters one axis of ranks):
