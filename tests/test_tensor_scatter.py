@@ -86,3 +86,31 @@ def test_sector_dispatch_avoids_parallel_overhead(threads, stride, monkeypatch):
     values = np.ones(len(indices))
     result = _tensor_scatter.unpack_sector(values, indices, (2**18,), threads=threads)
     assert np.count_nonzero(result) == len(indices)
+
+
+@pytest.mark.parametrize("holes_first", [False, True])
+def test_spin_block_unpack_matches_the_dense_unpack(holes_first):
+    """unpack_spin_blocks keeps the dense unpack's nonzero spin blocks, bit for
+    bit, and only those."""
+    from itertools import combinations, product
+
+    from itercc._tensor_scatter import unpack_antisymmetric, unpack_spin_blocks
+    from itercc._spin_quadruples_tiles import spin_blocks
+
+    nv, no, rank = 8, 6, 3
+    rows = []
+    for p in combinations(range(nv), rank):
+        for h in combinations(range(no), rank):
+            spins = [x % 2 for x in p + h]
+            if sum(spins[rank:]) - sum(spins[:rank]) == 1:        # a spin-flip sector
+                rows.append(p + h)
+    coordinates = np.asarray(rows, dtype=np.int64).T
+    vector = np.random.default_rng(11).normal(size=coordinates.shape[1])
+    shape = (nv,) * rank + (no,) * rank
+    blocked = unpack_spin_blocks(vector, coordinates, shape, holes_first=holes_first)
+    if blocked is None:
+        pytest.skip("compiled core unavailable")
+    dense = spin_blocks(unpack_antisymmetric(vector, coordinates, shape))
+    assert len(blocked.blocks) == 15
+    for signature in product((0, 1), repeat=2 * rank):
+        np.testing.assert_array_equal(blocked[signature], dense[signature])

@@ -11,7 +11,7 @@ from ._spin_quadruples_storage import (
 )
 from ._tensor_symmetry import signed_permutations as _permutations
 from ._tensor_scatter import unpack_antisymmetric
-from ._spin_quadruples_tiles import contract_tile, external_routes, projection_diagrams, spin_blocks
+from ._spin_quadruples_tiles import SpinBlocks, contract_tile, external_routes, projection_diagrams, spin_blocks
 from .bounded_einsum import einsum_into
 from .eom import EOMSinglet
 from .hamiltonian import Hamiltonian
@@ -112,6 +112,37 @@ def _raise_spin(mask, spatial_orbital):
     return mask ^ (3 * bit) if mask & (3 * bit) == 2 * bit else None
 
 
+def _blocked_einsum_into(xp, result, coefficient, spec, *operands):
+    """`einsum_into` with some operands `SpinBlocks`: each combination of
+    their stored blocks (consistent spins on shared letters) with the [s::2]
+    views of the other operands and of `result` for every spin of the
+    remaining letters. Absent blocks are zero, so this is the dense product
+    (other sums: rounding)."""
+    inputs, output = spec.split("->")
+    inputs = inputs.split(",")
+    blocked = [i for i, x in enumerate(operands) if isinstance(x, SpinBlocks)]
+    letters = sorted(set("".join(inputs)))
+    for chosen in product(*(list(operands[i].blocks.items()) for i in blocked)):
+        spin, consistent = {}, True
+        for i, (signature, _) in zip(blocked, chosen):
+            for c, s in zip(inputs[i], signature):
+                consistent = consistent and spin.setdefault(c, s) == s
+        if not consistent:
+            continue
+        free = [c for c in letters if c not in spin]
+        for spins in product((0, 1), repeat=len(free)):
+            assigned = spin | dict(zip(free, spins))
+            views = []
+            for i, x in enumerate(operands):
+                if i in blocked:
+                    views.append(chosen[blocked.index(i)][1])
+                else:
+                    views.append(x[tuple(slice(assigned[c], None, 2) for c in inputs[i])])
+            target = result[tuple(slice(assigned[c], None, 2) for c in output)]
+            einsum_into(xp, target, coefficient, spec, *views)
+    return result
+
+
 def holes_first_layout(tensor):
     """`tensor` (particle axes, then occupied axes) stored with its occupied
     axes outermost, viewed with the usual axes: the same values, other strides."""
@@ -169,15 +200,22 @@ class SpinFlipSpace:
                                                     np.array(target, dtype=np.int32)))
         self._phase = xp.asarray(np.array(phases, dtype=np.float64))[self._source]
 
-    def unpack(self, vector, *, max_rank=4, nonzero=None, holes_first=()):
+    def unpack(self, vector, *, max_rank=4, nonzero=None, holes_first=(), blocked=()):
         """Dense antisymmetric tensors of each rank; for the ranks in
         `holes_first`, stored with the occupied axes outermost (a transposed
-        view of the usual axes, see `holes_first_layout`)."""
+        view of the usual axes, see `holes_first_layout`); the ranks in
+        `blocked` as their nonzero spin blocks (`SpinBlocks`, CPU)."""
         for rank, (shape, indices, section) in enumerate(
                 zip(self.shapes[:max_rank], self.indices, self.slices), 1):
             if nonzero is not None and not nonzero[rank - 1]:
                 yield None
                 continue
+            if rank in blocked and self.xp is np:
+                from ._tensor_scatter import unpack_spin_blocks
+                found = unpack_spin_blocks(vector[section], indices, shape, holes_first=rank in holes_first)
+                if found is not None:
+                    yield found
+                    continue
             if rank in holes_first and self.xp is np:
                 order = tuple(range(rank, 2 * rank)) + tuple(range(rank))
                 stored = unpack_antisymmetric(vector[section], indices[list(order)],
@@ -268,7 +306,7 @@ class TripletEOMCCSDTQ:
             # products; the packed T4, R4 and image vectors are added below.
             # CuF (13o/29v, one socket): 71 GB after rank three, 173 GB at the
             # end of an action with a 64 GiB cache and 32 GiB of partial sums.
-            rank_three = (1.5 if backend == "cpu" and occupied_tiles and self._packed_direction
+            rank_three = (0.75 if backend == "cpu" and occupied_tiles and self._packed_direction
                           and _runtime.enabled("ITERCC_SPIN_BLOCKED_T3") else 2.5)
             self._fixed_bytes = int(8 * (rank_three * (4 * no * nv)**3 + 6 * (2 * (no + nv))**4
                                          + 2 * no**3 * nv**3 + 128 * nv**4))
@@ -734,7 +772,8 @@ class TripletEOMCCSDTQ:
         nonzero = (tuple(bool(xp.any(vector[section])) for section in self.space.slices)
                    if self.occupied_tiles else None)
         r1, *direction = self.space.unpack(vector, max_rank=3 if self.occupied_tiles else 4, nonzero=nonzero,
-                                           holes_first=self._holes_first_ranks())
+                                           holes_first=self._holes_first_ranks(),
+                                           blocked=(3,) if self._spin_blocked_t3() else ())
         dg = df = None
         if r1 is not None:
             dg = dress_direction(self.integrals, r1, no, xp)
@@ -780,7 +819,10 @@ class TripletEOMCCSDTQ:
                 result = xp.zeros(shape)
                 for coefficient, spec, names in DIAGRAMS[rank]:
                     for operands in product_directions(*(blocks[name] for name in names)):
-                        einsum_into(xp, result, coefficient, spec, *operands)
+                        if any(isinstance(x, SpinBlocks) for x in operands):
+                            _blocked_einsum_into(xp, result, coefficient, spec, *operands)
+                        else:
+                            einsum_into(xp, result, coefficient, spec, *operands)
                 outputs.append(_antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])])
             if packed_action is not None and 1 < rank < 4 and not (self.lower_part or (0,))[0]:
                 packed_action.add_lower(rank, outputs[-1])

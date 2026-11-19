@@ -108,6 +108,37 @@ extern "C" void itercc_permuted_gather_add(int64_t count, int rank, int terms,
     }
 }
 
+extern "C" void itercc_spin_unpack_blocks(int64_t count, int rank, const int32_t *coordinates,
+    const double *vector, int npermutations, const int32_t *permutations, const int32_t *signs,
+    const int64_t *blocks, const int64_t *strides, int64_t block_size, int threads)
+{
+    const int axes = 2 * rank, nblocks = 1 << axes;
+    #pragma omp parallel num_threads(threads)
+    {
+        for (int b = 0; b < nblocks; ++b) {
+            double *block = reinterpret_cast<double *>(static_cast<intptr_t>(blocks[b]));
+            if (block == nullptr) continue;
+            #pragma omp for schedule(static)
+            for (int64_t i = 0; i < block_size; ++i) block[i] = 0.;
+        }
+        for (int p = 0; p < npermutations; ++p) {
+            const int32_t *permutation = permutations + p * axes;
+            #pragma omp for schedule(static)
+            for (int64_t row = 0; row < count; ++row) {
+                const int32_t *coordinate = coordinates + row * axes;
+                int64_t signature = 0, offset = 0;
+                for (int a = 0; a < axes; ++a) {
+                    const int32_t index = coordinate[permutation[a]];
+                    signature = 2 * signature + (index & 1);
+                    offset += int64_t(index >> 1) * strides[a];
+                }
+                double *block = reinterpret_cast<double *>(static_cast<intptr_t>(blocks[signature]));
+                block[offset] = signs[p] * vector[row];
+            }
+        }
+    }
+}
+
 extern "C" void itercc_sector_unpack(int64_t size, int64_t count,
     const int64_t *indices, const double *vector, double *out, int threads)
 {

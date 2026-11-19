@@ -2,14 +2,18 @@
 
 ## Unreleased
 
-- The triplet engine keeps T3 as its nonzero spin blocks
-  (`_spin_quadruples_tiles.SpinBlocks`, 20 of 64 signatures, each a spatial
-  array with its occupied axes outermost): the Python tile loops take them
-  through `spin_blocks` and the slot program as one dense operand per block.
-  CuF: 27.4 -> 8.6 GB, and the setup no longer holds a dense T3 and its
-  holes-first copy at once. 6o/24v synthetic model: T3 1.42 -> 0.44 GiB, peak
-  memory after setup 3.48 -> 1.47 GiB, the same action bit for bit.
-  `ITERCC_SPIN_BLOCKED_T3=0` keeps the dense tensor.
+- The triplet engine keeps T3, and each action's R3, as their nonzero spin
+  blocks (`_spin_quadruples_tiles.SpinBlocks`: 20 and 15 of 64 signatures,
+  each a spatial array with its occupied axes outermost; R3 straight from the
+  packed vector, `_tensor_scatter.unpack_spin_blocks` on
+  `itercc_spin_unpack_blocks`, core ABI 38). The Python tile loops take them
+  through `spin_blocks`, the slot program as one dense operand per block,
+  rank one block by block. CuF: T3 27.4 -> 8.6 GB and R3 27.4 -> 6.4 GB per
+  process, and the setup no longer holds a dense T3 beside its holes-first
+  copy. 6o/24v synthetic model: peak memory of an action 12.9 -> 10.7 GiB
+  (after setup 3.4 -> 1.5), action 22.8 -> 21.7 s, the action moving at
+  rounding (1.8e-15; rank one sums R3 block by block).
+  `ITERCC_SPIN_BLOCKED_T3=0` keeps both dense.
 - Compact triplet slot-program intermediates store their chains innermost too
   (`ITERCC_INTER_CHAINS_INNER`): a tile product that takes a chain of a cached
   intermediate as its GEMM columns (the skinny products' 2998 x 7 blocks of

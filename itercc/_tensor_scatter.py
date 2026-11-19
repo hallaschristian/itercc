@@ -199,6 +199,42 @@ def expand_antisymmetric(vector, coordinates, shape, *, threads=None):
     return result
 
 
+def unpack_spin_blocks(vector, coordinates, shape, *, holes_first=False, threads=None):
+    """`unpack_antisymmetric` as a `SpinBlocks` tensor (CPU, compiled core):
+    only the spin blocks the canonical coordinates' permutations reach (every
+    pattern with the rows' beta counts in each half), each a spatial array,
+    with its occupied axes outermost when `holes_first`. The values are those
+    of the dense tensor's blocks. None without the compiled core."""
+    from itertools import product
+
+    from ._spin_quadruples_tiles import SpinBlocks
+
+    rank = len(shape) // 2
+    kernel = _cpu_kernels.library()
+    if kernel is None or not (isinstance(vector, np.ndarray) and vector.dtype == np.float64):
+        return None
+    coordinates = np.asarray(coordinates)
+    if coordinates.shape != (2 * rank, vector.size) or any(n % 2 for n in shape):
+        raise ValueError("Canonical amplitudes and coordinates have incompatible shapes")
+    spins = coordinates % 2
+    counts = {(int(p), int(h)) for p, h in zip(spins[:rank].sum(axis=0), spins[rank:].sum(axis=0))}
+    signatures = [s for s in product((0, 1), repeat=2 * rank) if (sum(s[:rank]), sum(s[rank:])) in counts]
+    spatial = tuple(n // 2 for n in shape)
+    order = tuple(range(rank, 2 * rank)) + tuple(range(rank)) if holes_first else tuple(range(2 * rank))
+    blocks = {s: np.empty(tuple(spatial[a] for a in order)).transpose(np.argsort(order)) for s in signatures}
+    pointers = np.zeros(1 << (2 * rank), dtype=np.int64)
+    for s, block in blocks.items():
+        pointers[int("".join(map(str, s)), 2)] = block.ctypes.data
+    strides = np.asarray(next(iter(blocks.values())).strides, dtype=np.int64) // 8 if blocks else np.zeros(1, np.int64)
+    rows = np.ascontiguousarray(coordinates.T, dtype=np.int32)
+    vector = np.ascontiguousarray(vector)
+    permutations, signs = _antisymmetric_permutations(rank)
+    kernel.spin_unpack_blocks(vector.size, rank, rows.ctypes.data, vector.ctypes.data, len(signs),
+                              permutations.ctypes.data, signs.ctypes.data, pointers.ctypes.data,
+                              strides.ctypes.data, int(np.prod(spatial)), cpu_threads(threads))
+    return SpinBlocks(blocks, shape)
+
+
 def unpack_antisymmetric(vector, coordinates, shape, *, xp=np, threads=None):
     """Expand canonical spin-orbital coordinates on CPU or device.
 

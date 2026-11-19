@@ -367,8 +367,9 @@ def test_holes_first_rank_three_keeps_the_action(monkeypatch):
 
 
 def test_spin_blocked_t3_keeps_the_action(monkeypatch):
-    """T3 kept as its nonzero spin blocks (20 of 64): the blocks of the dense
-    tensor, the same action bit for bit, under a third of the bytes."""
+    """T3 and each action's R3 kept as their nonzero spin blocks (20 and 15 of
+    64): the blocks of the dense tensors, under a third of the bytes, and the
+    action to rounding (rank one sums R3 block by block)."""
     from itercc._spin_quadruples_tiles import SpinBlocks, spin_blocks
 
     monkeypatch.setenv("ITERCC_SPIN_BLOCKED_T3", "0")
@@ -383,7 +384,7 @@ def test_spin_blocked_t3_keeps_the_action(monkeypatch):
     views = spin_blocks(dense_engine.amplitudes[2])
     for signature, view in views.items():
         np.testing.assert_array_equal(t3[signature], view)
-    np.testing.assert_array_equal(engine.sigma(vector), dense)
+    np.testing.assert_allclose(engine.sigma(vector), dense, rtol=1e-12, atol=1e-13 * np.abs(dense).max())
     engine.slot_program = False                      # the Python loop takes the blocks too
     np.testing.assert_allclose(engine.sigma(vector), dense, rtol=1e-12, atol=1e-13 * np.abs(dense).max())
 

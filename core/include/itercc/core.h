@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 37
+#define ITERCC_CORE_ABI 38
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -44,6 +44,15 @@ void itercc_sector_unpack(int64_t size, int64_t count, const int64_t *indices,
 void itercc_spin_unpack(int64_t count, int rank, int64_t nv, int64_t no,
     const int32_t *coordinates, const double *vector, int npermutations,
     const int32_t *permutations, const int32_t *signs, double *out, int threads);
+
+/* itercc_spin_unpack into spin blocks: the entry at spin orbitals
+ * (p_1 .. p_2rank) goes to blocks[signature] (signature = the parities p_a & 1
+ * as bits, the first axis highest) at sum_a (p_a >> 1) * strides[a]. Every
+ * nonzero block of `blocks` (2^(2 rank) addresses) is cleared first, holding
+ * `block_size` doubles; a permuted entry must land in a nonzero block. */
+void itercc_spin_unpack_blocks(int64_t count, int rank, const int32_t *coordinates, const double *vector,
+    int npermutations, const int32_t *permutations, const int32_t *signs, const int64_t *blocks,
+    const int64_t *strides, int64_t block_size, int threads);
 
 /* Binary small-operand / canonical spin-orbital T4 contraction. Coordinates
  * are count x (2*rank) int32. Signed maps encode address+1 (zero is forbidden).
