@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `itercc_permuted_gather_add` (the ranks two and three projections, the
+  packed-row gathers of the Python paths) runs blocks of 2048 rows term by
+  term with each term's strides set up once per block, as the slot program's
+  gathers now do; every row gets the same additions in the same order, so
+  results are the same bit for bit. 6o/24v synthetic model: 0.22 -> 0.15 s
+  per action.
 - Compact triplet slot-program tiles store their chains innermost and clear
   only their symmetry-allowed entries (`itercc_slot_tile_axes`, core ABI 36):
   a chain keeps every irrep, so clearing a compact tile whole wrote four

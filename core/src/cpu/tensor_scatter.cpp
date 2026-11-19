@@ -39,28 +39,72 @@ extern "C" void itercc_signed_gather_rows(int64_t rows, int64_t width,
     }
 }
 
+namespace {
+
+// Rows [r0, r1) of a permuted gather: term by term over the rows, with the
+// term's strides hoisted (Rank > 0: a fixed rank), into sums (one per row,
+// from +0.0); then each row's sum is added to its target. Every row gets the
+// same additions in the same order as a row-by-row loop over the terms.
+template <int Rank>
+void gather_rows(int64_t r0, int64_t r1, int rank, int terms, const int32_t *coordinates, const int64_t *rows,
+                 const int64_t *strides, const double *weights, const double *source, double *target,
+                 double *sums)
+{
+    const int n = Rank > 0 ? Rank : rank;
+    std::fill(sums, sums + (r1 - r0), 0.);
+    for (int term = 0; term < terms; ++term) {
+        const int64_t *step = strides + int64_t(term) * n;
+        const double w = weights[term];
+        for (int64_t row = r0; row < r1; ++row) {
+            const int32_t *c = coordinates + row * n;
+            int64_t offset = 0;
+            for (int axis = 0; axis < n; ++axis) offset += c[axis] * step[axis];
+            sums[row - r0] += w * source[offset];
+        }
+    }
+    for (int64_t row = r0; row < r1; ++row) target[rows[row]] += sums[row - r0];
+}
+
+void gather_rows_any(int64_t r0, int64_t r1, int rank, int terms, const int32_t *coordinates, const int64_t *rows,
+                     const int64_t *strides, const double *weights, const double *source, double *target,
+                     double *sums)
+{
+    switch (rank) {
+    case 2: return gather_rows<2>(r0, r1, rank, terms, coordinates, rows, strides, weights, source, target, sums);
+    case 4: return gather_rows<4>(r0, r1, rank, terms, coordinates, rows, strides, weights, source, target, sums);
+    case 6: return gather_rows<6>(r0, r1, rank, terms, coordinates, rows, strides, weights, source, target, sums);
+    case 8: return gather_rows<8>(r0, r1, rank, terms, coordinates, rows, strides, weights, source, target, sums);
+    default: return gather_rows<0>(r0, r1, rank, terms, coordinates, rows, strides, weights, source, target, sums);
+    }
+}
+
+}  // namespace
+
 extern "C" void itercc_permuted_gather_add(int64_t count, int rank, int terms,
     const int32_t *coordinates, const int64_t *rows, const int64_t *strides,
     const double *weights, const double *source, double *target, int threads)
 {
-    // One thread owns each distinct output row; preserve term order exactly.
-    auto gather = [&](int64_t row) {
-        double sum = 0.;
-        for (int term = 0; term < terms; ++term) {
-            int64_t offset = 0;
-            for (int axis = 0; axis < rank; ++axis)
-                offset += coordinates[row * rank + axis] * strides[term * rank + axis];
-            sum += weights[term] * source[offset];
-        }
-        target[rows[row]] += sum;
+    // One thread owns each distinct output row; every row's terms are added
+    // in order. Rows go in fixed blocks (term by term within a block: the
+    // term's strides are set up once per block, not once per row and term).
+    constexpr int64_t block = 2048;
+    const int64_t blocks = (count + block - 1) / block;
+    auto run = [&](int64_t b, double *sums) {
+        const int64_t r0 = b * block, r1 = std::min(count, r0 + block);
+        gather_rows_any(r0, r1, rank, terms, coordinates, rows, strides, weights, source, target, sums);
     };
     // Do not resize the OpenMP team between small gathers and the surrounding
     // GEMMs: that destroys worker reuse and can dominate the contraction time.
     if (count * rank * terms < 262144) {
-        for (int64_t row = 0; row < count; ++row) gather(row);
+        double sums[block];
+        for (int64_t b = 0; b < blocks; ++b) run(b, sums);
     } else {
-        #pragma omp parallel for schedule(static) num_threads(threads)
-        for (int64_t row = 0; row < count; ++row) gather(row);
+        #pragma omp parallel num_threads(threads)
+        {
+            double sums[block];
+            #pragma omp for schedule(static)
+            for (int64_t b = 0; b < blocks; ++b) run(b, sums);
+        }
     }
 }
 
