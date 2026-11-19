@@ -472,28 +472,34 @@ void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, cons
 // same additions in the same order as a row-by-row loop (from +0.0), so the
 // partial sums are those of itercc_permuted_gather_add bit for bit.
 template <int Chains, int First, int Second>
-void gather_terms(const itercc_slot_terms &t, const int32_t *coordinates, i64 count, const double *tile,
-                  double *rows)
+void gather_terms(const itercc_slot_terms &t, const int32_t *__restrict coordinates, i64 count,
+                  const double *__restrict tile, double *__restrict rows)
 {
     const i64 nv = t.nv;
     for (i64 k = 0; k < t.count; ++k) {
+        // The term's steps, chain members and tables in locals (the row
+        // loop then carries no loads the stores could alias: it vectorizes,
+        // gathering the tile's entries).
         const int64_t *step = t.offsets + 4 * k;
         const i64 s0 = step[0], s1 = step[1], s2 = step[2], s3 = step[3];
         const int64_t *m0 = t.members + 8 * k, *m1 = m0 + 4;
-        const int64_t *table0 = Chains > 0 ? t.tables[0] : nullptr, *table1 = Chains > 1 ? t.tables[1] : nullptr;
+        const i64 a0 = m0[0], a1 = m0[1], a2 = First == 3 ? m0[2] : 0;
+        const i64 b0 = Chains > 1 ? m1[0] : 0, b1 = Chains > 1 ? m1[1] : 0, b2 = Second == 3 ? m1[2] : 0;
+        const int64_t *__restrict table0 = Chains > 0 ? t.tables[0] : nullptr;
+        const int64_t *__restrict table1 = Chains > 1 ? t.tables[1] : nullptr;
         const i64 stride0 = Chains > 0 ? t.strides[0] : 0, stride1 = Chains > 1 ? t.strides[1] : 0;
         const double w = t.weights[k];
         for (i64 r = 0; r < count; ++r) {
             const int32_t *c = coordinates + 4 * r;
             i64 at = c[0] * s0 + c[1] * s1 + c[2] * s2 + c[3] * s3;
             if constexpr (Chains > 0) {
-                i64 flat = c[m0[0]] * nv + c[m0[1]];
-                if constexpr (First == 3) flat = flat * nv + c[m0[2]];
+                i64 flat = c[a0] * nv + c[a1];
+                if constexpr (First == 3) flat = flat * nv + c[a2];
                 at += table0[flat] * stride0;
             }
             if constexpr (Chains > 1) {
-                i64 flat = c[m1[0]] * nv + c[m1[1]];
-                if constexpr (Second == 3) flat = flat * nv + c[m1[2]];
+                i64 flat = c[b0] * nv + c[b1];
+                if constexpr (Second == 3) flat = flat * nv + c[b2];
                 at += table1[flat] * stride1;
             }
             rows[r] += w * tile[at];
