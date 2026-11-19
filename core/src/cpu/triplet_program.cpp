@@ -57,6 +57,13 @@ const bool profiling = [] {
     return value != nullptr && value[0] == '1';
 }();
 
+void add_time(std::atomic<double> &total, double add)
+{
+    double old = total.load();
+    while (!total.compare_exchange_weak(old, old + add)) {
+    }
+}
+
 class Phase {
   public:
     explicit Phase(int which) : which_(which), start_(profiling ? omp_get_wtime() : 0.0) {}
@@ -376,8 +383,21 @@ void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, cons
             ++j;
         }
         const Piece &u = w.pieces[i];
+        const double start = profiling ? omp_get_wtime() : 0.0;
         itercc::fused_gemm({u.rows, 0, u.cols, i64(w.segments.size()), w.segments.data(),
                             tile + u.x->out.coef[0] + u.o_base, u.x->rpos + u.r0, u.x->cpos + u.c0});
+        if (profiling) {
+            // The fused GEMM's time shared among its products by their sums.
+            const double spent = omp_get_wtime() - start;
+            double depth = 0.0;
+            for (size_t s = i; s < j; ++s) depth += double(w.pieces[s].block[2]);
+            for (size_t s = i; s < j; ++s) {
+                const i64 id = w.pieces[s].x->inter;
+                if (id < 0 || id >= kTimed) continue;
+                add_time(contraction_time[id], spent * double(w.pieces[s].block[2]) / std::max(depth, 1.0));
+                ++contraction_calls[id];
+            }
+        }
         i = j;
     }
 }
