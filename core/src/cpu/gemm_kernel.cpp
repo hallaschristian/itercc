@@ -403,13 +403,22 @@ void pack_b_side(const FusedSide &x, const i64 *bk, const i64 *cols, i64 kn, i64
 // Rows of a fused GEMM that skinny_driver takes: two vectors of eight.
 constexpr i64 kSkinnyRows = 16;
 
+// ITERCC_GEMM_SKINNY: "0" neither skinny path, "fused" or "packed" only
+// that one, else both (read once).
+int skinny_mode()
+{
+    static const int mode = [] {
+        const char *text = std::getenv("ITERCC_GEMM_SKINNY");
+        if (text == nullptr || text[0] == ' ') return 3;
+        const std::string value(text);
+        return value == "0" ? 0 : value == "fused" ? 1 : value == "packed" ? 2 : 3;
+    }();
+    return mode;
+}
+
 bool skinny_enabled()
 {
-    static const bool on = [] {
-        const char *text = std::getenv("ITERCC_GEMM_SKINNY");
-        return text == nullptr || text[0] != '0';
-    }();
-    return on;
+    return (skinny_mode() & 1) != 0;
 }
 
 #if defined(ITERCC_GEMM_AVX512) || defined(ITERCC_GEMM_AVX2)
@@ -622,6 +631,11 @@ void fused_gemm(const FusedGemm &g)
         fused_driver(n, g.m, g.cc + g.j0, g.cr, g.c, g.nseg, ys.data(), xs.data(), start.data(), g.nc);
     else
         fused_driver(g.m, n, g.cr, g.cc + g.j0, g.c, g.nseg, xs.data(), ys.data(), start.data(), g.nc);
+}
+
+bool skinny_gemm()
+{
+    return (skinny_mode() & 2) != 0;
 }
 
 void set_fused_orientation(int mode)

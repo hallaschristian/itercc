@@ -84,6 +84,10 @@ void fused_gemm(const FusedGemm &g);
 // 2 transposes it. A diagnostic: every choice gives the same results.
 void set_fused_orientation(int mode);
 
+// Whether packed-B blocks of at most 16 rows read B in place
+// (ITERCC_GEMM_SKINNY unset, "1" or "packed"; read once).
+bool skinny_gemm();
+
 // "avx512", "avx2" or "generic".
 const char *indirect_gemm_kernel();
 
