@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Triplet slot-program tiles store only the entries their kind's products
+  form and its gathers read: each chain of ordered particle letters (from one
+  antisymmetric subset of the projection group, so always within one
+  composite of every product) is one stored axis of ranks, and the gathers
+  read a chain through its rank table. At CuF size a tile keeps 28-30% of
+  the dense nv^4 on average (0.8-1.5 MB for 70% of the tile work, inside a
+  Sapphire Rapids core's L2) and is cleared that much faster. 6o/24v
+  synthetic model: rank four 21.0 -> 19.2 s (tile clearing 28 -> 7 thread-s,
+  tile products 97 -> 84, gathers 32 -> 50), the same action bit for bit.
+  `ITERCC_COMPACT_TILES=0` keeps dense tiles. Core ABI 35. On one Sapphire
+  Rapids socket (CuF, first 1500 slots, 192 GiB cache), compact
+  intermediates took the slots from 63.8 to 42.7 s (allocation 560 -> 19
+  thread-s, gathers 522 -> 199, cache waits 207 -> 41; cache peak 192 -> 68
+  GB).
 - Triplet slot-program intermediates store only the entries they form.
   The ordering constraints an intermediate keeps link its letters in chains
   (b < c < d for the ring g T4 products); a chain comes from one half of one

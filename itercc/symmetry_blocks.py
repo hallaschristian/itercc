@@ -406,8 +406,8 @@ def _composite(letters, extent, labels, nirrep, ordered=()):
 def _offsets(letters, extent, strides, flat, positions=None):
     """Element offsets (with `strides` per letter) of row-major flat indices
     over `letters`; a letter with `positions` stores index i at positions[i],
-    and the letters of an `OffsetGroup` (all of them in `letters`) together
-    add table[their flat index] * stride."""
+    and the members (group, j) of an `OffsetGroup` (all of them in `letters`)
+    together add table[their flat index, member j at place j] * stride."""
     if not letters:
         return np.zeros(len(flat), dtype=np.int64)
     positions = positions or {}
@@ -416,18 +416,17 @@ def _offsets(letters, extent, strides, flat, positions=None):
     groups = {}
     for c in letters:
         p = positions.get(c)
-        if isinstance(p, OffsetGroup):
-            groups[id(p)] = p
+        if isinstance(p, tuple):
+            groups.setdefault(id(p[0]), (p[0], []))[1].append((p[1], c))
         elif p is not None:
             total += p[digits[c]].astype(np.int64) * strides[c]
         else:
             total += digits[c].astype(np.int64) * strides[c]
-    for group in groups.values():
-        members = [c for c in letters if positions.get(c) is group]
+    for group, members in groups.values():
         if len(members) != len(group.extents):
             raise ValueError("An offset group is split between composites")
-        members.sort(key=lambda c: group.letters.index(c))
-        index = np.ravel_multi_index(tuple(digits[c] for c in members), group.extents)
+        members.sort()
+        index = np.ravel_multi_index(tuple(digits[c] for _, c in members), group.extents)
         rank = group.table[index]
         if np.any(rank < 0):
             raise ValueError("A composite holds tuples outside its offset group")
@@ -436,15 +435,25 @@ def _offsets(letters, extent, strides, flat, positions=None):
 
 
 class OffsetGroup:
-    """Letters stored together as one axis: their tuples kept in `table` (a
-    rank for each flat tuple over `extents` in the order of `letters`, -1 for
-    tuples never stored) times `stride`. A slot program keeps the letters of
-    an intermediate that every reader takes in order this way, each kept tuple
-    once (b < c < d: a sixth of the dense entries)."""
+    """Axes stored together as one: their tuples kept in `table` (a rank for
+    each flat tuple over `extents`, member j at place j, -1 for tuples never
+    stored) times `stride`. An operand's axis k is member j of a group when
+    its positions[k] is (group, j). A slot program keeps the letters of an
+    intermediate or tile that every reader takes in order this way, each kept
+    tuple once (b < c < d: a sixth of the dense entries)."""
 
-    def __init__(self, letters, extents, table, stride):
-        self.letters, self.extents = tuple(letters), tuple(int(n) for n in extents)
+    def __init__(self, extents, table, stride):
+        self.extents = tuple(int(n) for n in extents)
         self.table, self.stride = np.ascontiguousarray(table, dtype=np.int64), int(stride)
+
+
+def _position_key(p):
+    """A cache key of one axis's positions (arrays and groups by identity)."""
+    if p is None:
+        return None
+    if isinstance(p, tuple):
+        return id(p[0]), p[1]
+    return id(p)
 
 
 class PositionedView(np.ndarray):
@@ -470,7 +479,7 @@ def positions_key(array):
     positions = getattr(array, "positions", None)
     if not positions:
         return None
-    return tuple(None if p is None else id(p) for p in positions)
+    return tuple(_position_key(p) for p in positions)
 
 
 _POINTERS = None
@@ -553,7 +562,8 @@ class SymmetryBlocks:
         import cupy as cp
 
         positions = {c: p for c, p in (positions or {}).items() if c in letters and p is not None}
-        key = (composite[0], tuple(strides[c] for c in letters), tuple(sorted((c, id(p)) for c, p in positions.items())))
+        key = (composite[0], tuple(strides[c] for c in letters),
+               tuple(sorted((c, _position_key(p)) for c, p in positions.items())))
         hit = self._tables.get(key)
         if hit is None:
             hit = self._tables[key] = cp.asarray(_offsets(letters, extent, strides, composite[1], positions))

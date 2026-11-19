@@ -40,6 +40,10 @@ single-threaded contraction routes and its raw tile in that thread's caches.
   contiguous run, so a product reads whole cache lines instead of every
   fourth value (C2v orbitals in energy order). Composites and sums are those
   of the plain layout, so the action does not change.
+* A tile likewise stores only the entries its kind's products form and its
+  gathers read (`_tile_layout`: each chain of ordered particle letters one
+  axis of ranks): a third of the dense nv^4 on average at CuF size, so most
+  tiles stay in a core's L2 and are cleared three times faster.
 * Each tile's gathers go to partial sums, added to the slot's rows in the
   order of the Python loop and divided by (4!)^2 as it does, so the action is
   the loop's bit for bit, on any number of threads.
@@ -78,7 +82,8 @@ ROWS_DESCRIPTOR = np.dtype([("which", _i8), ("spins", _i8, 4), ("fixed", _i8, 4)
                             ("count", _i8, 4), ("pointers", _i8)])
 TEMPLATE = np.dtype([("kind", _i8), ("positions", _i8, 4), ("part_start", _i8), ("part_count", _i8)])
 PART = np.dtype([("group", _i8), ("terms", _i8)])
-TERMS = np.dtype([("offsets", _i8), ("weights", _i8), ("count", _i8)])
+TERMS = np.dtype([("offsets", _i8), ("weights", _i8), ("count", _i8), ("nchains", _i8), ("members", _i8),
+                  ("tables", _i8, 2), ("strides", _i8, 2), ("lengths", _i8, 2), ("nv", _i8)])
 GROUP = np.dtype([("rows", _i8), ("coordinates", _i8), ("count", _i8)])
 SLOT = np.dtype([("cls", _i8), ("key", _i8), ("start", _i8), ("length", _i8), ("occupied", _i8, 4)])
 
@@ -86,7 +91,7 @@ _ARRAYS = ("kind_start", "kind_count", "inter_start", "inter_count", "instructio
            "plan_start", "plan_table", "plan_count", "plan_id", "ground_bases", "ground_keys",
            "direction_bases", "direction_keys", "occupied_irreps", "class_start", "class_count",
            "templates", "parts", "terms", "key_group_start", "groups", "slots", "fuse_start", "fuse_count",
-           "fuse_groups", "fuse_members", "tile_runs")
+           "fuse_groups", "fuse_members", "tile_runs", "tile_sizes")
 
 
 class ProgramStruct(ctypes.Structure):
@@ -149,6 +154,7 @@ class _Kind:
         self.code = []          # instruction tuples
         self.inters = []        # (template id, positions, shape)
         self.contracts = []     # (contraction number, fixed positions of its labels)
+        self.tile_layout = None  # compact tile layout (`SlotProgram._tile_layout`), None: dense
 
 
 class SlotProgram:
@@ -200,6 +206,7 @@ class SlotProgram:
         self._keep = []
         self._row_pointers, self._positioned_maps = {}, {}
         self._found_constraints, self._offset_groups, self._inter_sizes = None, {}, {}
+        self._tile_layouts, self._tile_layout_of, self._tile_views, self._tile_view_of = [], {}, [], {}
         self._prepare(engine)
 
     @staticmethod
@@ -277,14 +284,111 @@ class SlotProgram:
         # The program's own arrays (intermediates, the tile) keep virtual axes
         # in irrep order (see the module docstring).
         sides = spec.replace("->", ",").split(",")
-        operands = tuple((x[0] == ROWS, x[2], x[3],
-                          self._vpos is not None and x[0] in (INTER, TILE, ROWS)
-                          and tuple(c in _VIRTUAL and n == self.nv for c, n in zip(side, x[2])))
-                         for x, side in zip((a, b, out), sides))
+        operands = tuple((x[0] == ROWS, x[2], x[3], self._marks(x, side)) for x, side in zip((a, b, out), sides))
         identity = (spec, operands, tuple(labels), irreps, tuple(ordered))
         number = self._number(identity)
         kind.code.append((CONTRACT, -1, -1, len(kind.contracts), a, b, out, float(alpha), beta))
         kind.contracts.append((number, tuple(positions)))
+
+    def _marks(self, x, side):
+        """Per-axis markers of an operand's stored positions (`_placement`), or
+        False for a plain operand: the program's own arrays keep virtual axes
+        in irrep order, and a compact tile's chained axes are members of its
+        groups."""
+        layout, order = (None, None) if x[0] != TILE else self._tile_views[x[1]]
+        if layout is None and (self._vpos is None or x[0] not in (INTER, TILE, ROWS)):
+            return False
+        member = {}
+        if layout is not None:
+            for g, chain in enumerate(self._tile_layouts[layout]["chains"]):
+                for j, axis in enumerate(chain):
+                    member[axis] = ("tile", layout, g, j)
+        return tuple(member.get(order[k]) if order is not None and order[k] in member else
+                     bool(self._vpos is not None and c in _VIRTUAL and n == self.nv)
+                     for k, (c, n) in enumerate(zip(side, x[2])))
+
+    def _view(self, layout, order):
+        """The number of a view of a tile layout (tile axis of each view axis),
+        kept in a TILE operand's index."""
+        key = layout, tuple(order)
+        number = self._tile_view_of.get(key)
+        if number is None:
+            number = self._tile_view_of[key] = len(self._tile_views)
+            self._tile_views.append(key)
+        return number
+
+    def _tile_layout(self, group, raw):
+        """The compact layout of the tiles of a kind (an index into
+        `_tile_layouts`), or None for the dense nv^4 tile. Its products form
+        and its gathers read only entries whose particle letters keep the
+        group's order (`ordered_letters`): each chain of ordered letters is one
+        stored axis, the ranks of its kept tuples in the composites' order
+        (irrep, then index), the other axes as before."""
+        if not _runtime.enabled("ITERCC_COMPACT_TILES"):
+            return None
+        constraints = tuple(sorted(ordered_letters(self.groups[group][0], raw, "abcdijkl")))
+        if not constraints:
+            return None
+        found = self._tile_layout_of.get(constraints)
+        if found is not None:
+            return found
+        nv = self.nv
+        pairs = [("abcd".index(x), "abcd".index(y), strict) for x, y, strict in constraints]
+        parent = list(range(4))
+
+        def root(t):
+            while parent[t] != t:
+                t = parent[t]
+            return t
+        for x, y, _ in pairs:
+            parent[root(x)] = root(y)
+        chains = {}
+        for t in range(4):
+            chains.setdefault(root(t), []).append(t)
+        chains = [chain for chain in chains.values() if len(chain) > 1]
+        virtual = np.asarray(self.blocked.labels["a"], dtype=np.int64)
+        orbital_at = None if self._vpos is None else np.argsort(self._vpos)
+        tables, positioned, ranks = [], [], []
+        for chain in chains:
+            values = np.indices((nv,) * len(chain)).reshape(len(chain), -1)
+            keep = np.ones(values.shape[1], dtype=bool)
+            for x, y, strict in pairs:
+                if x in chain and y in chain:
+                    vx, vy = values[chain.index(x)], values[chain.index(y)]
+                    keep &= (vx < vy) if strict else (vx <= vy)
+            irreps = np.bitwise_xor.reduce(virtual[values], axis=0)
+            kept = np.flatnonzero(keep)
+            kept = kept[np.argsort(irreps[kept], kind="stable")]
+            table = np.full(values.shape[1], -1, dtype=np.int64)
+            table[kept] = np.arange(len(kept))
+            tables.append(table)
+            # The gathers' coordinates are stored positions: the same ranks by position.
+            positioned.append(np.ascontiguousarray(
+                table if orbital_at is None else
+                table.reshape((nv,) * len(chain))[np.ix_(*[orbital_at] * len(chain))].reshape(-1)))
+            ranks.append(len(kept))
+        axes, seen = [], set()
+        for t in range(4):
+            g = next((g for g, chain in enumerate(chains) if t in chain), None)
+            if g is None:
+                axes.append((t, nv))
+            elif g not in seen:
+                seen.add(g)
+                axes.append((("chain", g), ranks[g]))
+        steps, step = {}, 1
+        for axis, size in reversed(axes):
+            steps[axis] = step
+            step *= size
+        strides = tuple(8 * steps[next((("chain", g) for g, chain in enumerate(chains) if t in chain), t)]
+                        for t in range(4)) + (8,) * 4
+        number = self._tile_layout_of[constraints] = len(self._tile_layouts)
+        self._tile_layouts.append(dict(
+            chains=[tuple(chain) for chain in chains], size=step, strides=strides,
+            groups=[OffsetGroup((nv,) * len(chain), table, steps[("chain", g)])
+                    for g, (chain, table) in enumerate(zip(chains, tables))],
+            positioned=positioned, chain_strides=[steps[("chain", g)] for g in range(len(chains))],
+            plain_steps=tuple(0 if any(t in chain for chain in chains) else steps[t] for t in range(4))))
+        return number
 
     def _number(self, identity):
         """The contraction number of an identity (spec, operands, labels,
@@ -304,10 +408,13 @@ class SlotProgram:
 
     def _placement(self, marker):
         """An axis's stored positions from its marker in a contraction identity:
-        True: the virtual irrep order; False: none; ("group", identity, g):
-        group g of a compact intermediate."""
+        True: the virtual irrep order; False: none; ("group", identity, g, j):
+        member j of group g of a compact intermediate; ("tile", layout, g, j):
+        member j of group g of a compact tile layout."""
         if isinstance(marker, tuple):
-            return self._offset_groups[marker[1]][marker[2]]
+            groups = (self._offset_groups[marker[1]] if marker[0] == "group" else
+                      self._tile_layouts[marker[1]]["groups"])
+            return groups[marker[2]], marker[3]
         return self._vpos if marker else None
 
     def _compact_intermediates(self, found):
@@ -384,9 +491,9 @@ class SlotProgram:
             for axis, size in reversed(axes):
                 steps[axis] = step
                 step *= size
-            groups = [OffsetGroup(chain, sizes, table, steps[g]) for g, (chain, sizes, table, _) in enumerate(tables)]
+            groups = [OffsetGroup(sizes, table, steps[g]) for g, (chain, sizes, table, _) in enumerate(tables)]
             strides = tuple(8 * steps[group_of.get(c, c)] for c in letters)
-            layouts[identity] = (strides, step, group_of)
+            layouts[identity] = (strides, step, group_of, chains)
             self._offset_groups[identity] = groups
             self._inter_sizes[identity] = step
         if not layouts:
@@ -405,8 +512,9 @@ class SlotProgram:
                 for x, side, operand in zip((a, b, out), sides, operands):
                     if x[0] == INTER and kind.inters[x[1]][0] in layouts:
                         identity = kind.inters[x[1]][0]
-                        strides, _, group_of = layouts[identity]
-                        marks = tuple(("group", identity, group_of[c]) if c in group_of else
+                        strides, _, group_of, chains = layouts[identity]
+                        marks = tuple(("group", identity, group_of[c], chains[group_of[c]].index(c))
+                                      if c in group_of else
                                       bool(self._vpos is not None and c in _VIRTUAL and n == self.nv)
                                       for c, n in zip(side, x[2]))
                         new.append((False, operand[1], strides, marks))
@@ -484,8 +592,9 @@ class SlotProgram:
         pattern, with the tile's occupied tuple symbolic."""
         no, nv = self.no, self.nv
         kind = _Kind()
+        kind.tile_layout = layout = self._tile_layout(group, raw)
         tile_shape = (nv,) * 4 + (1,) * 4
-        tile_strides = _c_strides(tile_shape)
+        tile_strides = _c_strides(tile_shape) if layout is None else self._tile_layouts[layout]["strides"]
         known = {}                                  # symbolic expression -> intermediate
         for coefficient, spec, names in self.groups[group][2]:
             lhs, output = spec.split("->")
@@ -546,7 +655,7 @@ class SlotProgram:
                             known[key] = value
                             return value
 
-                        tile = (TILE, 0, tile_shape, tile_strides, None)
+                        tile = (TILE, self._view(layout, range(8)), tile_shape, tile_strides, None)
                         # Only the entries the projection reads (`ordered_letters`).
                         ordered = ordered_letters(self.groups[group][0], raw, output)
                         if len(names) == 2:
@@ -558,7 +667,7 @@ class SlotProgram:
                         tree = contraction_schedule(spec, no, nv, tuple(cut))
                         binary, left, right = tree
                         order = tuple(output.index(c) for c in binary.split("->")[1])
-                        view = (TILE, 0, tuple(tile_shape[o] for o in order),
+                        view = (TILE, self._view(layout, order), tuple(tile_shape[o] for o in order),
                                 tuple(tile_strides[o] for o in order), None)
                         a, b = evaluate(left), evaluate(right)
                         self._contract(kind, binary, a, b, view, coefficient, 1.0, selected,
@@ -644,10 +753,12 @@ class SlotProgram:
                         by_group.setdefault(pspin, (number, []))[1].append((p, sign))
             for (raw, fixed), by_group in scatter.items():
                 parts = []
+                kind = self._kind(group, raw)
+                layout = self._kinds[kind].tile_layout
                 for number, permutations in by_group.values():
                     terms = tuple((p, multiplicity * sign) for p, sign in permutations)
-                    parts.append((number, terms_of.setdefault(terms, len(terms_of))))
-                tiles.append((self._kind(group, raw), fixed, parts))
+                    parts.append((number, terms_of.setdefault((terms, layout), len(terms_of))))
+                tiles.append((kind, fixed, parts))
         return tiles
 
     def _prepare(self, engine):
@@ -707,13 +818,31 @@ class SlotProgram:
         self.class_start = np.asarray(class_start or [0], dtype=np.int64)
         self.class_count = np.asarray(class_count or [0], dtype=np.int64)
         terms = np.zeros(max(1, len(terms_of)), dtype=TERMS)
-        tile_steps = (nv**3, nv**2, nv, 1)
-        for permutations, number in terms_of.items():
-            offsets, factors = _gather_steps(permutations, tile_steps)
+        for (permutations, layout), number in terms_of.items():
+            if layout is None:
+                offsets, factors = _gather_steps(permutations, (nv**3, nv**2, nv, 1))
+                chains, members = (), np.zeros(1, dtype=np.int64)
+            else:
+                # Plain axes by strides; a chain's members (tile axes) by the
+                # coordinates feeding them, through the chain's rank table.
+                found = self._tile_layouts[layout]
+                offsets, factors = _gather_steps(permutations, found["plain_steps"])
+                chains = found["chains"]
+                members = np.zeros((len(permutations), 2, 4), dtype=np.int64)
+                for k, (p, _) in enumerate(permutations):
+                    for g, chain in enumerate(chains):
+                        members[k, g, :len(chain)] = [p[t] for t in chain]
             offsets = np.ascontiguousarray(offsets, dtype=np.int64)
             factors = np.ascontiguousarray(factors, dtype=np.float64)
-            self._keep.extend((offsets, factors))
-            terms[number] = (offsets.ctypes.data, factors.ctypes.data, len(permutations))
+            members = np.ascontiguousarray(members)
+            self._keep.extend((offsets, factors, members))
+            row = terms[number]
+            row["offsets"], row["weights"], row["count"] = offsets.ctypes.data, factors.ctypes.data, len(permutations)
+            row["nchains"], row["members"], row["nv"] = len(chains), members.ctypes.data, nv
+            for g, chain in enumerate(chains):
+                row["tables"][g] = found["positioned"][g].ctypes.data
+                row["strides"][g] = found["chain_strides"][g]
+                row["lengths"][g] = len(chain)
         self.terms = terms
         groups, key_group_start = [], []
         for found in key_groups:
@@ -873,6 +1002,9 @@ class SlotProgram:
                 runs[g] = where[0], where[-1] + 1
                 contiguous &= len(where) == where[-1] + 1 - where[0]
         arrays["tile_runs"] = runs
+        arrays["tile_sizes"] = np.asarray([self.nv**4 if kind.tile_layout is None else
+                                           self._tile_layouts[kind.tile_layout]["size"]
+                                           for kind in self._kinds] or [self.nv**4], dtype=np.int64)
         for name, array in arrays.items():
             if not array.flags.c_contiguous:
                 raise ValueError(f"{name} is not contiguous")

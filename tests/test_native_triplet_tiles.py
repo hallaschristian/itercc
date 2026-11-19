@@ -299,6 +299,22 @@ def test_compact_intermediates_keep_the_action(monkeypatch):
     assert program._offset_groups and program.intermediates["size"].sum() < dense
 
 
+def test_compact_tiles_keep_the_action(monkeypatch):
+    """Tiles store only the entries their kind's products form and its
+    gathers read (each chain of ordered particle letters one axis of ranks):
+    the action of dense tiles bit for bit."""
+    engine = _split_engine()
+    vector = np.random.default_rng(763).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_COMPACT_TILES", "0")
+    engine._slot_programs = {}
+    dense = engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_COMPACT_TILES", "1")
+    engine._slot_programs = {}
+    np.testing.assert_array_equal(engine.sigma(vector), dense)
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    assert program._tile_layouts and program._arrays["tile_sizes"].min() < engine.nvir**4
+
+
 def test_irrep_ordered_program_arrays_keep_the_action(monkeypatch):
     """Intermediates and tiles with virtual axes in irrep order (positions),
     tiles cleared only where symmetry allows entries: the action of the plain

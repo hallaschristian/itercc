@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 34
+#define ITERCC_CORE_ABI 35
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -753,9 +753,17 @@ typedef struct {
 } itercc_slot_part;
 
 typedef struct {
-    const int64_t *offsets;   /* four tile strides per term */
+    const int64_t *offsets;   /* four tile strides per term (0 for an axis of a chain) */
     const double *weights;
     int64_t count;
+    /* A compact tile: up to two chains of axes stored as the ranks of their
+     * tuples. Per term, members[(8 k) + 4 g + j] is the coordinate feeding
+     * member j of chain g; tables[g][flat] (flat over `lengths[g]` coordinates,
+     * base nv) its rank, times strides[g]. */
+    int64_t nchains;
+    const int64_t *members;
+    const int64_t *tables[2];
+    int64_t strides[2], lengths[2], nv;
 } itercc_slot_terms;
 
 typedef struct {
@@ -803,6 +811,9 @@ typedef struct {
      * gathers read, only entries whose particle irreps multiply to its holes'
      * product times tile_irrep, so only those are cleared. */
     const int64_t *tile_runs;
+    /* Doubles of each kind's tile (nv^4 dense, fewer for a compact layout:
+     * then the first tile_sizes[kind] doubles are cleared). */
+    const int64_t *tile_sizes;
     int64_t tile_irrep;
 } itercc_slot_program;
 

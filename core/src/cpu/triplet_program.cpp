@@ -397,7 +397,9 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
             const char *value = std::getenv("ITERCC_TILE_RUNS");
             return value == nullptr || value[0] != '0';
         }();
-        if (p.tile_runs == nullptr || !runs) {
+        if (p.tile_sizes[m.kind] < nv4) {
+            std::fill(tile, tile + p.tile_sizes[m.kind], 0.0);   // a compact tile
+        } else if (p.tile_runs == nullptr || !runs) {
             std::fill(tile, tile + nv4, 0.0);
         } else {
             // Only the symmetry-allowed entries (one run of the last letter per
@@ -530,7 +532,13 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
             double sum = 0.;
             for (i64 k = 0; k < t.count; ++k) {
                 const int64_t *step = t.offsets + 4 * k;
-                const i64 at = c[0] * step[0] + c[1] * step[1] + c[2] * step[2] + c[3] * step[3];
+                i64 at = c[0] * step[0] + c[1] * step[1] + c[2] * step[2] + c[3] * step[3];
+                for (i64 g = 0; g < t.nchains; ++g) {       // a compact tile's chains
+                    const int64_t *member = t.members + 8 * k + 4 * g;
+                    i64 flat = 0;
+                    for (i64 j = 0; j < t.lengths[g]; ++j) flat = flat * t.nv + c[member[j]];
+                    at += t.tables[g][flat] * t.strides[g];
+                }
                 sum += t.weights[k] * tile[at];
             }
             sums[r] = sum;

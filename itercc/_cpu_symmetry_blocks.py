@@ -18,7 +18,7 @@ import numpy as np
 from . import _cpu_kernels
 from ._runtime import cpu_threads
 from ._tensor_scatter import SignedRows
-from .symmetry_blocks import SymmetryBlocks, _offsets, positions_key
+from .symmetry_blocks import SymmetryBlocks, _offsets, _position_key, positions_key
 
 _COLUMNS = ("a_rows", "a_sum", "b_sum", "b_cols", "rpos", "cpos")
 
@@ -60,7 +60,8 @@ class CpuSymmetryBlocks(SymmetryBlocks):
 
     def _offsets(self, letters, extent, strides, composite, positions=None):
         positions = {c: p for c, p in (positions or {}).items() if c in letters and p is not None}
-        key = (composite[0], tuple(strides[c] for c in letters), tuple(sorted((c, id(p)) for c, p in positions.items())))
+        key = (composite[0], tuple(strides[c] for c in letters),
+               tuple(sorted((c, _position_key(p)) for c, p in positions.items())))
         hit = self._tables.get(key)
         if hit is None:
             hit = self._tables[key] = np.ascontiguousarray(
