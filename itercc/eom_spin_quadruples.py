@@ -344,7 +344,7 @@ class TripletEOMCCSDTQ:
         self.xp = xp = self.proxy.xp
         self.nocc, self.nvir = no, nv
         self._spatial_labels = {"o": labels[:no], "v": labels[no:]}
-        self._symmetry_engine = None
+        self._symmetry_engine = self._lower_engine = None
         if occupied_tiles and np.any(labels):
             # Symmetry-blocked tile products: cuBLAS grouped GEMMs on the GPU,
             # the compiled executor on the CPU.
@@ -361,6 +361,17 @@ class TripletEOMCCSDTQ:
                 from . import _cpu_quadruples
                 if _cpu_quadruples.available():
                     self._symmetry_engine = _cpu_quadruples.blocked_einsum(by_letter, "ijkl", nirrep)
+                    if _runtime.enabled("ITERCC_LOWER_WHOLE_HOLES"):
+                        # Ranks two and three keep every occupied axis whole: their
+                        # occupied letters join the GEMMs' rows, columns and sums
+                        # instead of one small GEMM per occupied tuple (a 3 x 7 x 210
+                        # block of lmde,cdeijk->cijklm at CuF size). Entries whose
+                        # occupied letters are out of order between the operands
+                        # are formed too, and never read. 13o/29v replay, 12
+                        # threads: six of the largest products 10.8 -> 1.8 s.
+                        self._lower_engine = _cpu_quadruples.blocked_einsum(by_letter, "", nirrep)
+        if self._lower_engine is None:
+            self._lower_engine = self._symmetry_engine
         self.occupied_tiles = occupied_tiles
         if packed_contractions is None:
             from . import _cpu_quadruples
@@ -558,7 +569,7 @@ class TripletEOMCCSDTQ:
                         continue        # another process's tile (see `lower_part`)
                     tile = contract_tile(xp, rank, raw, cuts, primal, tangent, no, nv,
                                          irrep=space.irrep, labels=self._spatial_labels,
-                                         engine=self._symmetry_engine, diagrams=diagrams,
+                                         engine=self._lower_engine, diagrams=diagrams,
                                          occupied_slab=self.occupied_slab, intermediates=intermediates,
                                          compiled_products=self.packed_contractions,
                                          out=self._lower_tile(rank),

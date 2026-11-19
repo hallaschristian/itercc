@@ -585,16 +585,16 @@ def test_cpu_triplet_occupied_tiles_use_the_executor(monkeypatch):
                                   occupied_tiles=tiles)
         assert (engine._symmetry_engine is not None) == tiles
         if tiles:
-            executor = engine._symmetry_engine
-            original = executor.einsum
+            # Rank four's executor, and that of ranks two and three (their
+            # occupied letters inside the GEMMs).
+            for executor in {id(x): x for x in (engine._symmetry_engine, engine._lower_engine)}.values():
+                def checked(spec, a, b, out, executor=executor, original=executor.einsum, **kwargs):
+                    plan, _ = executor.plan_for(spec, a, b, out, kwargs["labels"], kwargs["irreps"])
+                    if plan:
+                        compiled_specs.add(spec)
+                    return original(spec, a, b, out, **kwargs)
 
-            def checked(spec, a, b, out, **kwargs):
-                plan, _ = executor.plan_for(spec, a, b, out, kwargs["labels"], kwargs["irreps"])
-                if plan:
-                    compiled_specs.add(spec)
-                return original(spec, a, b, out, **kwargs)
-
-            monkeypatch.setattr(executor, "einsum", checked)
+                monkeypatch.setattr(executor, "einsum", checked)
         vector = engine.space.project(np.random.default_rng(5).normal(size=engine.space.size))
         actions.append(engine.sigma(vector))
     assert "klcd,abcdijkl->abij" in compiled_specs

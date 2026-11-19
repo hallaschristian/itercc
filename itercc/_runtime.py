@@ -87,6 +87,9 @@ SWITCHES = {
     "ITERCC_SLOT_POSITIONS": Switch(
         "1", "call", "`0`: triplet slot-program intermediates and tiles keep virtual axes in orbital "
         "order, not irrep order"),
+    "ITERCC_LOWER_WHOLE_HOLES": Switch(
+        "1", "construction", "`0`: the triplet engine's rank-two and rank-three products run one GEMM per "
+        "occupied tuple, as the rank-four tiles do, not with the occupied letters in the GEMMs"),
     "ITERCC_LOWER_TILE_REUSE": Switch(
         "1", "call", "`0`: the triplet engine's rank-two and rank-three tiles are fresh arrays in letter order, not "
         "one reused tile with its occupied axes outermost"),

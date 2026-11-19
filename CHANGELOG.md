@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- The triplet engine's rank-two and rank-three products keep their occupied
+  letters inside the GEMMs (`TripletEOMCCSDTQ._lower_engine`, a blocked
+  einsum without enumerated letters; `ITERCC_LOWER_WHOLE_HOLES=0` keeps one
+  GEMM per occupied tuple, as rank four does). Per occupied tuple the blocks
+  were tiny (lmde,cdeijk->cijklm: 3 x 7 x 210 at CuF size, the plain-loop
+  route); entries whose occupied letters are out of order between the two
+  operands are now formed too and never read. 13o/29v replay, 12 threads: six
+  of the largest products 10.8 -> 1.8 s; 6o/24v synthetic model, warm ranks
+  one to three 1.71 -> 1.12 s, the action moving at rounding (1.4e-14 of 58).
+  A warm CuF action on one Sapphire Rapids socket before this change (cProfile,
+  114.7 s): slot program 86.2 s, rank-four opened terms 9.2 s, ranks two and
+  three's opened terms 8.1 s and blocked products 6.9 s, R3 unpacking 1.8 s.
+
 - The triplet slot program runs each slot's tiles on one thread, in order,
   adding each tile's gathered sums into the slot's rows right away
   (`itercc_triplet_slots`; `ITERCC_SLOT_WAVES=1` keeps the waves). The waves
@@ -11,7 +24,11 @@
   additions in the same order, so the action is the same bit for bit, and no
   partial-sum buffer is allocated (8 GiB at CuF by default). 6o/24v, 12
   threads, warm: rank four 11.06 -> 6.62 s (gathers 29.1 -> 15.5 thread-s,
-  slot sums 4.6 -> 2.1, intermediates 14.4 -> 10.1).
+  slot sums 4.6 -> 2.1, intermediates 14.4 -> 10.1). CuF on one Sapphire
+  Rapids socket, same node, second action: 132.0 s with waves, 113.6 s slot
+  by slot (rank four 95.5 s; clearing 540 -> 185 thread-s, gathers 1309 ->
+  1135, slot sums 304 -> 193, cache waits 75 -> 4), peak 119.8 -> 112.4 GB,
+  bit for bit.
 - The triplet engine's rank-two and rank-three tiles (one per projection
   group and spin pattern, 135 per action, 429 MB each at CuF size) are one
   reused array stored with its occupied axes outermost

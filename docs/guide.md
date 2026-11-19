@@ -292,6 +292,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TRIPLET_FUSED` | call | `0`: triplet slot program adds products into a tile one by one (the loop's action bit for bit) |
 | `ITERCC_DIRECT_DENSE` | call | `0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
 | `ITERCC_SLOT_POSITIONS` | call | `0`: triplet slot-program intermediates and tiles keep virtual axes in orbital order, not irrep order |
+| `ITERCC_LOWER_WHOLE_HOLES` | construction | `0`: the triplet engine's rank-two and rank-three products run one GEMM per occupied tuple, as the rank-four tiles do, not with the occupied letters in the GEMMs |
 | `ITERCC_LOWER_TILE_REUSE` | call | `0`: the triplet engine's rank-two and rank-three tiles are fresh arrays in letter order, not one reused tile with its occupied axes outermost |
 | `ITERCC_SPIN_BLOCKED_T3` | construction | `0`: the triplet engine keeps T3 and each action's R3 as dense spin-orbital tensors, not their nonzero spin blocks |
 | `ITERCC_HOLES_FIRST` | call | `0`: triplet dense rank-three tensors with the occupied axes innermost, not outermost |
