@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Compact triplet slot-program tiles store their chains innermost and clear
+  only their symmetry-allowed entries (`itercc_slot_tile_axes`, core ABI 36):
+  a chain keeps every irrep, so clearing a compact tile whole wrote four
+  times the entries its products and gathers touch (C2v), and with a plain
+  virtual axis innermost an irrep's run was a few doubles, shorter than a
+  cache line; a chain's irrep is a run of hundreds of ranks. On one Sapphire
+  Rapids socket the clearing took the same wall time on 28 and 56 threads.
+  6o/24v synthetic model: clearing 6.5 -> 3.8 thread-s, gathers 37.9 -> 34.8,
+  rank four 14.7 -> 13.9 s, the same action bit for bit.
+  `ITERCC_TILE_CHAINS_INNER=0` keeps letter order, `ITERCC_TILE_RUNS=0`
+  clears tiles whole.
+- GEMMs of at most 16 rows read B in place (`ITERCC_GEMM_SKINNY`): fused
+  GEMMs (`skinny_driver`) and packed-T4 blocks (`packed_skinny`). With so few
+  rows each B value is used once, so packing it only copied it, and the g T4
+  intermediates' packed gathers ran sums outermost, nv^2 or more map entries
+  apart per value. B is read column by column with the micro kernel's
+  arithmetic, so results are the same bit for bit. The triplet slot
+  program's skinny tile products (2998 x 7 x 7 blocks, 7 x 965 x 30, ...)
+  took 228 of its 369 tile-product thread-s and the g T4 intermediates 146 of
+  its 254 intermediate thread-s on one Sapphire Rapids socket at CuF size.
+  CCSDTQ tile programs: unchanged (6o/29v, 7.2 s per evaluation).
 - Triplet slot-program gathers (tile -> packed rows) run term by term over
   every row of a part, with each term's steps, chain members and rank tables
   hoisted and the common chain shapes (one or two chains of two or three
@@ -9,7 +30,8 @@
   order, so the action is the same bit for bit. At CuF size the gathers read
   2.8e10 tile entries for the first 1500 slots (2.4 per row) and took 278
   thread-s on one Sapphire Rapids socket; 6o/24v synthetic model: gathers
-  70.7 -> 43.8 thread-s.
+  70.7 -> 43.8 thread-s. Sapphire Rapids (one socket, 56 threads, CuF, first
+  1500 slots): gathers 287 -> 168 thread-s, the slots 22.3 -> 20.6 s.
 - Triplet tile products sum an exchangeable pair once (`_spin_quadruples_tiles.
   exchange_pairs`, `paired_routes`). Two summed letters that every operand
   holding one holds both of, in one antisymmetric half (mn of g(oovv) T4,
@@ -23,6 +45,9 @@
   their multiply-adds fall 5.4e11 -> 3.0e11 and packed-T4 entries read
   7.6e10 -> 3.7e10, tile products 1.43e12 -> 1.24e12. 6o/24v synthetic
   model: rank four 16.6 -> 13.3 s, the action moving at rounding (2.8e-14).
+  Sapphire Rapids (one socket, 56 threads, CuF, first 1500 slots, both on one
+  node): 29.4 -> 22.3 s (intermediates 452 -> 254 thread-s, tile products
+  543 -> 369), the action moving by 2.3e-16 relative.
   The blocked engines (CPU and CUDA) take it in ranks two to four; a product
   that falls back to a plain einsum is scaled by 1/2 per pair.
   `ITERCC_PAIR_SUMS=0` sums both orders.
@@ -34,7 +59,9 @@
   array, and packing it for the tile GEMMs was 65% of their time on Sapphire
   Rapids. 6o/24v synthetic model: rank four 19.6 -> 16.8 s; the action moves
   at rounding (the planner orders composite letters by stride).
-  `ITERCC_HOLES_FIRST=0` keeps the usual layout.
+  `ITERCC_HOLES_FIRST=0` keeps the usual layout. On Sapphire Rapids at CuF
+  size (first 1500 slots) the slots took 29.2 s, as before (29.3-30.1 s):
+  there the tile GEMMs' B packing reads mostly cached intermediates.
 - Triplet slot-program tiles store only the entries their kind's products
   form and its gathers read: each chain of ordered particle letters (from one
   antisymmetric subset of the projection group, so always within one

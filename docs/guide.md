@@ -292,6 +292,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_HOLES_FIRST` | call | `0`: triplet dense rank-three tensors with the occupied axes innermost, not outermost |
 | `ITERCC_PAIR_SUMS` | call | `0`: triplet tile products sum both orders of an exchangeable pair of summed letters instead of x < y twice |
 | `ITERCC_COMPACT_TILES` | call | `0`: triplet slot-program tiles stored whole (nv^4), not only their ordered entries |
+| `ITERCC_TILE_CHAINS_INNER` | call | `0`: compact slot-program tiles store their axes in letter order, not chains innermost |
 | `ITERCC_COMPACT_INTERMEDIATES` | call | `0`: triplet slot-program intermediates stored whole, not only their ordered entries |
 | `ITERCC_ORDERED_INTERMEDIATES` | call | `0`: triplet slot-program intermediates formed at every entry, not only where their readers read |
 | `ITERCC_DIRECT_OPENED` | call | `0`: triplet rank-four direct packed T4 terms by contexts per output slot (`ITERCC_DIRECT_DENSE`) instead of one GEMM per hole tuple and class |

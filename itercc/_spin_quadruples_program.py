@@ -383,6 +383,12 @@ class SlotProgram:
             elif g not in seen:
                 seen.add(g)
                 axes.append((("chain", g), ranks[g]))
+        if _runtime.enabled("ITERCC_TILE_CHAINS_INNER"):
+            # Chains innermost: an irrep of a chain is a run of hundreds of
+            # ranks, of a plain axis a few positions (shorter than a cache
+            # line), so the symmetry-allowed entries a tile clears and touches
+            # lie in long runs.
+            axes.sort(key=lambda axis: isinstance(axis[0], tuple))
         steps, step = {}, 1
         for axis, size in reversed(axes):
             steps[axis] = step
