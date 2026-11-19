@@ -758,6 +758,73 @@ def test_cpu_finite_difference_eom_ccsdtq_matches_fci():
     assert abs(first.excitation_energies[0] - (singlets[1] - singlets[0])) < 2e-8
 
 
+def test_sector_labels_keep_the_target_totally_symmetric():
+    from itercc.spatial_symmetry import sector_labels
+
+    c2v = np.arange(4)
+    np.testing.assert_array_equal(sector_labels(c2v, 0), c2v)
+    np.testing.assert_array_equal(sector_labels(c2v, 1), [0, 0, 1, 1])
+    np.testing.assert_array_equal(sector_labels(c2v, 2), [0, 1, 0, 1])
+    np.testing.assert_array_equal(sector_labels(c2v, 3), [0, 1, 1, 0])
+    d2h = np.arange(8)
+    for irrep in range(1, 8):
+        kept = sector_labels(d2h, irrep)
+        assert kept.max() == 3 and len(set(kept.tolist())) == 4
+        assert all(kept[x ^ y] == kept[x] ^ kept[y] for x in range(8) for y in range(8))
+        assert all(kept[x ^ irrep] == kept[x] for x in range(8))
+
+
+@pytest.mark.parametrize("irrep", [0, 1, 2])
+def test_cpu_singlet_eom_sector_paths_agree(irrep):
+    """Singlet EOM-CCSDTQ actions of a C2v model: on the dense layout with the
+    central difference (no labels), with one residual per action (nonzero
+    irreps: the sector part of Res(T + eps R) is the central difference, bit
+    for bit), and with a solver in the subgroup that keeps the target totally
+    symmetric (symmetry-blocked GEMMs, compressed T4, internal virtual order)."""
+    from itercc import _cpu_quadruples
+    from itercc.eom_ccsdtq import FiniteDifferenceEOM
+    from itercc.spatial_symmetry import sector_labels
+
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    model = symmetric_model()
+    dense = RestrictedCCSDTQ(*model, backend="cpu")
+    ground = dense.solve(max_iter=3, damping=0.2, diis_size=0).amplitudes
+    reference = FiniteDifferenceEOM(dense, ground, LABELS, irrep, one_sided=False)
+    vector = np.random.default_rng(13 + irrep).normal(size=reference.space.size)
+    base = reference.sigma(vector)
+    scale = np.abs(base).max()
+    if irrep:
+        one_sided = FiniteDifferenceEOM(dense, ground, LABELS, irrep)
+        assert one_sided.one_sided
+        np.testing.assert_array_equal(one_sided.sigma(vector), base)
+    solver = RestrictedCCSDTQ(*model, backend="cpu", orbital_irreps=sector_labels(LABELS, irrep))
+    assert solver.layout.symmetric and solver.layout.size < dense.layout.size
+    converted = solver.combine_states([(1.0, ground, None)])
+    engine = FiniteDifferenceEOM(solver, converted, LABELS, irrep)
+    assert engine.one_sided == bool(irrep)
+    np.testing.assert_array_equal(engine.diagonal, reference.diagonal)
+    np.testing.assert_allclose(engine.sigma(vector), base, rtol=0, atol=(1e-14 if irrep else 1e-10) * scale)
+    omega = float(vector @ base) / float(vector @ vector)
+    assert engine.full_residual_norm(vector, omega) == pytest.approx(
+        reference.full_residual_norm(vector, omega), rel=1e-9)
+    # The rank-four positions exist only when asked for.
+    assert engine.space._indices is None
+    np.testing.assert_array_equal(np.concatenate(engine.space.indices), np.concatenate(reference.space.indices))
+
+
+def test_cpu_singlet_eom_refuses_labels_that_split_the_sector():
+    from itercc import _cpu_quadruples
+    from itercc.eom_ccsdtq import FiniteDifferenceEOM
+
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    model = symmetric_model()
+    solver = RestrictedCCSDTQ(*model, backend="cpu", orbital_irreps=LABELS)
+    with pytest.raises(ValueError, match="sector_labels"):
+        FiniteDifferenceEOM(solver, None, LABELS, 2)
+
+
 def test_fused_gemm_orientations_agree():
     """Fused tile GEMMs give the same bits whichever orientation they take (the
     core picks the one that fills the register tiles better per product)."""

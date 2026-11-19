@@ -161,3 +161,21 @@ def conserved_labels(labels, broken):
         labels = np.where(labels & bit, labels ^ p, labels)
         pending = [q ^ p if q & bit else q for q in pending]
     return labels
+
+
+def sector_labels(labels, irrep):
+    """Labels 0, 1, ... of the largest subgroup in which `irrep` is totally
+    symmetric (`conserved_labels` with each divided-out bit removed, so no
+    irrep is empty): a totally symmetric ground state and an excited state of
+    `irrep` both lie in its totally symmetric sector, so the CCSDTQ residual
+    of T + eps R keeps that subgroup's symmetry blocks. irrep 0: the labels.
+    C2v (A1, A2, B1, B2 = 0, 1, 2, 3): A2 [0, 0, 1, 1], B1 [0, 1, 0, 1], B2
+    [0, 1, 1, 0]."""
+    labels = np.array(labels, dtype=np.int64)
+    if not 0 <= int(irrep) <= 7:
+        raise ValueError("Expected an Abelian irrep 0..7")
+    if not irrep:
+        return labels
+    reduced = conserved_labels(labels, [int(irrep)])
+    bit = 1 << (int(irrep).bit_length() - 1)          # cleared in every label
+    return (reduced & (bit - 1)) | ((reduced >> 1) & ~(bit - 1))

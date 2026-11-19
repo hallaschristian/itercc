@@ -93,6 +93,10 @@ SWITCHES = {
     "ITERCC_LOWER_TILE_REUSE": Switch(
         "1", "call", "`0`: the triplet engine's rank-two and rank-three tiles are fresh arrays in letter order, not "
         "one reused tile with its occupied axes outermost"),
+    "ITERCC_RELEASE_CACHE": Switch(
+        "1", "call", "`0`: the triplet slot program's freed intermediate cache stays with the allocator until the "
+        "next action instead of going back to the kernel (fewer page faults, up to the cache size more "
+        "resident memory)"),
     "ITERCC_SPIN_BLOCKED_T3": Switch(
         "1", "construction", "`0`: the triplet engine keeps T3 and each action's R3 as dense spin-orbital "
         "tensors, not their nonzero spin blocks"),

@@ -323,6 +323,35 @@ def test_merged_tiles_keep_the_action(monkeypatch):
     np.testing.assert_allclose(merged, separate, rtol=0, atol=1e-13 * np.abs(separate).max())
 
 
+def test_single_precision_intermediates():
+    """intermediate_precision="single": each slot-program intermediate is
+    rounded to float32 once formed. The action stays within float32 rounding
+    of the double one, with half the cached bytes, and the same values on any
+    number of threads, with shared pieces, and whether products run fused or
+    in place read double copies (to rounding)."""
+    from itercc._cpu_triples import thread_scope
+    engine = _triplet_engine(packed_spin=True, intermediate_cache_gib=0.0001)
+    vector = np.random.default_rng(773).normal(size=engine.space.size)
+    double = engine.sigma(vector)
+    double_peak = engine.last_intermediate_cache["peak_bytes"]
+    engine.intermediate_precision = "single"
+    with thread_scope(1):
+        single = engine._action(vector)
+    assert 0 < engine.last_intermediate_cache["peak_bytes"] <= double_peak // 2 + 8
+    assert not np.array_equal(single, double)
+    np.testing.assert_allclose(single, double, rtol=0, atol=1e-6 * np.abs(double).max())
+    engine.share_work = 1
+    for threads in (2, 4):
+        with thread_scope(threads):
+            np.testing.assert_array_equal(engine._action(vector), single)
+    engine.share_work = None
+    engine.fused_tiles = False          # every product in place: double copies of the intermediates
+    unfused = engine._action(vector)
+    np.testing.assert_allclose(unfused, single, rtol=0, atol=1e-12 * np.abs(double).max())
+    with pytest.raises(ValueError, match="precision"):
+        _triplet_engine(packed_spin=True, intermediate_precision="half")
+
+
 def test_complex_vectors_run_the_compiled_program():
     """The real and imaginary parts of a complex vector are strided views: the
     compiled slot program gets contiguous copies."""

@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 39
+CORE_ABI = 41
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -49,6 +49,7 @@ CPU_FUNCTIONS = {
     "purify": ([_P, _I, _I, _T], None),
     "triples_step": ([_P, _I, _I, _P, _P, _D, _T], None),
     "max_abs": ([_P, _I, _T], _D),
+    "sector_rows": ([_P, _I, _P, _P, _P, _P, _P, _P, _D, _T, _T], None),
     "t3_pack": ([_P, _I, _I, _I, _P, _P, _P, _P, _P, _P, _T], None),
     "t3_unpack": ([_P, _I, _I, _I, _P, _P, _P, _P, _P, _P, _T], None),
     "t3_leakage": ([_P, _I, _I, _P, _P, _T], _D),
@@ -274,6 +275,22 @@ def keep_freed_memory():
 
 _GLIBC_SETTINGS = ("MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_", "MALLOC_MMAP_MAX_")
 _heap = {"depth": 0}
+
+
+def release_free_memory():
+    """Return the allocator's free heap pages to the kernel (glibc
+    `malloc_trim(0)`), for a phase whose freed blocks the next phases do not
+    reuse: blocks below 32 MiB come from the heap (`keep_freed_memory`), so
+    after the triplet slot program its freed intermediate cache stays
+    resident (64 GiB at CuF size) while the direct terms and the solver's
+    vectors are mapped on top. A no-op where `keep_freed_memory` does not
+    apply and inside a `heap_scope`. Returns whether memory was released."""
+    if not keep_freed_memory() or "libc" not in _state:
+        return False
+    with _lock:
+        if _heap["depth"]:
+            return False
+        return bool(_state["libc"][1](0))
 
 
 class heap_scope:

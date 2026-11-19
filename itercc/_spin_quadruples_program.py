@@ -1157,9 +1157,10 @@ class SlotProgram:
         self._arrays = arrays
 
     def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,
-            share_work=0, progress=None, slots=None, partial_bytes=None):
+            share_work=0, progress=None, slots=None, partial_bytes=None, single=False):
         """Add the projected rank-four slots into `result` (zero on entry: the
-        slots' rows get the Python loop's values). `slots` (increasing slot
+        slots' rows get the Python loop's values; with `single`, intermediates
+        rounded to float32 once formed). `slots` (increasing slot
         indices) runs only those slots, `slot_limit` the first ones; each slot
         writes only its own rows, with the same values whichever slots run with
         it. `progress(done)` is called after each wave of slots. Returns the
@@ -1207,7 +1208,8 @@ class SlotProgram:
             ctypes.byref(struct), nslots, partial, pointers.ctypes.data,
             None if ground is None else ground.ctypes.data,
             None if direction is None else direction.ctypes.data,
-            result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads), int(bool(fused)),
+            result.ctypes.data, int(cache_bytes), stats.ctypes.data, int(threads),
+            int(bool(fused)) | (2 if single else 0),
             int(share_work), ctypes.cast(callback, ctypes.c_void_p) if callback is not None else None)
         if status == 2:
             raise MemoryError("The compiled slot program ran out of memory (a smaller intermediate cache "

@@ -48,7 +48,10 @@ Deliberate exceptions, measured on water cc-pVDZ (12 threads):
   compiled slot program: 0.63 of 2.98 s per action here, a few percent on
   CuF (13 occupied, 47 virtual).
 - **Finite-difference EOM-CCSDTQ** (`eom_ccsdtq.py`) differentiates the
-  CCSDTQ residual numerically on dense T4: a reference for small systems.
+  CCSDTQ residual numerically: one residual per action for a nonzero target
+  irrep, two for the totally symmetric one, each with the symmetry blocks of
+  the subgroup that keeps the target sector (`sector_labels`), not the
+  analytic tangent of every quadruples term.
 - **CUDA CCSDT** keeps its dense-slot T3 layout (`CudaTriplesLayout`), and
   its fused kernels stay options because their support masks are
   ground-state specific; `restricted.cuda_options()` is the one production

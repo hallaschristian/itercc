@@ -260,7 +260,7 @@ class TripletEOMCCSDTQ:
     def __init__(self, solver, amplitudes, orbital_irreps=None, irrep=0, *,
                  backend="cpu", memory_budget_gib=4, occupied_tiles=False, action_only=False,
                  packed_spin=False, packed_contractions=None, intermediate_cache_gib=0,
-                 occupied_slab=None, cpu_threads=None, partial_sums_gib=None):
+                 occupied_slab=None, cpu_threads=None, partial_sums_gib=None, intermediate_precision="double"):
         no, nv = solver.nocc, solver.nvir
         # Kernel threads of every action and solve: the option, else the
         # ground-state solver's.
@@ -295,6 +295,16 @@ class TripletEOMCCSDTQ:
         if partial_sums_gib is not None and (not np.isfinite(partial_sums_gib) or partial_sums_gib <= 0):
             raise ValueError("Partial sums need a positive finite budget")
         self.partial_sums_bytes = (None if partial_sums_gib is None else int(partial_sums_gib * 2**30))
+        # "single": the compiled slot program rounds each intermediate to
+        # float32 once it is formed (half the bytes cached and read by the
+        # tile GEMMs; operands, tiles, sums and the action stay float64).
+        # Opt-in: it changes the action at about 1e-7 relative. Elsewhere
+        # (the Python loop, the GPU) intermediates are float64.
+        if intermediate_precision not in ("double", "single"):
+            raise ValueError("Intermediate precision must be 'double' or 'single'")
+        if intermediate_precision == "single" and backend != "cpu":
+            raise ValueError("Single-precision intermediates need the CPU backend")
+        self.intermediate_precision = intermediate_precision
         self._packed_direction = packed_spin or action_only
         if self._packed_direction and not occupied_tiles:
             raise ValueError("The packed spin layout requires occupied tiling")
@@ -479,7 +489,7 @@ class TripletEOMCCSDTQ:
         return diagonal
 
     def _tiled_action(self, blocks, rank, packed_direction, *, slot_limit=None, slot_finished=None,
-                      packed_action=None, intermediates=None):
+                      packed_action=None, intermediates=None, out=None):
         xp = self.xp
         no, nv = self.nocc, self.nvir
         primal = {name: spin_blocks(pair.value) for name, pair in blocks.items()}
@@ -510,7 +520,8 @@ class TripletEOMCCSDTQ:
             tensors["t4"] = {signature: view(signature) for signature in product((0, 1), repeat=8)}
         space = self.space
         if rank == 4 and self._packed_direction:
-            result = xp.zeros(self._direction_t4.size)
+            # `out`: the rank-four rows of the action's image (zero on entry).
+            result = xp.zeros(self._direction_t4.size) if out is None else out
             if self._compiled_slots(blocks, packed_direction, result, slot_limit, slot_finished, packed_action):
                 yield None, result
                 return
@@ -640,7 +651,14 @@ class TripletEOMCCSDTQ:
                 slot_finished(slots, total, perf_counter() - started)
         self._program_cache = program.run(blocks, self.amplitudes[3], direction, result, cache_bytes=cache,
                                           threads=cpu_threads(), slot_limit=done, fused=fused, share_work=share,
-                                          progress=report, slots=chosen, partial_bytes=partial)
+                                          progress=report, slots=chosen, partial_bytes=partial,
+                                          single=self.intermediate_precision == "single")
+        if _runtime.enabled("ITERCC_RELEASE_CACHE"):
+            # The program's freed cache (small blocks, kept by the allocator)
+            # back to the kernel: the direct terms' buffers and the solver's
+            # vectors would otherwise be mapped on top of it.
+            from ._core import release_free_memory
+            release_free_memory()
         if packed_action is not None and done:
             # The direct packed terms of these slots (`add_rank_four`).
             packed_action.add_rank_four(result, np.arange(done) if chosen is None else chosen)
@@ -832,13 +850,21 @@ class TripletEOMCCSDTQ:
             from ._spin_quadruples_cpu import PackedBinaryAction
             packed_action = PackedBinaryAction(self, blocks,
                                               vector[self.space.slices[3]] if nonzero[3] else None)
-        outputs = []
         self._program_cache = None
         from ._intermediate_cache import IntermediateCache
         intermediates = IntermediateCache(self.intermediate_cache_bytes) if self.intermediate_cache_bytes else None
-        for rank in ranks:
+        # One output for the requested ranks, each rank's rows written into
+        # its section (rank four's compiled slots in place): no second copy
+        # of the image (2.8 GB at CuF size) to concatenate them.
+        ranks = tuple(ranks)
+        lengths = [self.space.slices[rank - 1].stop - self.space.slices[rank - 1].start for rank in ranks]
+        image = xp.zeros(sum(lengths))
+        at = 0
+        for rank, length in zip(ranks, lengths):
             start = perf_counter() if rank_finished is not None else 0.
             shape = self.space.shapes[rank - 1]
+            section = image[at:at + length]
+            at += length
             if rank == 4 and intermediates is not None and self.slot_program and xp is np:
                 # The compiled slot program keeps its own cache of the same
                 # budget: free the lower ranks' products first, or the process
@@ -850,11 +876,8 @@ class TripletEOMCCSDTQ:
                     r4 = r4[self._tiled_r4_order]
                 tiles = self._tiled_action(blocks, rank, r4, slot_limit=slot_limit,
                                            slot_finished=slot_finished, packed_action=packed_action,
-                                           intermediates=intermediates)
-                if rank == 4:
-                    outputs.append(next(tiles)[1])
-                else:
-                    outputs.append(self._project_lower_tiles(rank, tiles))
+                                           intermediates=intermediates, out=section if rank == 4 else None)
+                rows = next(tiles)[1] if rank == 4 else self._project_lower_tiles(rank, tiles)
             else:
                 result = xp.zeros(shape)
                 for coefficient, spec, names in DIAGRAMS[rank]:
@@ -863,9 +886,13 @@ class TripletEOMCCSDTQ:
                             _blocked_einsum_into(xp, result, coefficient, spec, *operands)
                         else:
                             einsum_into(xp, result, coefficient, spec, *operands)
-                outputs.append(_antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])])
+                rows = _antisymmetrize(xp, result)[tuple(self.space.indices[rank - 1])]
+                del result
+            if rows is not section:
+                section[...] = rows
+            del rows
             if packed_action is not None and 1 < rank < 4 and not (self.lower_part or (0,))[0]:
-                packed_action.add_lower(rank, outputs[-1])
+                packed_action.add_lower(rank, section)
             if rank_finished is not None:
                 if xp is not np:
                     xp.cuda.get_current_stream().synchronize()
@@ -875,7 +902,7 @@ class TripletEOMCCSDTQ:
                                         dict(hits=intermediates.hits, misses=intermediates.misses,
                                              peak_bytes=intermediates.peak_bytes))
         self._gather_plans = {}
-        return xp.concatenate(outputs)
+        return image
 
     @_runtime.threaded
     def probe_rank_four(self, vector, slots):

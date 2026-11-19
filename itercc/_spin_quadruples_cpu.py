@@ -646,10 +646,10 @@ class PackedBinaryAction:
         built = self._opened_layout(slots)
         engine = self.engine
         need = max((3 if t["kh"] == 1 else 5 if t["kh"] == 2 else 0) for _, t in families) * built["buffer_rows"]
-        buffers = engine.__dict__.get("_opened_buffers")
-        if buffers is None or buffers.size < max(need, 1):
-            buffers = engine._opened_buffers = None
-            buffers = engine._opened_buffers = np.empty(max(need, 1))
+        # Up to five rows of the output per position set of the opened holes
+        # (14 GB at CuF size): mapped for this call only, not kept between
+        # actions (the kernel clears them on all threads anyway).
+        buffers = np.empty(max(need, 1))
         threads = cpu_threads(None)
         for derivative, tables in families:
             struct = self._opened_struct(derivative, tables)

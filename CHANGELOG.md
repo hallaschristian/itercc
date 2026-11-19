@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- Singlet EOM-CCSDTQ (`FiniteDifferenceEOM`) runs on symmetry-blocked
+  solvers: with `orbital_irreps=spatial_symmetry.sector_labels(labels,
+  irrep)` (the full group for irrep 0, the subgroup of half its order in
+  which the target irrep is totally symmetric otherwise) the residuals use
+  compressed T4 and blocked GEMMs instead of C1 on dense T4, and
+  `combine_states` re-lays archived ground states into that layout. For a
+  nonzero target irrep one residual per action replaces the central
+  difference (`one_sided`, the CPU default): the sector part of
+  Res(T + eps R) holds only odd powers of eps, so over eps it equals the
+  central difference term for term (bit for bit on the dense layout). The
+  EOM vector is packed and shifted through per-class tables of slot
+  positions in parallel (`itercc_sector_rows`, core ABI 41) instead of
+  single-threaded NumPy indexing with an int64 index per entry (58 GB for
+  CuF in aug-cc-pVDZ, now formed only if `indices` is read); its order is
+  unchanged, so earlier Ritz vectors restart the new engine. C2v model, 4
+  occupied and 20 virtual orbitals, 12 threads: 1.07 s per action -> 0.21 s
+  (B1, A2) and 0.25 s (A1), the same actions to 3e-16 (7e-13 for A1). CuF in
+  aug-cc-pVDZ-DK (13 occupied, 63 virtual, 7.3e9 EOM parameters) on one
+  Sapphire Rapids socket, 56 threads: B1 18.2 min per action (subgroup T4
+  107 GB, peak 519 GB; the central difference on the same solver 35.8 min
+  and the same action bit for bit), A1 11.8 min (C2v T4 54 GB, peak 420
+  GB); archived ground state re-laid in 7 min, engine 1 min, ground energy
+  reproduced exactly. Dense C1 actions on 48 cores of an AMD Genoa node had
+  not finished after 83 minutes, at a peak of 1.0 TB.
+
+- Less resident memory in triplet EOM-CCSDTQ solves. The slot program's
+  freed intermediate cache (blocks of a few MB, kept by glibc) goes back to
+  the kernel when the program ends (`_core.release_free_memory`,
+  `ITERCC_RELEASE_CACHE=0` keeps it), so the direct terms and the solver's
+  vectors are no longer mapped on top of it; the opened direct terms' buffers
+  (up to five rows of R4, 14 GB at CuF size) are mapped per call instead of
+  kept on the engine; an action writes each rank into one image instead of
+  concatenating them; Davidson's preconditioner and Ritz residuals update in
+  place chunk by chunk (no full-length temporaries; the same values) and sort
+  the diagonal only when unit vectors are needed. CuF on one Sapphire Rapids
+  socket, three Davidson iterations from the converged B1 root: peak 137.4 GB
+  (834ad7d, double, 64 GiB cache) -> 120.0 GB, between actions
+  110-124 -> 43-54 GB, 488 -> 460 s; with single-precision intermediates and
+  a 32 GiB cache 87.9 GB, 436 s.
+
+- Opt-in single-precision intermediates for the triplet slot program:
+  `TripletEOMCCSDTQ(..., intermediate_precision="single")` (the CuF driver's
+  `--intermediate-precision single`; flags bit 1 of `itercc_triplet_slots`,
+  core ABI 40). Each intermediate is formed in double and rounded once to
+  float32 when its product is done; the cache holds the float values (half
+  the bytes, so twice the intermediates for a budget), the fused tile GEMMs
+  widen them as they pack them, and products that run in place read a
+  double copy made once per tile. Operands, tiles, gathers and the action
+  stay float64, and every reader sees the same rounded values, so the action
+  does not depend on the thread count, shared pieces or the cache size
+  (checked bit for bit). The default stays "double". 6o/24v synthetic model,
+  12 threads, warm rank four: with a 1 GiB cache 13.4 -> 8.75 s (misses
+  254k -> 159k, intermediates 63 -> 38 thread-s, tile products 38 -> 30),
+  with 8 GiB 5.55 -> 4.84 s (tile products 33 -> 27 thread-s, cache peak
+  5.3 -> 2.6 GB); the action moves by 4.7e-11 relative (norm). CuF on one
+  Sapphire Rapids socket, on the converged B1 root (0.0785964226 Eh): the
+  action moves by 5.6e-8 relative (rank four only), the Rayleigh quotient by
+  -4.4e-12 Eh and the residual norm from 8.12653e-7 to 8.12689e-7. Warm
+  actions: double with a 64 GiB cache 94.6 s, single 85.6 s (every distinct
+  intermediate fits: 37 GB cached), single with a 32 GiB cache 87.7 s at a
+  peak of 80 GB (double, 64 GiB: 115 GB).
+
 - With fused products (the default), the triplet slot program merges a slot's
   tiles of one kind whose gathers agree up to a sign
   (`SlotProgram._merge_tiles`, `itercc_slot_program.merge_order`, core ABI

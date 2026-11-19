@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 39
+#define ITERCC_CORE_ABI 41
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -279,6 +279,14 @@ void itercc_triples_step(double *r3, int64_t nslots, int64_t nv3, const double *
 
 /* Vector operations for the solver loop. */
 double itercc_max_abs(const double *x, int64_t n, int threads);
+/* The entries of an amplitude sector by slot (EOM vectors in a symmetry
+ * sector): slot s's are storage[offsets[s] + tables[classes[s]][k]], k <
+ * lengths[classes[s]], in the order of vector[starts[s] + k]. mode 0:
+ * vector = entries; 1: entries += scale * vector; 2: entries = scale *
+ * vector. Slots in parallel (a slot's entries distinct). */
+void itercc_sector_rows(double *storage, int64_t nslots, const int64_t *offsets, const int64_t *classes,
+                          const int64_t *const *tables, const int64_t *lengths, const int64_t *starts,
+                          double *vector, double scale, int mode, int threads);
 
 /* Symmetry-blocked restricted T3 (see core/src/cpu/blocked.cpp and
  * itercc/_blocked.py for the layout). */
@@ -851,16 +859,20 @@ typedef struct {
  * pieces of those of at least share_work multiply-adds (0: 2^22) also with
  * the tiles waiting for them (the same values whoever runs them); stats (five
  * entries) gets the cache's hits, misses and peak bytes, the intermediates
- * shared in pieces and the pieces run by waiting tiles. With `fused`, the products of a
- * fusion group run after the tile's other instructions as fused GEMMs, one
- * per block of output rows and columns (other sums, so other rounding);
- * without, every product runs in place, as the Python loop does. The results
- * do not depend on the thread count. `progress` (may be NULL) gets the slots
+ * shared in pieces and the pieces run by waiting tiles. With flags bit 0
+ * (fused), the products of a fusion group run after the tile's other
+ * instructions as fused GEMMs, one per block of output rows and columns
+ * (other sums, so other rounding); without, every product runs in place, as
+ * the Python loop does. With flags bit 1 (single), every intermediate is
+ * formed in double and rounded once to float when its product is done (half
+ * the bytes in the cache and in the GEMMs that read it; products in place
+ * read a double copy): the same values whichever tile forms it. The results
+ * do not depend on the thread count or the cache size. `progress` (may be NULL) gets the slots
  * done after each wave, or every 1/64 of the slots, on the calling thread. Returns 0, or 1 (nothing done)
  * for a tile without a plan. */
 int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
                          const double *const *bases, const double *ground, const double *direction,
-                         double *result, int64_t cache_bytes, int64_t *stats, int threads, int fused,
+                         double *result, int64_t cache_bytes, int64_t *stats, int threads, int flags,
                          int64_t share_work, void (*progress)(int64_t done, int64_t total));
 /* Diagnostic thread seconds of itercc_triplet_slots by phase (with
  * ITERCC_SLOT_PROFILE=1): zeroing, products into tiles, into intermediates,

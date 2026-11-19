@@ -110,6 +110,31 @@ states.excitation_energies, states.total_energies, states.converged
 - Not implemented: left eigenvectors, transition moments, oscillator
   strengths. Experimental: triplet (spin-flip) EOM-CCSDTQ (`TripletEOMCCSDTQ`).
 
+Singlet EOM-CCSDTQ (`itercc.eom_ccsdtq.FiniteDifferenceEOM`) differentiates
+the CCSDTQ residual numerically. Give its solver the labels of the subgroup in
+which the target irrep is totally symmetric, so both the ground state and
+T + eps R keep that subgroup's symmetry blocks:
+
+```python
+from itercc.spatial_symmetry import sector_labels
+
+solver = RestrictedCCSDTQ(h, eri, nocc, constant, backend="cpu", block_size=1,
+                          orbital_irreps=sector_labels(labels, irrep))
+ground = solver.combine_states([(1.0, archived_amplitudes, archived_signature)])
+eom = FiniteDifferenceEOM(solver, ground, labels, irrep)
+```
+
+`sector_labels` keeps the full group for irrep 0 and a subgroup of half its
+order otherwise (C2v B1: labels mod B1, two irreps); `combine_states` re-lays
+saved amplitudes of any symmetry into the solver's layout. For a target irrep
+other than the totally symmetric one, one residual per action replaces the
+central difference: the sector part of Res(T + eps R) has only odd powers of
+eps, so over eps it equals the central difference term for term. Without labels the solver runs every
+GEMM as C1 on dense T4: on a C2v model (4 occupied, 20 virtual) an action
+took 1.07 s that way, 0.21 s (B1, A2) and 0.25 s (A1) with sector labels, the
+same action to 3e-16 (7e-13 for A1, the central difference's rounding). The
+integrals must be symmetric (`project_integrals`).
+
 For CPU triplet EOM-CCSDTQ, `occupied_tiles=True, packed_spin=True` uses the
 compiled canonical spin-orbital contractions when the CPU core is available.
 They avoid dense T4 expansions in lower-rank feedback and part of the
@@ -145,6 +170,15 @@ the program takes half of what `memory_budget_gib` leaves beside the
 engine's estimate (which counts the program's tiles and buffers). Progress
 callbacks arrive every 1/64 of the slots (after each wave with waves). The action agrees with the earlier Python slot loop to round-off, and
 bit for bit with `ITERCC_TRIPLET_FUSED=0`; the switches below fall back.
+`intermediate_precision="single"` (opt-in, CPU only) rounds each of the
+program's intermediates to float32 once it is formed: the cache holds twice
+as many for its budget and the tile GEMMs read half the bytes, while
+operands, tiles and the action stay float64. Every tile reads the same
+rounded values, so the action still does not depend on threads or cache
+size. On the converged CuF B1 root the action moved by 5.6e-8 relative and
+the Rayleigh quotient by 4e-12 Eh; a 32 GiB single-precision cache ran as
+fast as 64 GiB in double (one socket: 87.7 against 94.6 s per action) at a
+peak of 80 instead of 115 GB.
 An action can also be shared by processes, one per socket (or node):
 `itercc._slot_split.Partners(engine, builder, kwargs, parts=2)` starts
 workers that build the same engine, deals the rank-four slots out in blocks
@@ -294,6 +328,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_SLOT_POSITIONS` | call | `0`: triplet slot-program intermediates and tiles keep virtual axes in orbital order, not irrep order |
 | `ITERCC_LOWER_WHOLE_HOLES` | construction | `0`: the triplet engine's rank-two and rank-three products run one GEMM per occupied tuple, as the rank-four tiles do, not with the occupied letters in the GEMMs |
 | `ITERCC_LOWER_TILE_REUSE` | call | `0`: the triplet engine's rank-two and rank-three tiles are fresh arrays in letter order, not one reused tile with its occupied axes outermost |
+| `ITERCC_RELEASE_CACHE` | call | `0`: the triplet slot program's freed intermediate cache stays with the allocator until the next action instead of going back to the kernel (fewer page faults, up to the cache size more resident memory) |
 | `ITERCC_SPIN_BLOCKED_T3` | construction | `0`: the triplet engine keeps T3 and each action's R3 as dense spin-orbital tensors, not their nonzero spin blocks |
 | `ITERCC_HOLES_FIRST` | call | `0`: triplet dense rank-three tensors with the occupied axes innermost, not outermost |
 | `ITERCC_PAIR_SUMS` | call | `0`: triplet tile products sum both orders of an exchangeable pair of summed letters instead of x < y twice |

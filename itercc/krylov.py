@@ -74,6 +74,15 @@ def _norm(xp, a):
     return float(xp.linalg.norm(a))
 
 
+_CHUNK = 1 << 21          # entries per chunk of elementwise vector updates (16 MiB)
+
+
+def _chunks(size, chunk=_CHUNK):
+    """Slices covering range(size), `chunk` entries each: elementwise updates
+    of full-length vectors without full-length temporaries."""
+    return [slice(start, min(size, start + chunk)) for start in range(0, size, chunk)]
+
+
 class Columns:
     """A preallocated block of equal-length vectors stored as contiguous rows."""
 
@@ -329,7 +338,9 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
     # them alone. Orthogonalized against a dense guess, each unit vector
     # becomes dense, an action as costly as any other for little gain.
     padded = basis.count if guesses is not None and basis.count >= nroots else min(max_space, 2 * nroots + 2)
-    for index in np.argsort(tohost(diagonal)):
+    # The diagonal is sorted only when unit vectors are needed (its index
+    # array is as large as a vector: 2.8 GB at CuF size).
+    for index in np.argsort(tohost(diagonal)) if basis.count < padded else ():
         if basis.count >= padded:
             break
         unit = xp.zeros(size)
@@ -346,7 +357,8 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
             energy = float(np.real(energy))
         vector = ritz(column)
         image = images.combine(column)
-        image -= energy * vector
+        for part in _chunks(size):
+            image[part] -= energy * vector[part]
         return vector, image
 
     history, previous = [], None
@@ -384,18 +396,24 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
             if lengths[-1] > residual_tol:
                 if precondition is not None:
                     residual = precondition(residual, float(np.real(energy)), vector)
+                elif not olsen or xp.iscomplexobj(residual):
+                    # In place, chunk by chunk: the same quotients without
+                    # full-length temporaries (four at once, 11 GB at CuF size).
+                    for part in _chunks(size):
+                        denominator = float(np.real(energy)) - diagonal[part]
+                        denominator = xp.where(xp.abs(denominator) < 1e-3,
+                                               xp.where(denominator < 0, -1e-3, 1e-3), denominator)
+                        residual[part] /= denominator
                 else:
                     denominator = float(np.real(energy)) - diagonal
                     denominator = xp.where(xp.abs(denominator) < 1e-3,
                                            xp.where(denominator < 0, -1e-3, 1e-3), denominator)
                     residual /= denominator
-                    if olsen and not xp.iscomplexobj(residual):
-                        # Olsen: t = (theta - D)^-1 (r - eps x) with x . t = 0.
-                        scaled = vector / denominator
-                        ratio = _dot(xp, vector, residual) / _dot(xp, vector, scaled)
-                        residual -= ratio * scaled
-                        del scaled
-                    del denominator
+                    # Olsen: t = (theta - D)^-1 (r - eps x) with x . t = 0.
+                    scaled = vector / denominator
+                    ratio = _dot(xp, vector, residual) / _dot(xp, vector, scaled)
+                    residual -= ratio * scaled
+                    del scaled, denominator
                 parts = (residual.real, residual.imag) if xp.iscomplexobj(residual) else (residual,)
                 for part in parts:
                     candidate = orthonormal(part, corrections)

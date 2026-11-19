@@ -93,7 +93,8 @@ def run_solve(engine, args, signature):
         from itercc._slot_split import Partners
 
         kwargs = dict(ground=str(args.ground), memory_gib=args.memory_gib, cache_gib=args.cache_gib,
-                      occupied_slab=args.occupied_slab, irrep=args.irrep, monitored=False)
+                      occupied_slab=args.occupied_slab, irrep=args.irrep, monitored=False,
+                      intermediate_precision=args.intermediate_precision)
         partners = Partners(engine, f"{Path(__file__).resolve()}:build_engine", kwargs, parts=args.sockets,
                             threads=args.socket_threads,
                             log=open(args.output.with_name(args.output.stem + "-workers.log"), "a"))
@@ -125,7 +126,8 @@ def run_solve(engine, args, signature):
         raise RuntimeError("The triplet roots did not converge within the iteration limit")
 
 
-def build_engine(ground, memory_gib, cache_gib, occupied_slab, irrep, *, solve=True, monitored=True):
+def build_engine(ground, memory_gib, cache_gib, occupied_slab, irrep, *, solve=True, monitored=True,
+                 intermediate_precision="double"):
     """The audited CuF triplet engine (also a slot worker's builder, see
     itercc._slot_split): (engine, ground receipt, setup seconds)."""
     ground_dir = Path(ground)
@@ -150,7 +152,7 @@ def build_engine(ground, memory_gib, cache_gib, occupied_slab, irrep, *, solve=T
     engine = (MonitoredTriplet if monitored else TripletEOMCCSDTQ)(
         solver, amplitudes, labels, irrep, backend="cpu", occupied_tiles=True, action_only=not solve,
         packed_spin=solve, memory_budget_gib=memory_gib, intermediate_cache_gib=cache_gib,
-        occupied_slab=occupied_slab)
+        occupied_slab=occupied_slab, intermediate_precision=intermediate_precision)
     if abs(engine.ground_energy - receipt_values["energy_Eh"]) > 2e-10:
         raise ValueError("Ground-state energy changed on reload")
     if engine._symmetry_engine is None:
@@ -175,6 +177,8 @@ def main():
                         help="Processes (one per NUMA node) that share each action's rank-four slots")
     parser.add_argument("--socket-threads", type=int,
                         help="Threads of each worker process (default: ITERCC_CPU_THREADS)")
+    parser.add_argument("--intermediate-precision", choices=("double", "single"), default="double",
+                        help="single: rank-four slot-program intermediates rounded to float32 (opt-in)")
     args = parser.parse_args()
     solve = args.mode == "solve"
     if solve and (args.output is None or args.roots < 1 or args.max_iter < 1):
@@ -182,14 +186,16 @@ def main():
     if args.sockets < 1 or (args.sockets > 1 and not solve):
         parser.error("--sockets splits the actions of an eigensolve")
     engine, ground, setup_seconds = build_engine(args.ground, args.memory_gib, args.cache_gib,
-                                                 args.occupied_slab, args.irrep, solve=solve)
+                                                 args.occupied_slab, args.irrep, solve=solve,
+                                                 intermediate_precision=args.intermediate_precision)
     dimensions = [part.stop - part.start for part in engine.space.slices]
     signature = dict(basis=ground["basis"], input_sha256=ground["input_sha256"],
                      ground_sha256=GROUND_SHA256, irrep=args.irrep, dimensions=dimensions,
                      roots=args.roots)
     print(json.dumps(dict(event="ready", **signature, setup_seconds=setup_seconds,
                           packed_contractions=engine.packed_contractions, cache_gib=args.cache_gib,
-                          occupied_slab=engine.occupied_slab)),
+                          occupied_slab=engine.occupied_slab,
+                          intermediate_precision=engine.intermediate_precision)),
           flush=True)
     if solve:
         run_solve(engine, args, signature)

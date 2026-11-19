@@ -170,6 +170,32 @@ extern "C" double itercc_max_abs(const double *x, int64_t n, int threads)
     return nan ? NAN : best;
 }
 
+// The entries of an amplitude sector by slot: slot s's are storage[offsets[s]
+// + tables[classes[s]][k]], k < lengths[classes[s]], in the order of
+// vector[starts[s] + k]. Mode 0 packs them into the vector, 1 adds scale *
+// vector to them, 2 sets them to scale * vector. A slot's entries must be
+// distinct; slots run in parallel and write disjoint entries.
+extern "C" void itercc_sector_rows(double *storage, int64_t nslots, const int64_t *offsets,
+                                   const int64_t *classes, const int64_t *const *tables,
+                                   const int64_t *lengths, const int64_t *starts, double *vector,
+                                   double scale, int mode, int threads)
+{
+#pragma omp parallel for schedule(dynamic, 4) num_threads(threads)
+    for (i64 s = 0; s < nslots; ++s) {
+        const i64 c = classes[s], n = lengths[c];
+        const int64_t *__restrict rel = tables[c];
+        double *__restrict slot = storage + offsets[s];
+        double *__restrict v = vector + starts[s];
+        if (mode == 0) {
+            for (i64 k = 0; k < n; ++k) v[k] = slot[rel[k]];
+        } else if (mode == 1) {
+            for (i64 k = 0; k < n; ++k) slot[rel[k]] += scale * v[k];
+        } else {
+            for (i64 k = 0; k < n; ++k) slot[rel[k]] = scale * v[k];
+        }
+    }
+}
+
 extern "C" void itercc_combine(int64_t n, int64_t k, const double *weights, const double *const *vs,
                                double *out, int threads)
 {

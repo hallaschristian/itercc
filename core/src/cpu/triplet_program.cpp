@@ -16,6 +16,8 @@
 // computed by one tile and shared through a cache keyed by its expression and
 // the occupied indices it depends on: other tiles that need it wait for its
 // producer, and finished intermediates stay while they fit the byte budget.
+// With single-precision intermediates (flags bit 1) each is rounded to float
+// once formed (`Values`): half the bytes cached and read by the tile GEMMs.
 #include <omp.h>
 
 #include <algorithm>
@@ -41,7 +43,24 @@
 namespace {
 
 using i64 = int64_t;
-using Buffer = std::shared_ptr<std::vector<double>>;
+
+// An intermediate's values: double, or, with single-precision intermediates,
+// float. A float intermediate is formed in double and rounded once when its
+// product is done, before any tile reads it: every reader sees the same
+// values, whichever tile formed it and whether it came from the cache.
+struct Values {
+    std::vector<double> wide;           // double
+    std::unique_ptr<float[]> narrow;    // single: `count` floats
+    i64 count = 0;
+    bool single() const { return narrow != nullptr; }
+    i64 bytes() const { return single() ? count * i64(sizeof(float)) : i64(wide.size() * sizeof(double)); }
+    // The values as an operand pointer (float data when single).
+    const double *data() const
+    {
+        return single() ? reinterpret_cast<const double *>(narrow.get()) : wide.data();
+    }
+};
+using Buffer = std::shared_ptr<Values>;
 
 // Diagnostic thread time by phase (ITERCC_SLOT_PROFILE=1, read by
 // itercc_triplet_profile): 0 zeroing, 1 products into the tile, 2 products
@@ -82,7 +101,7 @@ class Phase {
 };
 
 constexpr i64 kDense = 0, kRows = 1, kInter = 2;
-constexpr i64 kLookup = 1, kPublish = 2;
+constexpr i64 kContract = 0, kLookup = 1, kPublish = 2;
 constexpr double kDivisor = 576.0;   // (4!)^2 antisymmetrizer terms
 
 i64 affine(const int64_t *coef, const int64_t *fixed)
@@ -239,7 +258,7 @@ class Cache {
     // waiting tile then computes it itself).
     void publish(const Key &key, const Buffer &buffer)
     {
-        const i64 bytes = i64(buffer->size() * sizeof(double));
+        const i64 bytes = buffer->bytes();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto found = map_.find(key);
@@ -248,7 +267,7 @@ class Cache {
             } else {
                 while (bytes_ + bytes > budget_ && !lru_.empty()) {
                     auto oldest = map_.find(lru_.back());
-                    bytes_ -= i64(oldest->second.buffer->size() * sizeof(double));
+                    bytes_ -= oldest->second.buffer->bytes();
                     map_.erase(oldest);
                     lru_.pop_back();
                 }
@@ -295,12 +314,14 @@ class Cache {
     std::deque<std::shared_ptr<Job>> open_;   // jobs being produced, oldest first
 };
 
-// A plan block of a fused product: its output block and where it came from.
+// A plan block of a fused product: its output block and where it came from
+// (a32, b32: float operands, offsets in floats).
 struct Piece {
     i64 r0, c0, rows, cols, o_base, member;
     const int64_t *block;
     const itercc_slot_instruction *x;
     const double *a, *b;
+    bool a32, b32;
 };
 
 struct Worker {
@@ -309,6 +330,19 @@ struct Worker {
     std::vector<int64_t> bases, maps;
     std::vector<Piece> pieces;
     std::vector<itercc::GemmSegment> segments;
+    // Single-precision intermediates: those a product that is not fused
+    // reads (`serial`), their double copies (`wide`, valid for the tile where
+    // `widened`), and the buffer in which the others are formed.
+    std::vector<char> serial, widened;
+    std::vector<std::vector<double>> wide;
+    std::vector<double> forming;
+};
+
+// The settings of one call.
+struct Run {
+    bool fused, merged, single;
+    int workers;
+    i64 share_work, cacheable;
 };
 
 // The symmetry-allowed entries of a compact tile (irreps of its stored axes
@@ -399,12 +433,49 @@ const double *operand(const itercc_slot_operand &o, const int64_t *fixed, const 
     return tile + o.coef[0];
 }
 
+// An operand of a product that is not fused (the contraction routes read
+// doubles): a float intermediate as its double copy, made once per tile.
+const double *serial_operand(const itercc_slot_operand &o, const int64_t *fixed, const double *const *bases,
+                             Worker &w, const double *tile)
+{
+    if (o.kind == kInter && w.bound[size_t(o.index)]->single()) {
+        const size_t k = size_t(o.index);
+        std::vector<double> &copy = w.wide[k];
+        if (!w.widened[k]) {
+            const Values &v = *w.bound[k];
+            copy.resize(size_t(v.count));
+            const float *from = v.narrow.get();
+            for (i64 i = 0; i < v.count; ++i) copy[size_t(i)] = double(from[i]);
+            w.widened[k] = 1;
+        }
+        return copy.data();
+    }
+    return operand(o, fixed, bases, w, tile);
+}
+
+// Rounds an intermediate formed in `formed` (v.count values) to float;
+// `keep`: the rounded values also stay in `formed`, the tile's double copy.
+void narrow(Values &v, double *formed, bool keep)
+{
+    v.narrow.reset(new float[size_t(std::max<i64>(v.count, 1))]);
+    float *to = v.narrow.get();
+    for (i64 i = 0; i < v.count; ++i) to[i] = float(formed[i]);
+    if (keep)
+        for (i64 i = 0; i < v.count; ++i) formed[i] = double(to[i]);
+}
+
 // A tile of a wave: its slot, template (class tile), partial sums (in the
 // wave's buffer), plan set and occupied tuple.
 struct Tile {
     i64 slot, tmpl, partial, plans;
     int64_t fixed[4];
 };
+
+// An operand pointer moved by `entries` (floats when f32).
+inline const double *offset(const double *v, bool f32, i64 entries)
+{
+    return f32 ? reinterpret_cast<const double *>(reinterpret_cast<const float *>(v) + entries) : v + entries;
+}
 
 // The products of fusion group `group` of the tile's kind as fused GEMMs:
 // their plan blocks with the same output block (equal offset tables, so the
@@ -419,9 +490,11 @@ void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, cons
         const itercc_slot_instruction &x = code[p.fuse_members[g[0] + i]];
         const int64_t *table = reinterpret_cast<const int64_t *>(tables[x.plan]);
         const double *a = operand(x.a, job.fixed, bases, w, tile), *b = operand(x.b, job.fixed, bases, w, tile);
+        const bool a32 = x.a.kind == kInter && w.bound[size_t(x.a.index)]->single();
+        const bool b32 = x.b.kind == kInter && w.bound[size_t(x.b.index)]->single();
         for (i64 k = 0; k < counts[x.plan]; ++k) {
             const int64_t *t = table + 9 * k;
-            w.pieces.push_back(Piece{t[3], t[4], t[0], t[1], t[8], i, t, &x, a, b});
+            w.pieces.push_back(Piece{t[3], t[4], t[0], t[1], t[8], i, t, &x, a, b, a32, b32});
         }
     }
     std::stable_sort(w.pieces.begin(), w.pieces.end(), [](const Piece &u, const Piece &v) {
@@ -439,9 +512,10 @@ void run_fused(const itercc_slot_program &p, const itercc_slot_template &m, cons
                && w.pieces[j].o_base == w.pieces[i].o_base) {
             const Piece &u = w.pieces[j];
             const int64_t *t = u.block;   // rows, cols, depth, r0, c0, k0, a_base, b_base, o_base
-            itercc::GemmSegment segment{u.a + t[6], u.x->a_rows + t[3], u.x->a_sum + t[5], (u.x->flags & 1) != 0,
-                                        u.b + t[7], u.x->b_sum + t[5], u.x->b_cols + t[4], (u.x->flags & 2) != 0,
-                                        t[2], scale * u.x->alpha};
+            itercc::GemmSegment segment{offset(u.a, u.a32, t[6]), u.x->a_rows + t[3], u.x->a_sum + t[5],
+                                        (u.x->flags & 1) != 0, offset(u.b, u.b32, t[7]), u.x->b_sum + t[5],
+                                        u.x->b_cols + t[4], (u.x->flags & 2) != 0, t[2], scale * u.x->alpha,
+                                        u.a32, u.b32};
             w.segments.push_back(segment);
             ++j;
         }
@@ -541,10 +615,10 @@ void gather_part(const itercc_slot_terms &t, const int32_t *coordinates, i64 cou
 // products of fusion groups wait until the other instructions are done (the
 // intermediates they read stay bound) and run as fused GEMMs.
 void run_tile(const itercc_slot_program &p, const Tile &job, const double *const *bases,
-              const double *const *vectors, Cache &cache, i64 cacheable, double *tile, Worker &w,
-              double *partial, bool fused, int workers, i64 share_work, bool merged = false)
+              const double *const *vectors, Cache &cache, double *tile, Worker &w, double *partial,
+              const Run &run)
 {
-    const i64 nv = p.nv, nv4 = nv * nv * nv * nv;
+    const bool fused = run.fused, merged = run.merged, single = run.single;
     const itercc_slot_template &m = p.templates[job.tmpl];
     // A merged tile (merge_order): cleared by its group's first tile, its
     // products into the tile scaled by merge_sign, gathered by the last.
@@ -568,8 +642,22 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
     const itercc_slot_instruction *code = p.instructions + p.kind_start[m.kind];
     const i64 ncode = p.kind_count[m.kind];
     const itercc_slot_intermediate *inters = p.intermediates + p.inter_start[m.kind];
-    w.bound.assign(size_t(p.inter_count[m.kind]), nullptr);
-    w.owner.assign(size_t(p.inter_count[m.kind]), 0);
+    const size_t ninter = size_t(p.inter_count[m.kind]);
+    w.bound.assign(ninter, nullptr);
+    w.owner.assign(ninter, 0);
+    if (single) {
+        // The intermediates that products run in place read (as doubles).
+        w.serial.assign(ninter, 0);
+        w.widened.assign(ninter, 0);
+        if (w.wide.size() < ninter) w.wide.resize(ninter);
+        for (i64 pc = 0; pc < ncode; ++pc) {
+            const itercc_slot_instruction &x = code[pc];
+            if (x.op != kContract || (fused && x.next >= 0)) continue;
+            if (x.a.kind == kInter) w.serial[size_t(x.a.index)] = 1;
+            if (x.b.kind == kInter) w.serial[size_t(x.b.index)] = 1;
+        }
+    }
+    const i64 element = single ? i64(sizeof(float)) : i64(sizeof(double));
     const int64_t *tables = p.plan_table + p.plan_start[job.plans];
     const int64_t *counts = p.plan_count + p.plan_start[job.plans];
     for (i64 pc = 0; pc < ncode;) {
@@ -580,7 +668,7 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
                 pc = x.next;
                 continue;
             }
-            if (inters[k].size * i64(sizeof(double)) <= cacheable) {
+            if (inters[k].size * element <= run.cacheable) {
                 Buffer hit = cache.acquire(key_of(inters[k], job.fixed));
                 if (hit) {
                     w.bound[k] = std::move(hit);
@@ -606,18 +694,24 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
             continue;
         }
         double *out;
-        if (x.out.kind == kInter) {
+        const bool forms = x.out.kind == kInter;
+        if (forms) {
             const Phase timing(7);
-            Buffer fresh = std::make_shared<std::vector<double>>(size_t(inters[x.out.index].size), 0.0);
-            out = fresh->data();
-            w.bound[size_t(x.out.index)] = std::move(fresh);
+            const size_t k = size_t(x.out.index);
+            Buffer fresh = std::make_shared<Values>();
+            fresh->count = inters[k].size;
+            // A float intermediate is formed in double: in its tile copy when
+            // products in place read it, else in the worker's buffer.
+            std::vector<double> &into = !single ? fresh->wide : w.serial[k] ? w.wide[k] : w.forming;
+            into.assign(size_t(inters[k].size), 0.0);
+            out = into.data();
+            w.bound[k] = std::move(fresh);
         } else {
             out = tile + x.out.coef[0];
         }
         itercc::ContractPlan plan = itercc::contract_plan(
-            operand(x.a, job.fixed, bases, w, tile), operand(x.b, job.fixed, bases, w, tile), out, x.a_rows,
-            x.a_sum, x.b_sum, x.b_cols, x.rpos, x.cpos, x.out.kind == kInter ? x.alpha : scale * x.alpha,
-            x.flags);
+            serial_operand(x.a, job.fixed, bases, w, tile), serial_operand(x.b, job.fixed, bases, w, tile), out,
+            x.a_rows, x.a_sum, x.b_sum, x.b_cols, x.rpos, x.cpos, forms ? x.alpha : scale * x.alpha, x.flags);
         itercc::PackedRows rows{};
         if (x.b.kind == kRows) {
             const Phase timing(3);
@@ -630,9 +724,9 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
             const double start = profiling ? omp_get_wtime() : 0.0;
             const int64_t *table = reinterpret_cast<const int64_t *>(tables[x.plan]);
             i64 work = 0;
-            if (x.out.kind == kInter && w.owner[size_t(x.out.index)] && workers > 1)
+            if (x.out.kind == kInter && w.owner[size_t(x.out.index)] && run.workers > 1)
                 for (i64 g = 0; g < count; ++g) work += table[9 * g] * table[9 * g + 1] * table[9 * g + 2];
-            if (work >= share_work) {
+            if (work >= run.share_work) {
                 // Shared with the tiles that wait for this intermediate.
                 auto shared = std::make_shared<Job>();
                 shared->plan = plan;
@@ -640,7 +734,7 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
                     shared->rows = rows;
                     shared->plan.packed_b = &shared->rows;
                 }
-                itercc::contract_tasks(table, count, workers, shared->tasks);
+                itercc::contract_tasks(table, count, run.workers, shared->tasks);
                 cache.attach(key_of(inters[size_t(x.out.index)], job.fixed), shared);
                 shared->help();
                 // Helpers finish the last pieces: meanwhile, run other pieces.
@@ -655,6 +749,12 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
                 }
                 ++contraction_calls[x.inter];
             }
+        }
+        if (forms && single) {   // formed: rounded once, before anything reads it
+            const Phase timing(2);
+            const size_t k = size_t(x.out.index);
+            narrow(*w.bound[k], w.serial[k] ? w.wide[k].data() : w.forming.data(), w.serial[k] != 0);
+            w.widened[k] = w.serial[k];
         }
         ++pc;
     }
@@ -737,10 +837,11 @@ bool slot_tiles(const itercc_slot_program &p, i64 s, i64 &at, std::vector<Tile> 
 extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t partial_limit,
                                     const double *const *bases, const double *ground,
                                     const double *direction, double *result, int64_t cache_bytes,
-                                    int64_t *stats, int threads, int fused, int64_t share_work,
+                                    int64_t *stats, int threads, int flags, int64_t share_work,
                                     void (*progress)(int64_t done, int64_t total))
 {
     if (share_work <= 0) share_work = kShareWork;
+    const bool fused = (flags & 1) != 0, single = (flags & 2) != 0;
     const i64 nv = p->nv, nv4 = nv * nv * nv * nv;
     threads = std::max(1, threads);
     std::vector<Tile> tiles;
@@ -775,6 +876,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
     }();
     if (!waves) {
         const bool merged = p->merge_order != nullptr;
+        const Run run{fused, merged, single, threads, share_work, cache_bytes};
         std::atomic<bool> failed{false};
         std::atomic<i64> finished{0};
         const i64 step = std::max<i64>(1, nslots / 64);
@@ -803,8 +905,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
                     const itercc_slot_template &m = p->templates[job.tmpl];
                     try {
                         sums.resize(size_t(tile_rows(*p, m, groups, merged)));
-                        run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, sums.data(), fused != 0,
-                                 threads, share_work, merged);
+                        run_tile(*p, job, bases, vectors, cache, tile, w, sums.data(), run);
                     } catch (const std::bad_alloc &) {
                         const itercc_slot_intermediate *inters = p->intermediates + p->inter_start[m.kind];
                         for (size_t k = 0; k < w.owner.size(); ++k)
@@ -890,6 +991,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
         // keys it was producing are abandoned (their waiters produce them),
         // the remaining tiles are skipped, and the call returns 2.
         std::atomic<bool> failed{false};
+        const Run run{fused, false, single, threads, share_work, cache_bytes};
 #pragma omp parallel num_threads(threads)
         {
             Worker w;
@@ -904,8 +1006,7 @@ extern "C" int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots
                 if (failed.load(std::memory_order_relaxed)) continue;
                 const Tile &job = tiles[size_t(order[size_t(j)])];
                 try {
-                    run_tile(*p, job, bases, vectors, cache, cache_bytes, tile, w, partial.get() + job.partial,
-                             fused != 0, threads, share_work);
+                    run_tile(*p, job, bases, vectors, cache, tile, w, partial.get() + job.partial, run);
                 } catch (const std::bad_alloc &) {
                     const itercc_slot_template &m = p->templates[job.tmpl];
                     const itercc_slot_intermediate *inters = p->intermediates + p->inter_start[m.kind];
