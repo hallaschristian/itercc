@@ -404,10 +404,11 @@ void pack_b_side(const FusedSide &x, const i64 *bk, const i64 *cols, i64 kn, i64
 // C(r, c) = c[cm[r] + cn[c]], A_s and B_s given as sides (B's "rows" are its
 // columns), sums laid end to end in chunks of KC.
 void fused_driver(i64 m, i64 n, const i64 *cm, const i64 *cn, double *c, i64 nseg, const FusedSide *as,
-                  const FusedSide *bs, const i64 *start, i64 nc_hint)
+                  const FusedSide *bs, const i64 *start, i64 nc_hint, i64 kc_most)
 {
     const i64 depth = start[nseg];
-    const i64 kc_max = std::min(KC, depth);
+    const i64 chunk = fused_chunk(depth, kc_most);
+    const i64 kc_max = std::min(chunk, depth);
     const i64 ncb = column_block(m, depth, nc_hint);
     const i64 nc_max = std::min(ncb, (n + NR - 1) / NR * NR);
     const i64 mc_max = std::min(MC, (m + MR - 1) / MR * MR);
@@ -416,8 +417,8 @@ void fused_driver(i64 m, i64 n, const i64 *cm, const i64 *cn, double *c, i64 nse
     alignas(64) double acc[MR * NR] = {};
     for (i64 jc = 0; jc < n; jc += ncb) {
         const i64 nc = std::min(ncb, n - jc);
-        for (i64 pc = 0; pc < depth; pc += KC) {
-            const i64 kc = std::min(KC, depth - pc);
+        for (i64 pc = 0; pc < depth; pc += chunk) {
+            const i64 kc = std::min(chunk, depth - pc);
             // The chunk's sums, segment piece by segment piece.
             for (i64 s = 0; s < nseg && !ITERCC_KO(2); ++s) {
                 const i64 lo = std::max(pc, start[s]), hi = std::min(pc + kc, start[s + 1]);
@@ -485,9 +486,16 @@ void fused_gemm(const FusedGemm &g)
     // values and fused multiply-adds commute), so the results are identical.
     const int mode = orientation.load(std::memory_order_relaxed);
     if (mode == 2 || (mode == 0 && tiled(n, g.m) > tiled(g.m, n)))
-        fused_driver(n, g.m, g.cc + g.j0, g.cr, g.c, g.nseg, ys.data(), xs.data(), start.data(), g.nc);
+        fused_driver(n, g.m, g.cc + g.j0, g.cr, g.c, g.nseg, ys.data(), xs.data(), start.data(), g.nc, g.kc);
     else
-        fused_driver(g.m, n, g.cr, g.cc + g.j0, g.c, g.nseg, xs.data(), ys.data(), start.data(), g.nc);
+        fused_driver(g.m, n, g.cr, g.cc + g.j0, g.c, g.nseg, xs.data(), ys.data(), start.data(), g.nc, g.kc);
+}
+
+i64 fused_chunk(i64 depth, i64 most)
+{
+    if (most <= 0 || depth <= 0) return kGemmKc;
+    const i64 chunks = (depth + most - 1) / most;
+    return (depth + chunks - 1) / chunks;
 }
 
 void set_fused_orientation(int mode)

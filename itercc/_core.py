@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 41
+CORE_ABI = 42
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -105,6 +105,7 @@ CPU_FUNCTIONS = {
     "dots_f32": ([_I, _I, _P, _P, _P, _T], None),
     "to_f32": ([_P, _P, _I, _T], None),
     "permute_columns": ([_P, _I, _I, _P, _P, _T], None),
+    "permute_virtuals4": ([_P, _P, _I, _I, _P, _T], None),
     "permute_columns_f32": ([_P, _I, _I, _P, _P, _T], None),
     "diis_rebase": ([_I, _I, _P, _P, _P, _P, _P, _P, _T], None),
     "t3_divide": ([_P, _I, _I, _P, _T], None),

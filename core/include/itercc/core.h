@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 41
+#define ITERCC_CORE_ABI 42
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -283,7 +283,8 @@ double itercc_max_abs(const double *x, int64_t n, int threads);
  * sector): slot s's are storage[offsets[s] + tables[classes[s]][k]], k <
  * lengths[classes[s]], in the order of vector[starts[s] + k]. mode 0:
  * vector = entries; 1: entries += scale * vector; 2: entries = scale *
- * vector. Slots in parallel (a slot's entries distinct). */
+ * vector; 3: entries = 0 (vector unused). Slots in parallel (a slot's
+ * entries distinct). */
 void itercc_sector_rows(double *storage, int64_t nslots, const int64_t *offsets, const int64_t *classes,
                           const int64_t *const *tables, const int64_t *lengths, const int64_t *starts,
                           double *vector, double scale, int mode, int threads);
@@ -527,6 +528,10 @@ void itercc_to_f32(const double *x, float *out, int64_t n, int threads);
  * the _f32 variant rounds to float. */
 void itercc_permute_columns(const double *src, int64_t rows, int64_t ncols, const int64_t *index,
                             double *dst, int threads);
+/* dst[s, a, b, c, d] = src[s, perm[a], perm[b], perm[c], perm[d]] for nslots
+ * dense slots of nv^4 (packed T4's virtual axes in another order). */
+void itercc_permute_virtuals4(const double *src, double *dst, int64_t nslots, int64_t nv,
+                              const int64_t *perm, int threads);
 void itercc_permute_columns_f32(const double *src, int64_t rows, int64_t ncols, const int64_t *index,
                                 float *dst, int threads);
 void itercc_diis_rebase(int64_t n, int64_t k, const double *weights, float *const *deltas,

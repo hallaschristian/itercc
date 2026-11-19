@@ -185,6 +185,10 @@ extern "C" void itercc_sector_rows(double *storage, int64_t nslots, const int64_
         const i64 c = classes[s], n = lengths[c];
         const int64_t *__restrict rel = tables[c];
         double *__restrict slot = storage + offsets[s];
+        if (mode == 3) {
+            for (i64 k = 0; k < n; ++k) slot[rel[k]] = 0.0;
+            continue;
+        }
         double *__restrict v = vector + starts[s];
         if (mode == 0) {
             for (i64 k = 0; k < n; ++k) v[k] = slot[rel[k]];
@@ -334,6 +338,27 @@ extern "C" void itercc_permute_columns(const double *src, int64_t rows, int64_t 
                                        double *dst, int threads)
 {
     permute_columns(src, rows, ncols, index, dst, threads);
+}
+
+// dst[s, a, b, c, d] = src[s, perm[a], perm[b], perm[c], perm[d]] for nslots
+// dense slots of nv^4 (the four virtual axes of packed T4 in another order).
+extern "C" void itercc_permute_virtuals4(const double *src, double *dst, int64_t nslots, int64_t nv,
+                                         const int64_t *perm, int threads)
+{
+    const i64 rows = nslots * nv * nv * nv;
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (i64 r = 0; r < rows; ++r) {
+        i64 q = r;
+        const i64 k = q % nv;
+        q /= nv;
+        const i64 j = q % nv;
+        q /= nv;
+        const i64 i = q % nv;
+        const i64 s = q / nv;
+        const double *__restrict row = src + (((s * nv + perm[i]) * nv + perm[j]) * nv + perm[k]) * nv;
+        double *__restrict out = dst + r * nv;
+        for (i64 l = 0; l < nv; ++l) out[l] = row[perm[l]];
+    }
 }
 
 extern "C" void itercc_permute_columns_f32(const double *src, int64_t rows, int64_t ncols,

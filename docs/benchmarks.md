@@ -309,6 +309,54 @@ iteration with 13 correlated occupied orbitals in C2v symmetry:
 | CCSDT | 88 | 2.5 | 7.9 |
 | CCSDT | 131 | 9.2 | 26.6 |
 | CCSDTQ | 47 | 85 | |
+| CCSDTQ | 63 | 293 | |
+
+The 63-virtual case is CuF in aug-cc-pVDZ-DK. Its CCSDTQ evaluation spends
+141 s in the R4 tile programs (1.04e14 multiply-adds, about two fifths of
+the socket's double-precision peak; 151 s with sum chunks of 256,
+`ITERCC_TILE_KC=0`), 65 s on T4 into ranks two and three, 49 s on the ring
+terms and 23 s on the oooo terms.
+
+### Excited states with quadruples
+
+Singlet EOM-CCSDTQ (`FiniteDifferenceEOM`), CuF in aug-cc-pVDZ-DK, one
+Jacobian action on the same socket (7.3e9 parameters per sector):
+
+| Solver | Target | Minutes per action | Peak memory |
+| --- | --- | --- | --- |
+| no labels (C1 on dense T4), central difference | any | over 83 (unfinished, 48 cores) | 1.0 TB |
+| C2v labels, central difference | A1 | 11.8 | 420 GiB |
+| B1-subgroup labels, one residual, sector-only R4 tiles | B1, A2 | 12.8 | 413 GiB |
+
+With `sector_labels` both residuals keep the subgroup's symmetry blocks, and
+for a nonzero target irrep one residual replaces the two of the central
+difference (the same action, bit for bit). The tile programs then form only
+the target sector's R4 entries, half their multiply-adds: on one node the B1
+action took 19.8 min forming every allowed entry and 17.3 min with the
+sector's only, with identical results. Shifting the ground amplitudes in
+place (one T4 fewer) brought its peak from 519 GiB, more than the socket's
+503 GiB, to 413 GiB; with packed T4 boxes combined tile by tile it took
+12.8 min (4.9 min in the R4 tile programs, 3.8 min on T4 into ranks two and
+three, 2.3 min on the ring terms, 0.9 min on the oooo terms and 0.4 min
+projecting R4), 2.6 C2v residuals. `python -m
+benchmarks.singlet_eom_ccsdtq --synthetic 4 24 --irrep 2` compares every
+variant on a synthetic C2v model (12 desktop threads: 2.69 s per action
+without labels, 0.57 s with sector labels); `--input zero.npz --state DIR`
+runs a saved ground state.
+
+Triplet (spin-flip) EOM-CCSDTQ (`TripletEOMCCSDTQ`), CuF in ANO-RCC-VDZP
+(13 occupied, 29 virtual), one warm action and the peak of a three-iteration
+solve on the same socket:
+
+| Slot-program intermediates | Cache | Seconds per action | Solve peak |
+| --- | --- | --- | --- |
+| double | 64 GiB | 94.6 | 120 GB |
+| single (`intermediate_precision="single"`) | 64 GiB | 85.6 | |
+| single | 32 GiB | 87.7 | 88 GB |
+
+Single-precision intermediates moved the Rayleigh quotient of the converged
+B1 root by 4e-12 Eh. `benchmarks/cuf_triplet_ccsdtq_probe.py` runs these
+(`--intermediate-precision`, `--memory-trace` for resident memory by phase).
 
 ## Reproduce
 

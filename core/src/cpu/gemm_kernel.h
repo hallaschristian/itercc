@@ -76,7 +76,14 @@ struct FusedGemm {
     double *c;
     const int64_t *cr, *cc;
     int64_t nc = 0;     // columns per packed block of B (0: the default)
+    int64_t kc = 0;     // most sums per chunk (0: kGemmKc); see fused_chunk
 };
+
+// Sums per chunk of a fused product of `depth` sums whose chunks hold at most
+// `most` (0: kGemmKc): kGemmKc when most is 0, else the depth cut into the
+// fewest equal chunks of at most `most` sums. It depends only on the product,
+// so the arithmetic stays independent of threads and column ranges.
+int64_t fused_chunk(int64_t depth, int64_t most);
 
 void fused_gemm(const FusedGemm &g);
 

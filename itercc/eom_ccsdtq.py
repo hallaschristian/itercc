@@ -248,6 +248,16 @@ class QuadruplesSector:
                     raise ValueError("Expected C-contiguous device amplitudes")
                 _cuda_kernels()[0](vector[block], self._indices[rank - 1], scale, amplitude.reshape(-1))
 
+    def clear(self, amplitudes):
+        """Set the sector's entries of host amplitudes to zero."""
+        empty = np.empty(0)
+        for rank, amplitude in enumerate(amplitudes, 1):
+            if self._compiled and self._sector_rows(rank, amplitude, empty, 0.0, 3):
+                continue
+            positions = self._storage_positions(rank) if self._compiled else self._indices[rank - 1]
+            flat = amplitude.reshape(-1) if amplitude.flags.c_contiguous else amplitude.flat
+            flat[positions] = 0.0
+
 
 class FiniteDifferenceEOM:
     """Numerically differentiate the complete T1–T4 residual equations of a
@@ -268,7 +278,12 @@ class FiniteDifferenceEOM:
     zero there, so its sector part over eps is the central difference, term
     for term. The shifted amplitudes' sector entries are set to eps R, so any
     sector leakage of the stored ground amplitudes drops out; the integrals
-    must be free of it (they are audited).
+    must be free of it (they are audited). The shift is made in the ground
+    amplitudes themselves (their sector entries are eps R during an action
+    and zero after it; the totally symmetric entries are never written), so
+    an action holds one copy of T rather than two (107 GB of T4 for CuF in
+    aug-cc-pVDZ with B1-subgroup labels); amplitudes that are not writable
+    C-contiguous host arrays are copied once, here.
     """
     def __init__(self, solver, amplitudes, labels, irrep, *, step=5e-5, one_sided=None):
         if solver._host_r4:
@@ -301,8 +316,23 @@ class FiniteDifferenceEOM:
         if one_sided and (int(irrep) == 0 or xp is not np):
             raise ValueError("One residual per action needs a nonzero target irrep on the CPU")
         self.one_sided = bool(one_sided)
+        self._tile_sector = None
         if self.one_sided:
             _check_integral_sectors(solver, labels)
+            self.amplitudes = tuple(a if _writable(a) else _cpu_quadruples.copy(np.asarray(a))
+                                    for a in self.amplitudes)
+            program = getattr(solver, "_tile_program", None)
+            if program is not None:
+                # Only the sector's R4 entries are packed: the tile programs
+                # form only those (`TileProgram._sector`), per slot the virtual
+                # class irrep ^ (its occupied irreps), in the solver's order.
+                no = solver.nocc
+                order = getattr(solver, "_virtual_order", None)
+                virtual = labels[no:] if order is None else labels[no:][order]
+                occupied = np.asarray(program.occupied, dtype=np.int64)
+                classes = int(irrep) ^ np.bitwise_xor.reduce(labels[:no][occupied], axis=1)
+                self._tile_sector = (np.ascontiguousarray(virtual, dtype=np.int64),
+                                     np.ascontiguousarray(classes, dtype=np.int64))
         self.matvec_count = 0
         self.matvec_seconds = 0.0
 
@@ -337,10 +367,17 @@ class FiniteDifferenceEOM:
     def _one_sided(self, vector, step, omega):
         """The sector part of Res(T + step R) over step (see the class); with
         `omega`, the norm of its difference from omega R."""
-        shifted = self._shifted()
-        self.space.shift(shifted, vector, step, assign=True)
-        residuals = self.solver._residuals(shifted)
-        del shifted
+        shifted = self.amplitudes
+        program = getattr(self.solver, "_tile_program", None)
+        if self._tile_sector is not None and _runtime.enabled("ITERCC_EOM_SECTOR_TILES"):
+            program.output_sector = self._tile_sector
+        try:
+            self.space.shift(shifted, vector, step, assign=True)
+            residuals = self.solver._residuals(shifted)
+        finally:
+            self.space.clear(shifted)
+            if program is not None:
+                program.output_sector = None
         value = self.space.pack(residuals)
         del residuals
         value /= step
@@ -388,6 +425,12 @@ class FiniteDifferenceEOM:
         guesses = self.singles_guesses()
         # Reuse the response-optimized EOM driver's restarted Davidson loop.
         return EOMSinglet.solve(self, 1, guesses=guesses, **options)
+
+
+def _writable(array):
+    """A host array the one-sided action may shift in place (not a memory map)."""
+    return (type(array) is np.ndarray and array.dtype == np.float64 and array.flags.c_contiguous
+            and array.flags.writeable)
 
 
 def _check_sector_labels(solver_labels, labels, irrep):

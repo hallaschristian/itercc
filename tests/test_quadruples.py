@@ -813,6 +813,93 @@ def test_cpu_singlet_eom_sector_paths_agree(irrep):
     np.testing.assert_array_equal(np.concatenate(engine.space.indices), np.concatenate(reference.space.indices))
 
 
+def test_cpu_singlet_eom_sector_tiles_keep_the_action(monkeypatch):
+    """One-sided actions form only the target sector's R4 tile entries (each
+    fused block split by the classes of its rows and columns): the same
+    action bit for bit, from half the tile multiply-adds."""
+    from itercc import _cpu_quadruples
+    from itercc.eom_ccsdtq import FiniteDifferenceEOM
+    from itercc.spatial_symmetry import sector_labels
+
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    model = symmetric_model()
+    dense = RestrictedCCSDTQ(*model, backend="cpu")
+    ground = dense.solve(max_iter=3, damping=0.2, diis_size=0).amplitudes
+    solver = RestrictedCCSDTQ(*model, backend="cpu", orbital_irreps=sector_labels(LABELS, 2))
+    engine = FiniteDifferenceEOM(solver, solver.combine_states([(1.0, ground, None)]), LABELS, 2)
+    assert engine._tile_sector is not None
+    vector = np.random.default_rng(29).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_EOM_SECTOR_TILES", "0")
+    every = engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_EOM_SECTOR_TILES", "1")
+    np.testing.assert_array_equal(engine.sigma(vector), every)
+    fused = [f for recorded in solver._tile_program._recorded.values() for f in recorded.fused.values() if f]
+    assert fused and all(f.sectors for f in fused)
+    assert solver._tile_program.output_sector is None          # only within the action
+
+
+def test_cpu_singlet_eom_shifts_the_ground_amplitudes_in_place(tmp_path):
+    """A one-sided action shifts the engine's ground amplitudes in place: the
+    same image as a shifted copy, bit for bit, with the totally symmetric
+    entries untouched and the sector's zero afterwards; read-only amplitudes
+    (memory maps) are copied once."""
+    from itercc import _cpu_quadruples
+    from itercc.eom_ccsdtq import FiniteDifferenceEOM
+    from itercc.spatial_symmetry import sector_labels
+
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    model = symmetric_model()
+    dense = RestrictedCCSDTQ(*model, backend="cpu")
+    ground = dense.solve(max_iter=3, damping=0.2, diis_size=0).amplitudes
+    solver = RestrictedCCSDTQ(*model, backend="cpu", orbital_irreps=sector_labels(LABELS, 2))
+    start = solver.combine_states([(1.0, ground, None)])
+    engine = FiniteDifferenceEOM(solver, start, LABELS, 2)
+    before = tuple(a.copy() for a in engine.amplitudes)
+    vector = np.random.default_rng(31).normal(size=engine.space.size)
+    shifted = tuple(a.copy() for a in before)
+    engine.space.shift(shifted, vector, engine.step, assign=True)
+    solver._tile_program.output_sector = engine._tile_sector
+    expected = engine.space.pack(solver._residuals(shifted)) / engine.step
+    solver._tile_program.output_sector = None
+    np.testing.assert_array_equal(engine.sigma(vector), expected)
+    marker = tuple(np.zeros(a.shape) for a in before)
+    engine.space.shift(marker, np.ones(engine.space.size), 1.0, assign=True)
+    for after, previous, inside in zip(engine.amplitudes, before, marker):
+        inside = inside != 0
+        assert inside.any() and not after[inside].any()
+        np.testing.assert_array_equal(after[~inside], previous[~inside])
+    # A read-only memory map is copied, not written.
+    np.save(tmp_path / "t4.npy", start[3])
+    mapped = np.load(tmp_path / "t4.npy", mmap_mode="r")
+    other = FiniteDifferenceEOM(solver, (*start[:3], mapped), LABELS, 2)
+    assert other.amplitudes[3] is not mapped and type(other.amplitudes[3]) is np.ndarray
+    np.testing.assert_array_equal(other.sigma(vector), expected)
+
+
+def test_singlet_eom_benchmark_variants_agree(tmp_path):
+    """benchmarks.singlet_eom_ccsdtq on a small synthetic model: every variant
+    reports actions that agree with the dense central difference."""
+    import json
+
+    from itercc import _cpu_quadruples
+
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    output = tmp_path / "records.jsonl"
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run([sys.executable, "-m", "benchmarks.singlet_eom_ccsdtq", "--synthetic", "3", "9",
+                    "--irrep", "1", "--actions", "1", "--ground-iterations", "1", "--threads", "2",
+                    "--output", str(output)], check=True, cwd=root, capture_output=True,
+                   env={**os.environ, "PYTHONPATH": str(root)})
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    actions = [r for r in records if r["event"] == "action"]
+    assert [r["variant"] for r in actions] == ["dense-central", "dense-one-sided", "sector", "sector-every",
+                                               "sector-central"]
+    assert all(r["relative_difference"] < 1e-12 for r in actions[1:])
+
+
 def test_cpu_singlet_eom_refuses_labels_that_split_the_sector():
     from itercc import _cpu_quadruples
     from itercc.eom_ccsdtq import FiniteDifferenceEOM

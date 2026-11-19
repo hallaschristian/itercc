@@ -417,46 +417,145 @@ inline void box_irreps(const itercc_quad_layout *l, i64 h, i64 box, i64 *g)
 
 enum class BoxOp { assign, add, add_weighted };
 
-// One output box (extents ext, C order) from its source box `a` under the
-// permutation sel (source position k holds output axis sel[k]): dst(x) = /
-// += / += w * src(x[sel]). The source box is read in its own memory order
-// (its innermost position is contiguous) and the output box, which stays in
-// L1/L2, is written with strides: reading the source along a strided output
-// line would take one cache line per element. Each entry gets the same
-// arithmetic as the line-by-line loops, so results are bitwise unchanged.
-inline void box_permute(double *dst, const i64 *ext, const double *src, const Affine &a, const i64 *sel,
-                        double w, BoxOp op)
+// Boxes are combined tile by tile (kBoxTile^4 entries, 512 KB): with four
+// irreps a box of a 63-virtual layout is about 0.5 MB, with two (the layouts
+// of `sector_labels` subgroups) about 8 MB, and a pass over a whole box with
+// strides then took a cache line per entry. Within a tile every term is
+// applied before the next tile, so each entry gets its terms in the same
+// order (and the same operations) as box by box: bitwise the same results.
+constexpr i64 kBoxTile = 16;
+
+struct Tile {
+    i64 lo[4], len[4];
+};
+
+// Calls f(tile) for the tiles of a box with extents ext.
+template <typename F>
+inline void for_tiles(const i64 *ext, F &&f)
 {
-    const i64 ostride[4] = {ext[1] * ext[2] * ext[3], ext[2] * ext[3], ext[3], 1};
+    Tile t;
+    for (t.lo[0] = 0; t.lo[0] < ext[0]; t.lo[0] += kBoxTile)
+        for (t.lo[1] = 0; t.lo[1] < ext[1]; t.lo[1] += kBoxTile)
+            for (t.lo[2] = 0; t.lo[2] < ext[2]; t.lo[2] += kBoxTile)
+                for (t.lo[3] = 0; t.lo[3] < ext[3]; t.lo[3] += kBoxTile) {
+                    for (int q = 0; q < 4; ++q) t.len[q] = std::min(kBoxTile, ext[q] - t.lo[q]);
+                    f(t);
+                }
+}
+
+inline void box_strides(const i64 *ext, i64 *ostride)
+{
+    ostride[0] = ext[1] * ext[2] * ext[3];
+    ostride[1] = ext[2] * ext[3];
+    ostride[2] = ext[3];
+    ostride[3] = 1;
+}
+
+// dst(x) = / += / += w * src(a, x) for the entries x of a tile of an output
+// box (extents ext, C order; a: the source box's offset and its stride per
+// output axis), read in the source's memory order.
+inline void tile_term(double *dst, const i64 *ext, const Tile &t, const double *src, const Affine &a, double w,
+                      BoxOp op)
+{
+    i64 ostride[4];
+    box_strides(ext, ostride);
+    int order[4] = {0, 1, 2, 3};      // output axes by decreasing source stride
+    std::sort(order, order + 4, [&](int x, int y) { return a.stride[x] > a.stride[y]; });
     i64 n[4], p[4], o[4];
-    for (int k = 0; k < 4; ++k) {
-        n[k] = ext[sel[k]];
-        p[k] = a.stride[sel[k]];        // p[3] == 1: the source's innermost position
-        o[k] = ostride[sel[k]];
+    const double *x = src + a.base;
+    double *d = dst;
+    for (int q = 0; q < 4; ++q) {
+        x += t.lo[q] * a.stride[q];
+        d += t.lo[q] * ostride[q];
+        n[q] = t.len[order[q]];
+        p[q] = a.stride[order[q]];
+        o[q] = ostride[order[q]];
     }
-    const double *base = src + a.base;
-    const i64 step = o[3];
+    const i64 ps = p[3], os = o[3];
     for (i64 s0 = 0; s0 < n[0]; ++s0)
         for (i64 s1 = 0; s1 < n[1]; ++s1)
             for (i64 s2 = 0; s2 < n[2]; ++s2) {
-                const double *x = base + s0 * p[0] + s1 * p[1] + s2 * p[2];
-                double *d = dst + s0 * o[0] + s1 * o[1] + s2 * o[2];
-                if (step == 1) {
-                    if (op == BoxOp::assign)
-                        for (i64 m = 0; m < n[3]; ++m) d[m] = x[m];
-                    else if (op == BoxOp::add)
-                        for (i64 m = 0; m < n[3]; ++m) d[m] += x[m];
-                    else
-                        for (i64 m = 0; m < n[3]; ++m) d[m] += w * x[m];
-                } else {
-                    if (op == BoxOp::assign)
-                        for (i64 m = 0; m < n[3]; ++m) d[m * step] = x[m];
-                    else if (op == BoxOp::add)
-                        for (i64 m = 0; m < n[3]; ++m) d[m * step] += x[m];
-                    else
-                        for (i64 m = 0; m < n[3]; ++m) d[m * step] += w * x[m];
-                }
+                const double *xs = x + s0 * p[0] + s1 * p[1] + s2 * p[2];
+                double *ds = d + s0 * o[0] + s1 * o[1] + s2 * o[2];
+                if (op == BoxOp::assign)
+                    for (i64 m = 0; m < n[3]; ++m) ds[m * os] = xs[m * ps];
+                else if (op == BoxOp::add)
+                    for (i64 m = 0; m < n[3]; ++m) ds[m * os] += xs[m * ps];
+                else
+                    for (i64 m = 0; m < n[3]; ++m) ds[m * os] += w * xs[m * ps];
             }
+}
+
+inline void tile_zero(double *dst, const i64 *ext, const Tile &t)
+{
+    i64 ostride[4];
+    box_strides(ext, ostride);
+    double *corner = dst + t.lo[0] * ostride[0] + t.lo[1] * ostride[1] + t.lo[2] * ostride[2] + t.lo[3];
+    for (i64 i = 0; i < t.len[0]; ++i)
+        for (i64 j = 0; j < t.len[1]; ++j)
+            for (i64 k = 0; k < t.len[2]; ++k)
+                std::fill_n(corner + i * ostride[0] + j * ostride[1] + k * ostride[2], t.len[3], 0.0);
+}
+
+// The three ring terms of a tile, dst = x0 + (x1 + x2) entry by entry.
+inline void tile_ring(double *dst, const i64 *ext, const Tile &t, const double *src, const Affine *a)
+{
+    i64 ostride[4];
+    box_strides(ext, ostride);
+    const i64 t0 = a[0].stride[3], t1 = a[1].stride[3], t2 = a[2].stride[3];
+    for (i64 i = t.lo[0]; i < t.lo[0] + t.len[0]; ++i)
+        for (i64 j = t.lo[1]; j < t.lo[1] + t.len[1]; ++j)
+            for (i64 k = t.lo[2]; k < t.lo[2] + t.len[2]; ++k) {
+                double *d = dst + i * ostride[0] + j * ostride[1] + k * ostride[2] + t.lo[3];
+                const double *s0 = src + a[0].base + i * a[0].stride[0] + j * a[0].stride[1] + k * a[0].stride[2]
+                                   + t.lo[3] * t0;
+                const double *s1 = src + a[1].base + i * a[1].stride[0] + j * a[1].stride[1] + k * a[1].stride[2]
+                                   + t.lo[3] * t1;
+                const double *s2 = src + a[2].base + i * a[2].stride[0] + j * a[2].stride[1] + k * a[2].stride[2]
+                                   + t.lo[3] * t2;
+                for (i64 m = 0; m < t.len[3]; ++m) d[m] = s0[m * t0] + (s1[m * t1] + s2[m * t2]);
+            }
+}
+
+// An occupied tie on a tile: dst = 0.5 * (x + y), x the box's own entries
+// (the box at `own` of src and dst) and y the swapped ones (a).
+inline void tile_tie(double *dst, const i64 *ext, const Tile &t, const double *src, i64 own, const Affine &a)
+{
+    i64 ostride[4];
+    box_strides(ext, ostride);
+    const i64 step = a.stride[3];
+    for (i64 i = t.lo[0]; i < t.lo[0] + t.len[0]; ++i)
+        for (i64 j = t.lo[1]; j < t.lo[1] + t.len[1]; ++j)
+            for (i64 k = t.lo[2]; k < t.lo[2] + t.len[2]; ++k) {
+                const i64 at = own + i * ostride[0] + j * ostride[1] + k * ostride[2] + t.lo[3];
+                const double *x = src + at;
+                const double *y = src + a.base + i * a.stride[0] + j * a.stride[1] + k * a.stride[2] + t.lo[3] * step;
+                double *d = dst + at;
+                for (i64 m = 0; m < t.len[3]; ++m) d[m] = 0.5 * (x[m] + y[m * step]);
+            }
+}
+
+// One output box (extents ext, C order) from its source box `a`: dst(x) = /
+// += / += w * src(a, x).
+inline void box_permute(double *dst, const i64 *ext, const double *src, const Affine &a, double w, BoxOp op)
+{
+    for_tiles(ext, [&](const Tile &t) { tile_term(dst, ext, t, src, a, w, op); });
+}
+
+// dst = sum_t w_t src(a_t, x), the terms added in order from zero.
+inline void box_terms(double *dst, const i64 *ext, const double *src, const Affine *a, const double *w,
+                      i64 count)
+{
+    for_tiles(ext, [&](const Tile &t) {
+        tile_zero(dst, ext, t);
+        for (i64 term = 0; term < count; ++term) tile_term(dst, ext, t, src, a[term], w[term], BoxOp::add_weighted);
+    });
+}
+
+// dst = x0 + (x1 + x2) (the ring terms).
+inline void box_ring(double *dst, const i64 *ext, const double *src, const Affine *a)
+{
+    for_tiles(ext, [&](const Tile &t) { tile_ring(dst, ext, t, src, a); });
 }
 
 }  // namespace
@@ -483,7 +582,7 @@ extern "C" void itercc_quad_gather_rows(const itercc_quad_layout *l, const doubl
             const Affine a = source_box(l, h, g, sel);
             const i64 ext[4] = {na, nb, nc, nd};
             box_permute(rows + row_offset[r] + l->boff[((h * N + g[0]) * N + g[1]) * N + g[2]], ext,
-                        packed + l->soff[slot], a, sel, 1.0, BoxOp::assign);
+                        packed + l->soff[slot], a, 1.0, BoxOp::assign);
         }
 }
 
@@ -515,23 +614,11 @@ extern "C" void itercc_quad_rows_permute(const itercc_quad_layout *l, const doub
             for (i64 t = 0; t < count; ++t) a[t] = source_box(l, h, g, perms + 4 * t);
             const double *src = in + row_offset[r];
             double *dst = out + row_offset[r] + l->boff[((h * N + g[0]) * N + g[1]) * N + g[2]];
-            if (!ring) {
-                const i64 ext[4] = {na, nb, nc, nd};
-                std::fill(dst, dst + na * nb * nc * nd, 0.0);
-                for (i64 t = 0; t < count; ++t)
-                    box_permute(dst, ext, src, a[t], perms + 4 * t, weights[t], BoxOp::add_weighted);
-                continue;
-            }
-            for (i64 i = 0; i < na; ++i)
-                for (i64 j = 0; j < nb; ++j)
-                    for (i64 k = 0; k < nc; ++k) {
-                        double *d = dst + ((i * nb + j) * nc + k) * nd;
-                        const double *s0 = src + a[0].base + i * a[0].stride[0] + j * a[0].stride[1] + k * a[0].stride[2];
-                        const double *s1 = src + a[1].base + i * a[1].stride[0] + j * a[1].stride[1] + k * a[1].stride[2];
-                        const double *s2 = src + a[2].base + i * a[2].stride[0] + j * a[2].stride[1] + k * a[2].stride[2];
-                        const i64 t0 = a[0].stride[3], t1 = a[1].stride[3], t2 = a[2].stride[3];
-                        for (i64 m = 0; m < nd; ++m) d[m] = s0[m * t0] + (s1[m * t1] + s2[m * t2]);
-                    }
+            const i64 ext[4] = {na, nb, nc, nd};
+            if (ring)
+                box_ring(dst, ext, src, a);
+            else
+                box_terms(dst, ext, src, a, weights, count);
         }
 }
 
@@ -577,28 +664,11 @@ void gather_permute(const itercc_quad_layout *l, const double *packed, int64_t n
             } else {
                 dst = itercc::scratch(0).get(size_t(volume));   // released between phases
             }
-            if (!ring) {
-                const i64 ext[4] = {na, nb, nc, nd};
-                std::fill(dst, dst + volume, 0.0);
-                for (i64 t = 0; t < count; ++t) {
-                    i64 sel[4];
-                    for (int k = 0; k < 4; ++k) sel[k] = perms[4 * t + row_order[4 * r + k]];
-                    box_permute(dst, ext, src, a[t], sel, weights[t], BoxOp::add_weighted);
-                }
-                if constexpr (!std::is_same_v<T, double>)
-                    for (i64 x = 0; x < volume; ++x) out[x] = T(dst[x]);
-                continue;
-            }
-            for (i64 i = 0; i < na; ++i)
-                for (i64 j = 0; j < nb; ++j)
-                    for (i64 k = 0; k < nc; ++k) {
-                        double *d = dst + ((i * nb + j) * nc + k) * nd;
-                        const double *s0 = src + a[0].base + i * a[0].stride[0] + j * a[0].stride[1] + k * a[0].stride[2];
-                        const double *s1 = src + a[1].base + i * a[1].stride[0] + j * a[1].stride[1] + k * a[1].stride[2];
-                        const double *s2 = src + a[2].base + i * a[2].stride[0] + j * a[2].stride[1] + k * a[2].stride[2];
-                        const i64 t0 = a[0].stride[3], t1 = a[1].stride[3], t2 = a[2].stride[3];
-                        for (i64 m = 0; m < nd; ++m) d[m] = s0[m * t0] + (s1[m * t1] + s2[m * t2]);
-                    }
+            const i64 ext[4] = {na, nb, nc, nd};
+            if (ring)
+                box_ring(dst, ext, src, a);
+            else
+                box_terms(dst, ext, src, a, weights, count);
             if constexpr (!std::is_same_v<T, double>)
                 for (i64 x = 0; x < volume; ++x) out[x] = T(dst[x]);
         }
@@ -647,7 +717,7 @@ extern "C" void itercc_quad_row_add_packed(const itercc_quad_layout *l, const do
             const Affine a = source_box(l, h, g, sel);
             const i64 ext[4] = {na, nb, nc, nd};
             box_permute(packed + l->soff[slot] + l->boff[((h * N + g[0]) * N + g[1]) * N + g[2]], ext,
-                        rows + row_offset[entry[1]], a, sel, 1.0, BoxOp::add);
+                        rows + row_offset[entry[1]], a, 1.0, BoxOp::add);
         }
 }
 
@@ -793,16 +863,8 @@ extern "C" void itercc_quad_project(const itercc_quad_layout *l, double *packed,
                     if (!(na && nb && nc && nd)) continue;
                     const Affine a = source_box(l, h, g, swap);
                     const i64 own = l->boff[((h * N + g[0]) * N + g[1]) * N + g[2]];
-                    for (i64 i = 0; i < na; ++i)
-                        for (i64 j = 0; j < nb; ++j)
-                            for (i64 k = 0; k < nc; ++k) {
-                                const i64 at = own + ((i * nb + j) * nc + k) * nd;
-                                const double *x = src + at;
-                                const double *y = src + a.base + i * a.stride[0] + j * a.stride[1] + k * a.stride[2];
-                                double *d = dst + at;
-                                const i64 step = a.stride[3];
-                                for (i64 m = 0; m < nd; ++m) d[m] = 0.5 * (x[m] + y[m * step]);
-                            }
+                    const i64 ext[4] = {na, nb, nc, nd};
+                    for_tiles(ext, [&](const Tile &t) { tile_tie(dst, ext, t, src, own, a); });
                 }
                 std::swap(src, dst);
             }
@@ -814,24 +876,32 @@ extern "C" void itercc_quad_project(const itercc_quad_layout *l, double *packed,
                 Affine a[24];
                 for (i64 t = 0; t < count_terms; ++t) a[t] = source_box(l, h, g, perms + 4 * t);
                 double *out = row + l->boff[((h * N + g[0]) * N + g[1]) * N + g[2]];
-                const i64 f0 = irreps.first[g[0]], f1 = irreps.first[g[1]], f2 = irreps.first[g[2]];
-                const i64 f3 = irreps.first[g[3]];
+                const i64 first[4] = {irreps.first[g[0]], irreps.first[g[1]], irreps.first[g[2]],
+                                      irreps.first[g[3]]};
                 const i64 ext[4] = {na, nb, nc, nd};
-                std::fill(out, out + na * nb * nc * nd, 0.0);
-                for (i64 t = 0; t < count_terms; ++t)
-                    box_permute(out, ext, src, a[t], perms + 4 * t, weights[t], BoxOp::add_weighted);
-                for (i64 i = 0; i < na; ++i)
-                    for (i64 j = 0; j < nb; ++j)
-                        for (i64 k = 0; k < nc; ++k) {
-                            double *o = out + ((i * nb + j) * nc + k) * nd;
-                            const i64 va = f0 + i, vb = f1 + j, vc = f2 + k;
-                            for (i64 m = 0; m < nd; ++m) {
-                                const i64 vd = f3 + m;
-                                const bool purified = (va == vb && (vb == vc || vb == vd)) ||
-                                                      (vc == vd && (va == vc || vb == vc));
-                                o[m] = purified ? 0.0 : alpha * o[m] / divisor + 0.0;
+                i64 ostride[4];
+                box_strides(ext, ostride);
+                // Tile by tile: the spin terms in order, then scaling and
+                // purification, while the tile stays in cache.
+                for_tiles(ext, [&](const Tile &t) {
+                    tile_zero(out, ext, t);
+                    for (i64 term = 0; term < count_terms; ++term)
+                        tile_term(out, ext, t, src, a[term], weights[term], BoxOp::add_weighted);
+                    double *corner = out + t.lo[0] * ostride[0] + t.lo[1] * ostride[1] + t.lo[2] * ostride[2] + t.lo[3];
+                    for (i64 i = 0; i < t.len[0]; ++i)
+                        for (i64 j = 0; j < t.len[1]; ++j)
+                            for (i64 k = 0; k < t.len[2]; ++k) {
+                                double *o = corner + i * ostride[0] + j * ostride[1] + k * ostride[2];
+                                const i64 va = first[0] + t.lo[0] + i, vb = first[1] + t.lo[1] + j;
+                                const i64 vc = first[2] + t.lo[2] + k;
+                                for (i64 m = 0; m < t.len[3]; ++m) {
+                                    const i64 vd = first[3] + t.lo[3] + m;
+                                    const bool purified = (va == vb && (vb == vc || vb == vd)) ||
+                                                          (vc == vd && (va == vc || vb == vc));
+                                    o[m] = purified ? 0.0 : alpha * o[m] / divisor + 0.0;
+                                }
                             }
-                        }
+                });
             }
         }
     }

@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+- Benchmarks: `benchmarks.singlet_eom_ccsdtq` times singlet EOM-CCSDTQ
+  actions by variant (no labels with the central difference, one residual
+  per action, sector labels, sector-only tiles on and off) on a synthetic C2v
+  model or a saved ground state and checks that they agree;
+  `benchmarks/_memory.py` traces resident memory by phase (and glibc's heap
+  in use, free and mapped), used by it and by the triplet CuF driver's
+  `--memory-trace`. `docs/benchmarks.md` adds CuF aug-cc-pVDZ-DK CCSDTQ and
+  singlet EOM-CCSDTQ and CuF triplet EOM-CCSDTQ actions and memory.
+
+- One-sided singlet EOM-CCSDTQ actions form only the target sector's R4
+  tile entries (`TileProgram._sector`, `ITERCC_EOM_SECTOR_TILES=0` forms
+  every allowed entry): an entry's tile offset is its rows' plus its
+  columns' (disjoint base-nv digits), so each fused block splits into the
+  row and column class pairs that reach the sector, half its multiply-adds
+  (counted on a 5o/36v C2v model, B1) with every product's segments and sum
+  order unchanged: the same action bit for bit. CuF aug-cc-pVDZ-DK B1 on one
+  Sapphire Rapids socket: tile programs 497 -> 375 s, the action 1186 ->
+  1040 s.
+- The R4 tile programs' fused GEMMs cut each product's sums into the fewest
+  equal chunks of at most 1024 (`ITERCC_TILE_KC`; `0` keeps chunks of 256
+  like the other GEMMs), so the deep pair products read and write their
+  block of the R4 tile about a quarter as often. Results change in rounding
+  only. CuF aug-cc-pVDZ-DK C2v CCSDTQ residual on one Sapphire Rapids
+  socket: tile programs 150.8 -> 140.6 s, the residual 302 -> 293 s; a
+  synthetic 4o/44v model on 12 desktop threads: 1.69 -> 1.55 s.
+- The packed T4 kernels combine boxes tile by tile (16^4 entries, every
+  term of a tile before the next tile): the projection, its occupied ties,
+  the row gathers, the permuted gathers and row permutations of the ring and
+  lower-rank passes, and the row adds. A box of a two-irrep layout (the
+  B1-subgroup labels of a singlet EOM-CCSDTQ solver) holds about 8 MB at 63
+  virtuals, and a term written over a whole box with strides took a cache
+  line per entry: the CuF aug-cc-pVDZ-DK B1 action spent 41 s projecting R4
+  against about 6 s for a C2v residual. The same terms in the same order per
+  entry: bitwise the same results. A synthetic 3o/62v B1 action on 12
+  desktop threads: 18.7-19.4 -> 17.1-17.7 s (projection 0.68 -> 0.52 s).
+- One-sided singlet EOM-CCSDTQ actions shift the engine's ground amplitudes
+  in place (the sector's entries are eps R during the residual and zero
+  after it, `QuadruplesSector.clear`, `itercc_sector_rows` mode 3; the
+  totally symmetric entries are never written) instead of a fresh copy of
+  T1-T4 per action: the same action bit for bit, with one T4 fewer (107 GB
+  for CuF aug-cc-pVDZ-DK with B1-subgroup labels). Read-only or
+  memory-mapped ground amplitudes are copied once, when the engine is made.
+  With the tiled T4 kernels and 1024-sum tile chunks above, the CuF B1
+  action on one Sapphire Rapids socket: 1004-1040 -> 765 s, peak 519 -> 413
+  GiB (the socket holds 503 GiB; the old peak spilled to the other socket's
+  memory). By phase (against the 1004 s action): tile programs 384 -> 294 s,
+  T4 into ranks two and three 318 -> 230 s, ring terms 163 -> 138 s, oooo
+  terms 72 -> 57 s, R4 projection 41 -> 26 s.
+- `combine_states` re-lays saved T4 on all threads on the CPU
+  (`CompiledQuadruplesLayout.accumulate_from`: parallel reads of the
+  memory-mapped source, `itercc_permute_virtuals4` for the virtual order,
+  parallel axpy; core ABI 42): CuF aug-cc-pVDZ-DK, 57 GB archived T4, 412 ->
+  167 s into the C2v layout (read from a network file system) and 438 -> 34 s
+  into the B1-subgroup layout (from the page cache).
+
 - Singlet EOM-CCSDTQ (`FiniteDifferenceEOM`) runs on symmetry-blocked
   solvers: with `orbital_irreps=spatial_symmetry.sector_labels(labels,
   irrep)` (the full group for irrep 0, the subgroup of half its order in

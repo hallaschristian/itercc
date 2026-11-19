@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import resource
+import sys
 from time import perf_counter
 
 import numpy as np
@@ -71,7 +72,22 @@ def slot_phases():
     return dict(zip(names, (round(float(x), 1) for x in seconds)))
 
 
-def run_solve(engine, args, signature):
+def memory_trace():
+    """Resident memory by phase (`benchmarks._memory.MemoryTrace`): around the
+    slot program, the rank-four direct terms and the lower-rank tiles of
+    every action; Davidson iterations are marked by `run_solve`."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _memory import MemoryTrace
+    from itercc import _spin_quadruples_cpu, _spin_quadruples_program
+
+    trace = MemoryTrace(lambda **row: print(json.dumps(row), flush=True))
+    trace.wrap(_spin_quadruples_program.SlotProgram, "run", "slot program")
+    trace.wrap(_spin_quadruples_cpu.PackedBinaryAction, "add_rank_four", "rank-4 direct terms")
+    trace.wrap(TripletEOMCCSDTQ, "_project_lower_tiles", "lower tiles")
+    return trace
+
+
+def run_solve(engine, args, signature, trace=None):
     identity = np.array(json.dumps(signature, sort_keys=True))
     guesses = None
     if args.output.exists():
@@ -101,10 +117,14 @@ def run_solve(engine, args, signature):
         print(json.dumps(dict(event="split_action", sockets=args.sockets,
                               slots_here=len(engine.rank_four_slots),
                               slots_total=len(engine._direction_t4.slots))), flush=True)
+    def progress(info):
+        print(json.dumps(info), flush=True)
+        if trace is not None:
+            trace.mark(f"davidson iteration {info['iteration']}")
+
     result = engine.solve(
         args.roots, residual_tol=1e-6, max_iter=args.max_iter, max_space=2 * args.roots + 5,
-        guesses=guesses, callback=lambda info: print(json.dumps(info), flush=True),
-        checkpoint_callback=checkpoint)
+        guesses=guesses, callback=progress, checkpoint_callback=checkpoint)
     if partners is not None:
         partners.close()
     spin_defects = [float(np.linalg.norm(vector - engine.space.project(vector)))
@@ -179,12 +199,15 @@ def main():
                         help="Threads of each worker process (default: ITERCC_CPU_THREADS)")
     parser.add_argument("--intermediate-precision", choices=("double", "single"), default="double",
                         help="single: rank-four slot-program intermediates rounded to float32 (opt-in)")
+    parser.add_argument("--memory-trace", action="store_true",
+                        help="resident memory by phase of every action and Davidson iteration")
     args = parser.parse_args()
     solve = args.mode == "solve"
     if solve and (args.output is None or args.roots < 1 or args.max_iter < 1):
         parser.error("An eigensolve requires an output checkpoint and positive root and iteration counts")
     if args.sockets < 1 or (args.sockets > 1 and not solve):
         parser.error("--sockets splits the actions of an eigensolve")
+    trace = memory_trace() if args.memory_trace else None
     engine, ground, setup_seconds = build_engine(args.ground, args.memory_gib, args.cache_gib,
                                                  args.occupied_slab, args.irrep, solve=solve,
                                                  intermediate_precision=args.intermediate_precision)
@@ -197,8 +220,12 @@ def main():
                           occupied_slab=engine.occupied_slab,
                           intermediate_precision=engine.intermediate_precision)),
           flush=True)
+    if trace is not None:
+        trace.mark("engine")
     if solve:
-        run_solve(engine, args, signature)
+        run_solve(engine, args, signature, trace)
+        if trace is not None:
+            print(json.dumps(dict(event="memory_peak", peak_GiB=trace.overall_peak_GiB)), flush=True)
         return
 
     vector = np.random.default_rng(714).standard_normal(engine.space.size)

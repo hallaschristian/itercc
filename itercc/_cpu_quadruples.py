@@ -378,6 +378,36 @@ class CompiledQuadruplesLayout(NumpyQuadruplesLayout):
                                   dense.ctypes.data, self._n())
         return dense
 
+    def accumulate_from(self, out, weight, source, source_layout, perm=None):
+        """out += weight * `source` re-laid into this layout (see QuadruplesLayout),
+        every pass on all threads: each batch of the source read (saved
+        amplitudes are memory-mapped files, which a NumPy pass faults in on one
+        thread: 57 GB of aug-cc-pVDZ CuF T4 in 7 minutes), expanded, its
+        virtual axes permuted, compressed and added."""
+        if (source_layout.dense_shape != self.dense_shape or hasattr(source, "read")
+                or not (isinstance(out, np.ndarray) and out.dtype == np.float64 and out.flags.c_contiguous)):
+            return super().accumulate_from(out, weight, source, source_layout, perm)
+        library, n = self._kernels, self._n()
+        same = (perm is None and np.array_equal(self.occupied_irreps, source_layout.occupied_irreps)
+                and np.array_equal(self.virtual_irreps, source_layout.virtual_irreps))
+        perm = None if perm is None else np.ascontiguousarray(perm, dtype=np.int64)
+        flat = np.asarray(source).reshape(-1)
+        for first, stop in self.batches():
+            window = self.segment(first, stop)
+            part = copy(flat[source_layout.segment(first, stop)])
+            if not same:
+                dense = source_layout.expand(part, first, stop)
+                if perm is not None:
+                    permuted = np.empty_like(dense)
+                    library.permute_virtuals4(dense.ctypes.data, permuted.ctypes.data, stop - first,
+                                              self.nvir, perm.ctypes.data, n)
+                    dense = permuted
+                part = np.empty(window.stop - window.start)
+                self.compress(np.ascontiguousarray(dense), part, first)
+                del dense
+            target = out[window]
+            library.axpy(target.ctypes.data, part.ctypes.data, float(weight), target.size, n)
+
     def compress(self, dense, segment, first):
         if not self.symmetric:
             return super().compress(dense, segment, first)

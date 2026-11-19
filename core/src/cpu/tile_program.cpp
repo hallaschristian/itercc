@@ -14,6 +14,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 #include "contract.h"
@@ -198,6 +199,22 @@ namespace {
 
 constexpr i64 kFusedPiece = 256;   // columns per team task
 
+// Most sums per chunk of the tile programs' fused products: each product's
+// sums are cut into the fewest equal chunks of at most this many (each chunk
+// reads and writes the product's block of the R4 tile once). CuF
+// aug-cc-pVDZ-DK C2v, one Sapphire Rapids socket: tile programs 153.8 s with
+// chunks of 256 (kGemmKc), 149.5 s of 512, 146.8 s of 1024. ITERCC_TILE_KC
+// sets it (0: chunks of kGemmKc, the rounding of the other GEMMs).
+constexpr i64 kTileChunk = 1024;
+i64 tile_chunk()
+{
+    static const i64 most = [] {
+        const char *text = std::getenv("ITERCC_TILE_KC");
+        return text == nullptr || *text == 0 ? kTileChunk : std::max<i64>(0, std::atoll(text));
+    }();
+    return most;
+}
+
 // The segments of a fused block for the slot with occupied indices o.
 // An operand's start: base `index` (-1: the slot's T4 tile) at element offset
 // `at`, in floats when base_f32 flags the base.
@@ -240,7 +257,8 @@ void fused_block(const itercc_fused_block &b, const itercc_fused_segment *segmen
 #ifdef ITERCC_PROFILE_SYM
     const double start = omp_get_wtime();
 #endif
-    itercc::fused_gemm({b.rows, j0, j1, b.seg_count, segs.data(), tile + b.o_base, b.rpos, b.cpos});
+    itercc::fused_gemm({b.rows, j0, j1, b.seg_count, segs.data(), tile + b.o_base, b.rpos, b.cpos, 0,
+                        tile_chunk()});
 #ifdef ITERCC_PROFILE_SYM
     if (b.tag >= 0 && b.tag < kTagSlots) {
         double old = tag_time[b.tag].load(), add = omp_get_wtime() - start;

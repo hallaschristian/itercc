@@ -129,7 +129,11 @@ order otherwise (C2v B1: labels mod B1, two irreps); `combine_states` re-lays
 saved amplitudes of any symmetry into the solver's layout. For a target irrep
 other than the totally symmetric one, one residual per action replaces the
 central difference: the sector part of Res(T + eps R) has only odd powers of
-eps, so over eps it equals the central difference term for term. Without labels the solver runs every
+eps, so over eps it equals the central difference term for term. Such an
+action shifts the ground amplitudes it was given in place (their target-sector
+entries, which symmetry keeps at zero, hold eps R during the residual and are
+zero again after it), so an action holds one copy of T rather than two. Without
+labels the solver runs every
 GEMM as C1 on dense T4: on a C2v model (4 occupied, 20 virtual) an action
 took 1.07 s that way, 0.21 s (B1, A2) and 0.25 s (A1) with sector labels, the
 same action to 3e-16 (7e-13 for A1, the central difference's rounding). The
@@ -322,6 +326,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TEAM_SCHEDULE` | call | `rounds`: CCSDTQ teams in fixed rounds (diagnostic) |
 | `ITERCC_LOWER_CHUNK` | call | occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB) |
 | `ITERCC_DIIS_COMPACT` | call | `0`: float64 instead of compact float32 host T4 DIIS history |
+| `ITERCC_EOM_SECTOR_TILES` | call | `0`: one-sided singlet EOM-CCSDTQ actions form every allowed R4 tile entry, not only those of the target sector |
 | `ITERCC_TRIPLET_PROGRAM` | call | `0`: triplet EOM-CCSDTQ rank-four slots in the Python loop instead of the compiled program |
 | `ITERCC_TRIPLET_FUSED` | call | `0`: triplet slot program adds products into a tile one by one (the loop's action bit for bit) |
 | `ITERCC_DIRECT_DENSE` | call | `0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts |
@@ -347,6 +352,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_SYM_MIN_SHARE` | core | GEMM executor: least work per thread of a shared block |
 | `ITERCC_SYM_PARALLEL_WORK` | core | GEMM executor: work from which one block runs on all threads |
 | `ITERCC_GEMM_NC` | core | `auto`: narrower GEMM column blocks for deep products (experiment) |
+| `ITERCC_TILE_KC` | core | most sums per chunk of the R4 tile programs' fused GEMMs (`0`: chunks of 256 like the other GEMMs) |
 | `ITERCC_GEMM_KNOCKOUT` | core | GEMM micro-kernel stages to skip (timing diagnostic only) |
 | `ITERCC_GEMM_AUTOTUNE` | import | `0`: CUDA GEMM routes chosen statically instead of timed |
 | `ITERCC_BOUNDED_GEMM` | import | `1`: CUDA slab einsum products through the GEMM router |
@@ -354,6 +360,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_SYMMETRY_FUSED_DEPTH` | import | CUDA symmetry blocks: deepest fused-kernel sum |
 | `ITERCC_SYMMETRY_FUSED_SKINNY` | import | CUDA symmetry blocks: widest skinny fused product |
 | `ITERCC_SYMMETRY_DIRECT_DEPTH` | import | CUDA symmetry blocks: deepest direct-kernel sum |
+
 
 ## How results are validated
 

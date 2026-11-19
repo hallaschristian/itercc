@@ -83,11 +83,34 @@ class _Recorded:
 class _Fused:
     """The terms of a recorded program as fused blocks (itercc_fused_tile_program)."""
 
-    def __init__(self, block_start, block_count, blocks, segments, keep, partitions):
+    def __init__(self, block_start, block_count, blocks, segments, keep, partitions, tables=None):
         self.block_start, self.block_count = block_start, block_count
         self.blocks, self.segments = blocks, segments
         self.keep = keep                  # offset tables the blocks and segments point into
         self.partitions = partitions      # row letters of each tag
+        # Per pattern, the blocks as (tag, rpos, cpos, segments), each segment
+        # with its row and column offset tables: for `TileProgram._sector`.
+        self.tables = tables
+        self.sectors = {}                 # (labels, targets) -> (pattern, _Fused)
+
+
+def _pack_fused(block_start, block_count, blocks, segments, keep, partitions, tables=None):
+    """A _Fused from Python block and segment tuples."""
+    fused_blocks = (_core.FusedBlock * max(1, len(blocks)))()
+    for target, values in zip(fused_blocks, blocks):
+        (target.rows, target.cols, target.rpos, target.cpos, target.seg_start, target.seg_count,
+         target.tag) = values
+        target.o_base = 0
+    fused_segments = (_core.FusedSegment * max(1, len(segments)))()
+    for target, values in zip(fused_segments, segments):
+        target.x_base, target.y_base = values[0], values[1]
+        target.x_coef[:] = values[2]
+        target.y_coef[:] = values[3]
+        target.x_rows, target.x_sum, target.y_sum, target.y_cols = values[4:8]
+        target.depth, target.alpha, target.flags = values[8:11]
+    return _Fused(np.ascontiguousarray(block_start, dtype=np.int64),
+                  np.ascontiguousarray(block_count, dtype=np.int64), fused_blocks, fused_segments,
+                  keep, partitions, tables)
 
 
 def blocked_t3_enabled():
@@ -125,6 +148,9 @@ class TileProgram:
         self._recorded = {}
         self._failed = set()
         self._pairs = None
+        # (virtual labels, class per slot): form only the tile entries of that
+        # sector (`_sector`); None forms every allowed entry.
+        self.output_sector = None
 
     def pairs(self):
         """The pair blocking of T3-like bases (virtual irreps of the layout)."""
@@ -193,6 +219,9 @@ class TileProgram:
         live = self._out.nbytes * (2 if t4 is not None else 1)
         self.team = team_size(threads, live)
         if fused and fusion_enabled():
+            pattern = self.pattern
+            if self.output_sector is not None and fused.tables is not None:
+                pattern, fused = self._sector(fused, self.output_sector)
             narrow = {name: array for name, array in (narrow or {}).items()
                       if name in bases and array.shape == bases[name].shape and array.dtype == np.float32
                       and array.flags.c_contiguous and bases[name].flags.c_contiguous}
@@ -201,7 +230,7 @@ class TileProgram:
             flags = (ctypes.c_uint8 * max(1, len(arrays)))(*[int(a.dtype == np.float32) for a in arrays])
             self.library.fused_tile_program(
                 self.layout._layout, len(self.slots), self.slots.ctypes.data, self.occupied.ctypes.data,
-                self.pattern.ctypes.data, fused.block_start.ctypes.data, fused.block_count.ctypes.data,
+                pattern.ctypes.data, fused.block_start.ctypes.data, fused.block_count.ctypes.data,
                 ctypes.cast(fused.blocks, ctypes.c_void_p), ctypes.cast(fused.segments, ctypes.c_void_p),
                 ctypes.cast(pointers, ctypes.c_void_p), ctypes.cast(flags, ctypes.c_void_p),
                 None if packed is None else packed.ctypes.data, r4.ctypes.data, float(beta), threads,
@@ -301,15 +330,16 @@ class TileProgram:
             return hit
 
         def address(table, start, order):
+            """(address, entries) of a block's offset table in canonical order."""
             if order[0] is None:
-                return table.ctypes.data + 8 * start
+                return table.ctypes.data + 8 * start, table[start:start + len(order[1])]
             key = (id(table), start, order[2])
             hit = permuted.get(key)
             if hit is None:
                 hit = permuted[key] = np.ascontiguousarray(
                     table[start:start + len(order[0])][order[0]], dtype=np.int64)
                 keep.append(hit)
-            return hit.ctypes.data
+            return hit.ctypes.data, hit
 
         def canon(keys):
             code = keys.tobytes()
@@ -321,7 +351,7 @@ class TileProgram:
 
         sides = self._blocked_sides(recorded, names, swapped)
         keep.extend(table for side in sides.values() for table in side[1:])
-        block_start, block_count, blocks, segments = [], [], [], []
+        block_start, block_count, blocks, segments, tables = [], [], [], [], []
         for kind in range(len(self.representatives)):
             local, where = [], {}
             for number, (term, (normal, tag)) in enumerate(zip(recorded.terms, info)):
@@ -343,10 +373,10 @@ class TileProgram:
                         y = (a_index, term.a_coef, a_base, a_free, r0, a_sum)
                         flags = (0 if term.flags & 2 else 1) | (0 if term.flags & 1 else 2)
                     (rpos, r_code), (cpos, c_code) = canon(r_order[1]), canon(c_order[1])
+                    (x_rows, x_table), (y_cols, y_table) = address(x[3], x[4], r_order), address(y[3], y[4], c_order)
                     segment = (x[0], y[0], [x[1][0] + x[2], *x[1][1:]], [y[1][0] + y[2], *y[1][1:]],
-                               address(x[3], x[4], r_order), x[5].ctypes.data + 8 * k0,
-                               y[5].ctypes.data + 8 * k0, address(y[3], y[4], c_order),
-                               depth, term.alpha, flags)
+                               x_rows, x[5].ctypes.data + 8 * k0, y[5].ctypes.data + 8 * k0, y_cols,
+                               depth, term.alpha, flags, x_table, y_table)
                     block = where.get((tag, r_code, c_code))
                     if block is None:
                         block = where[(tag, r_code, c_code)] = len(local)
@@ -360,25 +390,70 @@ class TileProgram:
                     raise Unsupported
             block_start.append(len(blocks))
             block_count.append(len(local))
+            tables.append(local)
             for tag, rpos, cpos, own in local:
                 blocks.append((len(rpos), len(cpos), rpos.ctypes.data, cpos.ctypes.data,
                                len(segments), len(own), tag))
                 segments.extend(own)
-        fused_blocks = (_core.FusedBlock * max(1, len(blocks)))()
-        for target, values in zip(fused_blocks, blocks):
-            (target.rows, target.cols, target.rpos, target.cpos, target.seg_start, target.seg_count,
-             target.tag) = values
-            target.o_base = 0
-        fused_segments = (_core.FusedSegment * max(1, len(segments)))()
-        for target, values in zip(fused_segments, segments):
-            target.x_base, target.y_base = values[0], values[1]
-            target.x_coef[:] = values[2]
-            target.y_coef[:] = values[3]
-            target.x_rows, target.x_sum, target.y_sum, target.y_cols = values[4:8]
-            target.depth, target.alpha, target.flags = values[8:]
-        return _Fused(np.ascontiguousarray(block_start, dtype=np.int64),
-                      np.ascontiguousarray(block_count, dtype=np.int64), fused_blocks, fused_segments,
-                      keep, {tag: rows for rows, tag in partitions.items()})
+        return _pack_fused(block_start, block_count, blocks, segments, keep,
+                           {tag: rows for rows, tag in partitions.items()}, tables)
+
+    def _sector(self, fused, sector):
+        """`fused` restricted to the tile entries of one symmetry sector: for
+        `sector` = (virtual labels, slot classes) the entries (a, b, c, d) of
+        slot s whose labels XOR to classes[s] (the EOM sector of a finer group
+        than the layout's). An entry's offset is its rows' plus its columns'
+        (disjoint base-nv digits of the dense tile), so a block's rows and
+        columns take the classes of their digits and each block splits into
+        the row and column class pairs that reach the sector: about half the
+        rows times half the columns of the block, the summed dimension whole.
+        Returns (pattern per slot, _Fused); the other entries are not formed."""
+        virtual, classes = sector
+        key = (virtual.tobytes(), classes.tobytes())
+        hit = fused.sectors.get(key)
+        if hit is not None:
+            return hit
+        nv = len(virtual)
+
+        def digits(pos):
+            label = np.zeros(len(pos), dtype=np.int64)
+            for _ in range(4):
+                label ^= virtual[pos % nv]
+                pos = pos // nv
+            return label
+
+        refined, pattern = {}, np.empty(len(self.pattern), dtype=np.int64)
+        for s, (kind, target) in enumerate(zip(self.pattern.tolist(), classes.tolist())):
+            pattern[s] = refined.setdefault((kind, target), len(refined))
+        keep = [fused.keep]
+        block_start, block_count, blocks, segments = [], [], [], []
+        for kind, target in refined:
+            count = 0
+            block_start.append(len(blocks))
+            for tag, rpos, cpos, own in fused.tables[kind]:
+                r_class, c_class = digits(rpos), digits(cpos)
+                for alpha in np.unique(r_class).tolist():
+                    rows = np.flatnonzero(r_class == alpha)
+                    cols = np.flatnonzero(c_class == (alpha ^ target))
+                    if not (rows.size and cols.size):
+                        continue
+                    sub_r = np.ascontiguousarray(rpos[rows])
+                    sub_c = np.ascontiguousarray(cpos[cols])
+                    keep.extend((sub_r, sub_c))
+                    first = len(segments)
+                    for x in own:
+                        x_rows = np.ascontiguousarray(x[11][rows], dtype=np.int64)
+                        y_cols = np.ascontiguousarray(x[12][cols], dtype=np.int64)
+                        keep.extend((x_rows, y_cols))
+                        segments.append((*x[:4], x_rows.ctypes.data, x[5], x[6], y_cols.ctypes.data, *x[8:11]))
+                    blocks.append((rows.size, cols.size, sub_r.ctypes.data, sub_c.ctypes.data, first,
+                                   len(own), tag))
+                    count += 1
+            block_count.append(count)
+        hit = fused.sectors[key] = (np.ascontiguousarray(pattern),
+                                    _pack_fused(block_start, block_count, blocks, segments, keep,
+                                                fused.partitions))
+        return hit
 
     def _locate(self, array, names, bases, tile):
         """(base index, element offset) of an operand: into the T4 tile (base -1)
