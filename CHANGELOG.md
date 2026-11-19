@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Triplet tile products sum an exchangeable pair once (`_spin_quadruples_tiles.
+  exchange_pairs`, `paired_routes`). Two summed letters that every operand
+  holding one holds both of, in one antisymmetric half (mn of g(oovv) T4,
+  ef of g(vovv) T3, ...), leave the summand unchanged when they swap: the
+  spin route with (beta, alpha) on them equals the (alpha, beta) one and is
+  dropped, and a route with equal spins sums over x < y only (the planner
+  now applies ordering constraints between summed letters too:
+  `symmetry_blocks.summed_pairs`); every route kept counts twice per pair.
+  The g T4 intermediates were most of the slot program's intermediate work
+  and nearly all of its packed-T4 reads; at CuF size (first 1500 slots)
+  their multiply-adds fall 5.4e11 -> 3.0e11 and packed-T4 entries read
+  7.6e10 -> 3.7e10, tile products 1.43e12 -> 1.24e12. 6o/24v synthetic
+  model: rank four 16.6 -> 13.3 s, the action moving at rounding (2.8e-14).
+  The blocked engines (CPU and CUDA) take it in ranks two to four; a product
+  that falls back to a plain einsum is scaled by 1/2 per pair.
+  `ITERCC_PAIR_SUMS=0` sums both orders.
 - Triplet dense rank-three tensors (ground T3 and each action's R3) are stored
   with the occupied axes outermost and viewed with the usual axes
   (`eom_spin_quadruples.holes_first_layout`; R3 is unpacked that way at no

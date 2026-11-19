@@ -89,6 +89,9 @@ SWITCHES = {
         "order, not irrep order"),
     "ITERCC_HOLES_FIRST": Switch(
         "1", "call", "`0`: triplet dense rank-three tensors with the occupied axes innermost, not outermost"),
+    "ITERCC_PAIR_SUMS": Switch(
+        "1", "call", "`0`: triplet tile products sum both orders of an exchangeable pair of summed "
+        "letters instead of x < y twice"),
     "ITERCC_COMPACT_TILES": Switch(
         "1", "call", "`0`: triplet slot-program tiles stored whole (nv^4), not only their ordered entries"),
     "ITERCC_COMPACT_INTERMEDIATES": Switch(

@@ -18,7 +18,7 @@ import numpy as np
 from . import _cpu_kernels
 from ._runtime import cpu_threads
 from ._tensor_scatter import SignedRows
-from .symmetry_blocks import SymmetryBlocks, _offsets, _position_key, positions_key
+from .symmetry_blocks import SymmetryBlocks, _offsets, _position_key, positions_key, summed_pairs
 
 _COLUMNS = ("a_rows", "a_sum", "b_sum", "b_cols", "rpos", "cpos")
 
@@ -155,7 +155,7 @@ class CpuSymmetryBlocks(SymmetryBlocks):
             if self.fallback is None:
                 raise ValueError(f"No symmetry-blocked plan for {spec}")
             b = b.dense() if isinstance(b, SignedRows) else b
-            return self.fallback(spec, a, b, out=out, alpha=alpha, beta=beta)
+            return self.fallback(spec, a, b, out=out, alpha=alpha * 0.5 ** summed_pairs(spec, ordered), beta=beta)
         threads = cpu_threads(self.threads if threads is None else threads)
         library = self._library
         if beta != 1.0:

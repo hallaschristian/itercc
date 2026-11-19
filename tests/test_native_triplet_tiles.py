@@ -315,6 +315,34 @@ def test_holes_first_rank_three_keeps_the_action(monkeypatch):
     np.testing.assert_allclose(engine.sigma(vector), plain, rtol=1e-12, atol=1e-13 * np.abs(plain).max())
 
 
+def test_exchangeable_pairs_are_summed_once(monkeypatch):
+    """A pair of summed letters that every operand holding one holds both of,
+    in one antisymmetric half, is summed once: the (beta, alpha) route is
+    dropped, equal spins sum over x < y, and every kept route counts twice.
+    The action moves at rounding only."""
+    from itercc._spin_quadruples_tiles import exchange_pairs, paired_routes, routes
+    from itercc.symmetry_blocks import summed_pairs
+    assert exchange_pairs("klcd,abcdijkl->abij", ("goovv", "t4")) == (("k", "l"), ("c", "d"))
+    assert exchange_pairs("lmde,ablm,cdeijk->abcijk", ("goovv", "t2", "t3")) == (("l", "m"), ("d", "e"))
+    assert exchange_pairs("akci,bcjk->abij", ("gvovo", "t2")) == ()
+    assert exchange_pairs("me,abim,cdejkl->abcdijkl", ("fov", "t2", "t3")) == ()
+    spec, target = "mnef,bcdfklmn->bcdekl", (0, 0, 0, 0, 0, 1)
+    kept = paired_routes(spec, ("goovv", "t4"), target, 1)
+    every = routes(spec, target, 1)
+    assert 0 < len(kept) < len(every) and all(factor == 2 for _, factor, _ in kept)
+    assert summed_pairs("mnef,abmn->abef", (("m", "n", True), ("a", "b", True))) == 1
+    engine = _split_engine()
+    vector = np.random.default_rng(767).normal(size=engine.space.size)
+    monkeypatch.setenv("ITERCC_PAIR_SUMS", "0")
+    engine._slot_programs = {}
+    both = engine.sigma(vector)
+    monkeypatch.setenv("ITERCC_PAIR_SUMS", "1")
+    engine._slot_programs = {}
+    np.testing.assert_allclose(engine.sigma(vector), both, rtol=1e-12, atol=1e-13 * np.abs(both).max())
+    program = next(p for p in engine._slot_programs.values() if p is not None)
+    assert any(c[0] not in info[0].split("->")[1] for info in program._contraction_info for c in info[5])
+
+
 def test_compact_tiles_keep_the_action(monkeypatch):
     """Tiles store only the entries their kind's products form and its
     gathers read (each chain of ordered particle letters one axis of ranks):

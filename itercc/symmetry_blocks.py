@@ -376,6 +376,16 @@ def _parse(spec):
     return first, second, output
 
 
+def summed_pairs(spec, ordered):
+    """How many constraints of `ordered` link two summed letters of `spec`:
+    each restricts the sum to x < y (an exchangeable pair, whose sum over both
+    orders is twice that; the caller doubles alpha), so a fallback product
+    over the whole sum is scaled by 1/2 per pair."""
+    sa, sb, so = _parse(spec)
+    summed = set(sa) & set(sb) - set(so)
+    return sum(1 for x, y, _ in ordered if x in summed and y in summed)
+
+
 def _composite(letters, extent, labels, nirrep, ordered=()):
     """Sorted composite index over `letters`: permutation, per-irrep starts and irreps.
 
@@ -624,7 +634,8 @@ class SymmetryBlocks:
         # Ordered free letters of one operand: only those output entries are formed.
         r_sorted = self._sorted(vrow, extent, labels, ordered)
         c_sorted = self._sorted(vcol, extent, labels, ordered)
-        k_sorted = self._sorted(summed, extent, labels)
+        # Ordered summed letters: the sum runs over those tuples only.
+        k_sorted = self._sorted(summed, extent, labels, ordered)
         (_, _, r_start), (_, _, c_start), (_, _, k_start) = r_sorted, c_sorted, k_sorted
         combos_r = list(product(*[range(extent[c]) for c in orow]))
         combos_c = list(product(*[range(extent[c]) for c in ocol]))
@@ -785,7 +796,8 @@ class SymmetryBlocks:
 
     def einsum(self, spec, a, b, out, alpha=1.0, beta=0.0, labels=None, irreps=(0, 0), ordered=()):
         """out = beta * out + alpha * einsum(spec, a, b) (with `ordered`, only
-        the output entries those constraints keep; see `_composite`).
+        the output entries those constraints keep, and sums over only the
+        summed tuples they keep; see `_composite` and `summed_pairs`).
 
         `labels` replaces the labels of any letters for this call; `irreps`
         gives the total irreps of `a` and `b` (zero for totally symmetric
@@ -806,7 +818,7 @@ class SymmetryBlocks:
         if not structure or (plan["count"] and not plan.get("fused") and _grouped_gemm() is None):
             if self.fallback is None:
                 raise ValueError(f"No symmetry-blocked plan for {spec}")
-            return self.fallback(spec, a, b, out=out, alpha=alpha, beta=beta)
+            return self.fallback(spec, a, b, out=out, alpha=alpha * 0.5 ** summed_pairs(spec, ordered), beta=beta)
         if beta == 0.0:
             out[...] = 0.0
         elif beta != 1.0:
@@ -890,7 +902,8 @@ class SymmetryBlocks:
     def _resolve(self, spec, a, b, out, labels, irreps, ordered=()):
         """(structure, plan) for one call signature, or (False, None) for the fallback.
         `ordered`: (letter, letter, strict) constraints on free output letters
-        (see `_composite`); the other output entries are not written."""
+        (see `_composite`), whose other output entries are not written, and on
+        summed letters, whose other summed tuples are skipped."""
         current = self.labels if not labels else {**self.labels,
                                                    **{c: np.asarray(v, dtype=np.int64)
                                                       for c, v in labels.items()}}

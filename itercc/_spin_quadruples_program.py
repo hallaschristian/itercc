@@ -44,6 +44,11 @@ single-threaded contraction routes and its raw tile in that thread's caches.
   gathers read (`_tile_layout`: each chain of ordered particle letters one
   axis of ranks): a third of the dense nv^4 on average at CuF size, so most
   tiles stay in a core's L2 and are cleared three times faster.
+* A pair of summed letters that every operand holding one holds both of, in
+  one antisymmetric half (the mn of the g T4 products), is summed once
+  (`paired_routes`): the (beta, alpha) route is dropped and equal spins sum
+  over x < y, each kept route counting twice. That halves the g T4
+  intermediates, their packed-T4 reads included.
 * Each tile's gathers go to partial sums, added to the slot's rows in the
   order of the Python loop and divided by (4!)^2 as it does, so the action is
   the loop's bit for bit, on any number of threads.
@@ -60,7 +65,7 @@ import numpy as np
 
 from . import _cpu_kernels, _runtime
 from ._spin_quadruples_tiles import (_PACKED_TILE_BYTES, _packed_cuts, ordered_letters, _tree_irrep, contraction_schedule,
-                                     external_routes, routes)
+                                     exchange_pairs, external_routes, node_sums, routes, tile_routes)
 from ._tensor_scatter import SignedRows, _gather_steps
 from .symmetry_blocks import OffsetGroup, PositionedView
 
@@ -584,7 +589,9 @@ class SlotProgram:
                     continue
                 number, positions = kind.contracts[plan]
                 spec, operands, labels, irreps, ordered = self._contraction_keys[number]
-                ordered = tuple(sorted((x, y, strict) for (x, y), strict in constraints.items()))
+                output = spec.split("->")[1]
+                summed = tuple(c for c in ordered if c[0] not in output)    # its sums over x < y stay
+                ordered = summed + tuple(sorted((x, y, strict) for (x, y), strict in constraints.items()))
                 kind.contracts[plan] = (self._number((spec, operands, labels, irreps, ordered)), positions)
 
     def _record(self, group, raw):
@@ -606,10 +613,12 @@ class SlotProgram:
             else:
                 slabs = _packed_cuts(inputs[t4][4:], tuple((c, 0, 1) for c in cut), no, nv, _PACKED_TILE_BYTES,
                                      self.slab)
+            sliced = {c for pieces in slabs for c, _ in pieces}
+            paired = not any(x in sliced or y in sliced for x, y in exchange_pairs(spec, names))
             for derivative in range(len(names)):
                 if not self.presence[names[derivative]]:
                     continue
-                for signatures in routes(spec, raw, derivative):
+                for signatures, factor, sums in tile_routes(spec, names, raw, derivative, paired):
                     for pieces in slabs:
                         selected = {c: (s.start, s.stop) for c, s in pieces}
                         selected.update({c: (_FIXED, q) for c, q in cut.items()})
@@ -624,7 +633,9 @@ class SlotProgram:
                             if isinstance(tree, int):
                                 return (names[tree], tree == derivative, signatures[tree],
                                         tuple(selected.get(c, _ALL) for c in inputs[tree]))
-                            return tree[0], key_of(tree[1]), key_of(tree[2])
+                            key = tree[0], key_of(tree[1]), key_of(tree[2])
+                            node = node_sums(tree[0], sums)
+                            return key + (node,) if node else key
 
                         irreps = tuple(self.irrep if i == derivative else 0 for i in range(len(names)))
 
@@ -649,7 +660,8 @@ class SlotProgram:
                             kind.inters[number] = (identity, positions, shape)
                             value = (INTER, number, shape, _c_strides(shape), None)
                             self._contract(kind, inner, a, b, value, 1.0, 0.0, selected,
-                                           (_tree_irrep(left, irreps), _tree_irrep(right, irreps)))
+                                           (_tree_irrep(left, irreps), _tree_irrep(right, irreps)),
+                                           node_sums(inner, sums))
                             kind.code.append((PUBLISH, number, -1, -1, None, None, None, 0.0, 0.0))
                             kind.code[look][2] = len(kind.code)
                             known[key] = value
@@ -659,8 +671,8 @@ class SlotProgram:
                         # Only the entries the projection reads (`ordered_letters`).
                         ordered = ordered_letters(self.groups[group][0], raw, output)
                         if len(names) == 2:
-                            self._contract(kind, spec, operand(0), operand(1), tile, coefficient, 1.0,
-                                           selected, irreps, ordered)
+                            self._contract(kind, spec, operand(0), operand(1), tile, coefficient * factor, 1.0,
+                                           selected, irreps, ordered + node_sums(spec, sums))
                             continue
                         if len(names) < 2:
                             raise Unsupported
@@ -670,8 +682,9 @@ class SlotProgram:
                         view = (TILE, self._view(layout, order), tuple(tile_shape[o] for o in order),
                                 tuple(tile_strides[o] for o in order), None)
                         a, b = evaluate(left), evaluate(right)
-                        self._contract(kind, binary, a, b, view, coefficient, 1.0, selected,
-                                       (_tree_irrep(left, irreps), _tree_irrep(right, irreps)), ordered)
+                        self._contract(kind, binary, a, b, view, coefficient * factor, 1.0, selected,
+                                       (_tree_irrep(left, irreps), _tree_irrep(right, irreps)),
+                                       ordered + node_sums(binary, sums))
         return kind
 
     def _kind(self, group, raw):

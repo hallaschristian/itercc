@@ -2,11 +2,12 @@
 from collections import defaultdict
 from ._intermediate_cache import IntermediateCache  # compatibility import
 from functools import lru_cache
-from itertools import product
+from itertools import combinations, product
 from math import factorial, prod
 
 import numpy as np
 
+from . import _runtime
 from ._spin_quadruples_diagrams import DIAGRAMS
 from ._tensor_symmetry import signed_permutations
 from .bounded_einsum import einsum, einsum_into
@@ -59,11 +60,23 @@ def contraction_schedule(spec, no, nv, fixed=()):
     return min((c for c in candidates if c[0][1] <= limit), key=lambda c: c[0])[2]
 
 
-def _expression_key(tree, keys):
+def node_sums(spec, sums):
+    """Ordering constraints (x, y, True) of the pairs in `sums` that the
+    binary product `spec` sums over (see `paired_routes`)."""
+    if not sums:
+        return ()
+    inputs, output = spec.split("->")
+    a, b = inputs.split(",")
+    return tuple((x, y, True) for x, y in sums if x in a and x in b and x not in output)
+
+
+def _expression_key(tree, keys, sums=()):
     if isinstance(tree, int):
         return keys[tree]
     spec, left, right = tree
-    return spec, _expression_key(left, keys), _expression_key(right, keys)
+    key = spec, _expression_key(left, keys, sums), _expression_key(right, keys, sums)
+    node = node_sums(spec, sums)
+    return key + (node,) if node else key      # a sum over x < y only: another value
 
 
 def _tree_irrep(tree, irreps):
@@ -72,19 +85,22 @@ def _tree_irrep(tree, irreps):
     return _tree_irrep(tree[1], irreps) ^ _tree_irrep(tree[2], irreps)
 
 
-def _evaluate(xp, tree, operands, keys=None, cache=None, blocked=None):
+def _evaluate(xp, tree, operands, keys=None, cache=None, blocked=None, sums=()):
     if isinstance(tree, int):
         return operands[tree]()
     spec, left, right = tree
-    key = _expression_key(tree, keys) if cache is not None else None
+    key = _expression_key(tree, keys, sums) if cache is not None else None
     if cache is not None:
         found = cache.get(key)
         if found is not None:
             return found
-    a = _evaluate(xp, left, operands, keys, cache, blocked)
-    b = _evaluate(xp, right, operands, keys, cache, blocked)
+    a = _evaluate(xp, left, operands, keys, cache, blocked, sums)
+    b = _evaluate(xp, right, operands, keys, cache, blocked, sums)
+    node = node_sums(spec, sums)
     if blocked is None:
         result = einsum(xp, spec, a, b)
+        if node:
+            result *= 0.5 ** len(node)          # the sum over x < y: half the whole
     else:
         engine, labels, irreps = blocked
         lhs, output = spec.split("->")
@@ -92,15 +108,16 @@ def _evaluate(xp, tree, operands, keys=None, cache=None, blocked=None):
         extents = dict(zip(sa, a.shape)) | dict(zip(sb, b.shape))
         result = xp.empty(tuple(extents[c] for c in output), dtype=np.float64)
         engine.einsum(spec, a, b, result, labels=labels,
-                      irreps=(_tree_irrep(left, irreps), _tree_irrep(right, irreps)))
+                      irreps=(_tree_irrep(left, irreps), _tree_irrep(right, irreps)), ordered=node)
     if cache is not None:
         cache.put(key, result)
     return result
 
 
 def tile_product(xp, spec, operands, target, coefficient, no, nv, fixed=(), *, keys=None, cache=None,
-                 blocked=None, ordered=()):
-    """Evaluate only the requested occupied tile and accumulate into its output."""
+                 blocked=None, ordered=(), sums=()):
+    """Evaluate only the requested occupied tile and accumulate into its output
+    (`sums`: exchangeable pairs summed over x < y only, see `paired_routes`)."""
     _, output = spec.split("->")
     if len(operands) == 1:
         target += coefficient * xp.einsum(spec, operands[0]())
@@ -109,14 +126,16 @@ def tile_product(xp, spec, operands, target, coefficient, no, nv, fixed=(), *, k
     binary, left, right = tree
     axes = binary.split("->")[1]
     view = target.transpose(tuple(output.index(c) for c in axes))
-    a = _evaluate(xp, left, operands, keys, cache, blocked)
-    b = _evaluate(xp, right, operands, keys, cache, blocked)
+    a = _evaluate(xp, left, operands, keys, cache, blocked, sums)
+    b = _evaluate(xp, right, operands, keys, cache, blocked, sums)
+    node = node_sums(binary, sums)
     if blocked is None:
-        einsum_into(xp, view, coefficient, binary, a, b)
+        einsum_into(xp, view, coefficient * 0.5 ** len(node), binary, a, b)
     else:
         engine, labels, irreps = blocked
         engine.einsum(binary, a, b, view, alpha=coefficient, beta=1.0, labels=labels,
-                      irreps=(_tree_irrep(left, irreps), _tree_irrep(right, irreps)), ordered=ordered)
+                      irreps=(_tree_irrep(left, irreps), _tree_irrep(right, irreps)),
+                      ordered=tuple(ordered) + node)
 
 
 def spin_blocks(tensor):
@@ -142,6 +161,77 @@ def routes(spec, target, derivative):
                for i, s in enumerate(signatures)):
             selected.append(signatures)
     return tuple(selected)
+
+
+def _halves(name, length):
+    """Antisymmetric halves (positions) of a diagram operand: the
+    antisymmetrized integrals <pq||rs> (g...) and their T1 tangents in (p, q)
+    and (r, s); amplitudes (t_k and their tangents r_k) among particles and
+    among holes; none for the Fock blocks."""
+    if name.startswith("g") and length == 4:
+        return ((0, 1), (2, 3))
+    if name[:1] == "t" and name[1:].isdigit() and length >= 4:
+        return (tuple(range(length // 2)), tuple(range(length // 2, length)))
+    return ()
+
+
+@lru_cache(maxsize=None)
+def exchange_pairs(spec, names):
+    """Pairs (x, y) of summed letters that every operand holding one holds
+    both of, in one antisymmetric half. Swapping them negates each such
+    operand twice, so the summand is unchanged: the sum over both orders is
+    twice the sum over x < y (x = y vanishes), and a spin route with (beta,
+    alpha) on them equals the one with (alpha, beta). Every diagram pair of
+    the integrals with an amplitude (mn of g(oovv) T4, ef of g(vovv) T3, ...)
+    is one."""
+    inputs, output = spec.split("->")
+    inputs = inputs.split(",")
+    if len(inputs) < 2:
+        return ()
+    places = {}
+    for i, (term, name) in enumerate(zip(inputs, names)):
+        halves = _halves(name, len(term))
+        for position, c in enumerate(term):
+            half = next((h for h, members in enumerate(halves) if position in members), None)
+            places.setdefault(c, []).append((i, half))
+    internal = [c for c in places if c not in output]
+    pairs, used = [], set()
+    for x, y in combinations(internal, 2):
+        if x in used or y in used or places[x] != places[y]:
+            continue
+        if all(half is not None for _, half in places[x]):
+            pairs.append((x, y))
+            used.update((x, y))
+    return tuple(pairs)
+
+
+@lru_cache(maxsize=None)
+def paired_routes(spec, names, target, derivative):
+    """`routes` with the exchangeable pairs (`exchange_pairs`) folded:
+    ((signatures, factor, sums), ...). A route whose pair holds spins (beta,
+    alpha) is its (alpha, beta) twin and is dropped; every route kept counts
+    twice per pair (`factor`), and its pairs of equal spins (`sums`) are summed
+    over x < y only: half the multiply-adds and packed-T4 reads of the g T4
+    products (and of each product summing such a pair)."""
+    pairs = exchange_pairs(spec, names)
+    inputs = spec.split("->")[0].split(",")
+    found = []
+    for signatures in routes(spec, target, derivative):
+        spin = {}
+        for term, signature in zip(inputs, signatures):
+            spin.update(zip(term, signature))
+        if any(spin[x] > spin[y] for x, y in pairs):
+            continue
+        found.append((signatures, 2 ** len(pairs), tuple((x, y) for x, y in pairs if spin[x] == spin[y])))
+    return tuple(found)
+
+
+def tile_routes(spec, names, target, derivative, paired):
+    """(signatures, factor, sums) of a diagram's spin routes: `paired_routes`
+    when `paired` (and ITERCC_PAIR_SUMS is on), else every route once."""
+    if paired and _runtime.enabled("ITERCC_PAIR_SUMS") and exchange_pairs(spec, names):
+        return paired_routes(spec, names, target, derivative)
+    return tuple((signatures, 1, ()) for signatures in routes(spec, target, derivative))
 
 
 @lru_cache(maxsize=None)
@@ -289,10 +379,15 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
             slabs = _packed_cuts(inputs[t4][4:], tuple((c, s.start, s.stop) for c, s in cuts.items()),
                                  no, nv, max_cache_bytes if occupied_slab else max_cache_bytes // 4,
                                  occupied_slab)
+        # Exchangeable pairs summed over x < y (the blocked engine only, and
+        # never a pair a slab cuts: its local indices start elsewhere).
+        cut = {c for pieces in slabs for c, _ in pieces}
+        paired = (engine is not None and (len(names) == 2 or compiled_products)
+                  and not any(x in cut or y in cut for x, y in exchange_pairs(spec, names)))
         for derivative in range(len(names)):
             if tangent[names[derivative]] is None:
                 continue
-            for signatures in routes(spec, raw, derivative):
+            for signatures, factor, sums in tile_routes(spec, names, raw, derivative, paired):
                 for pieces in slabs:
                     selected = cuts | dict(pieces)
                     out_cuts = tuple(slice(selected[c].start - s.start, selected[c].stop - s.start)
@@ -326,10 +421,10 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                                                hole_order and all(selected[c] == s and not s.start
                                                                   for c, s in cuts.items())))
                     if engine is not None and len(names) == 2:
-                        engine.einsum(spec, *[op() for op in operands], target, alpha=coefficient,
+                        engine.einsum(spec, *[op() for op in operands], target, alpha=coefficient * factor,
                                       beta=1.0, labels=_tile_labels(labels["o"], selected),
                                       irreps=tuple(irrep if i == derivative else 0 for i in range(2)),
-                                      ordered=ordered)
+                                      ordered=tuple(ordered) + node_sums(spec, sums))
                     else:
                         unit = tuple(c for c in cuts if selected[c].stop - selected[c].start == 1)
                         keys = None
@@ -338,8 +433,8 @@ def contract_tile(xp, rank, raw, fixed, primal, tangent, no, nv, *, irrep=None,
                             keys = tuple((name, i == derivative, signatures[i],
                                           tuple(bounds.get(c, _ALL) for c in inputs[i]))
                                          for i, name in enumerate(names))
-                        tile_product(xp, spec, operands, target, coefficient, no, nv, unit,
-                                     keys=keys, cache=intermediates,
+                        tile_product(xp, spec, operands, target, coefficient * factor, no, nv, unit,
+                                     keys=keys, cache=intermediates, sums=sums,
                                      blocked=((engine, _tile_labels(labels["o"], selected),
                                                tuple(irrep if i == derivative else 0 for i in range(len(names))))
                                               if compiled_products and engine is not None else None),
