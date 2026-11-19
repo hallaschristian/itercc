@@ -107,12 +107,14 @@ SWITCHES = {
         "pieces (default 2^22)"),
     "ITERCC_SLOT_PROFILE": Switch("", "core", "`1`: slot-program phase timers (`itercc_triplet_profile`)"),
     "ITERCC_SLOT_SORT": Switch("", "core", "`0`: slot-program tiles in slot order (diagnostic)"),
-    "ITERCC_TILE_RUNS": Switch("", "core", "`0`: slot-program tiles cleared whole, not only where symmetry "
-                               "allows entries (diagnostic)"),
+    "ITERCC_TILE_RUNS": Switch("", "core", "`0`: slot-program tiles (dense or compact) cleared whole, not only "
+                               "where symmetry allows entries (diagnostic)"),
     # The CPU GEMM executor (read once by the core)
     "ITERCC_SYM_MIN_SHARE": Switch("", "core", "GEMM executor: least work per thread of a shared block"),
     "ITERCC_SYM_PARALLEL_WORK": Switch(
         "", "core", "GEMM executor: work from which one block runs on all threads"),
+    "ITERCC_GEMM_SKINNY": Switch(
+        "", "core", "`0`: fused GEMMs of at most 16 rows pack B like the others instead of reading it in place"),
     "ITERCC_GEMM_NC": Switch("", "core", "`auto`: narrower GEMM column blocks for deep products (experiment)"),
     "ITERCC_GEMM_KNOCKOUT": Switch("", "core", "GEMM micro-kernel stages to skip (timing diagnostic only)"),
     # CUDA

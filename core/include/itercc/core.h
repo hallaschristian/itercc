@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 35
+#define ITERCC_CORE_ABI 36
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -778,6 +778,13 @@ typedef struct {
     int64_t cls, key, start, length, occupied[4];
 } itercc_slot_info;
 
+/* A compact tile's stored axes, outermost first (the last of stride 1):
+ * axis a holds irrep g at indices starts[a][g] .. starts[a][g + 1] (a chain's
+ * ranks and a positioned virtual axis are in irrep order). */
+typedef struct itercc_slot_tile_axes_s {
+    int64_t naxes, strides[4], starts[4][9];
+} itercc_slot_tile_axes;
+
 typedef struct {
     int64_t nv, holes, nirrep;   /* virtual orbitals; spin-orbital occupied orbitals; irreps */
     const int64_t *kind_start, *kind_count, *inter_start, *inter_count;
@@ -815,6 +822,10 @@ typedef struct {
      * then the first tile_sizes[kind] doubles are cleared). */
     const int64_t *tile_sizes;
     int64_t tile_irrep;
+    /* The stored axes of each kind's compact tile, so that a tile clears only
+     * its symmetry-allowed entries (null, or naxes 0 for a kind: the first
+     * tile_sizes[kind] doubles are cleared). */
+    const struct itercc_slot_tile_axes_s *tile_axes;
 } itercc_slot_program;
 
 /* Slots 0 .. nslots - 1 of `result` (zero on entry), in waves whose partial

@@ -91,6 +91,7 @@ TERMS = np.dtype([("offsets", _i8), ("weights", _i8), ("count", _i8), ("nchains"
                   ("tables", _i8, 2), ("strides", _i8, 2), ("lengths", _i8, 2), ("nv", _i8)])
 GROUP = np.dtype([("rows", _i8), ("coordinates", _i8), ("count", _i8)])
 SLOT = np.dtype([("cls", _i8), ("key", _i8), ("start", _i8), ("length", _i8), ("occupied", _i8, 4)])
+TILE_AXES = np.dtype([("naxes", _i8), ("strides", _i8, 4), ("starts", _i8, (4, 9))])
 
 _ARRAYS = ("kind_start", "kind_count", "inter_start", "inter_count", "instructions", "intermediates", "rows",
            "plan_start", "plan_table", "plan_count", "plan_id", "ground_bases", "ground_keys",
@@ -102,7 +103,8 @@ _ARRAYS = ("kind_start", "kind_count", "inter_start", "inter_count", "instructio
 class ProgramStruct(ctypes.Structure):
     """itercc_slot_program of core.h."""
     _fields_ = ([("nv", ctypes.c_int64), ("holes", ctypes.c_int64), ("nirrep", ctypes.c_int64)]
-                + [(name, ctypes.c_void_p) for name in _ARRAYS] + [("tile_irrep", ctypes.c_int64)])
+                + [(name, ctypes.c_void_p) for name in _ARRAYS] + [("tile_irrep", ctypes.c_int64),
+                                                                   ("tile_axes", ctypes.c_void_p)])
 
 
 _PROGRESS = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64)
@@ -353,7 +355,7 @@ class SlotProgram:
         chains = [chain for chain in chains.values() if len(chain) > 1]
         virtual = np.asarray(self.blocked.labels["a"], dtype=np.int64)
         orbital_at = None if self._vpos is None else np.argsort(self._vpos)
-        tables, positioned, ranks = [], [], []
+        tables, positioned, ranks, chain_starts = [], [], [], []
         for chain in chains:
             values = np.indices((nv,) * len(chain)).reshape(len(chain), -1)
             keep = np.ones(values.shape[1], dtype=bool)
@@ -372,6 +374,7 @@ class SlotProgram:
                 table if orbital_at is None else
                 table.reshape((nv,) * len(chain))[np.ix_(*[orbital_at] * len(chain))].reshape(-1)))
             ranks.append(len(kept))
+            chain_starts.append(np.r_[0, np.cumsum(np.bincount(irreps[kept], minlength=self.nirrep))])
         axes, seen = [], set()
         for t in range(4):
             g = next((g for g, chain in enumerate(chains) if t in chain), None)
@@ -386,8 +389,16 @@ class SlotProgram:
             step *= size
         strides = tuple(8 * steps[next((("chain", g) for g, chain in enumerate(chains) if t in chain), t)]
                         for t in range(4)) + (8,) * 4
+        # Each stored axis's irreps as index ranges (a chain's ranks are in
+        # irrep order; a plain axis only with positions): the core clears only
+        # the symmetry-allowed entries.
+        clear = None
+        if self._vpos is not None and len(axes) <= 4 and self.nirrep <= 8:
+            plain = np.r_[0, np.cumsum(np.bincount(virtual, minlength=self.nirrep))]
+            clear = (len(axes), [steps[axis] for axis, _ in axes],
+                     [chain_starts[axis[1]] if isinstance(axis, tuple) else plain for axis, _ in axes])
         number = self._tile_layout_of[constraints] = len(self._tile_layouts)
-        self._tile_layouts.append(dict(
+        self._tile_layouts.append(dict(clear=clear,
             chains=[tuple(chain) for chain in chains], size=step, strides=strides,
             groups=[OffsetGroup((nv,) * len(chain), table, steps[("chain", g)])
                     for g, (chain, table) in enumerate(zip(chains, tables))],
@@ -1018,12 +1029,23 @@ class SlotProgram:
         arrays["tile_sizes"] = np.asarray([self.nv**4 if kind.tile_layout is None else
                                            self._tile_layouts[kind.tile_layout]["size"]
                                            for kind in self._kinds] or [self.nv**4], dtype=np.int64)
+        tile_axes = np.zeros(max(1, len(self._kinds)), dtype=TILE_AXES)
+        for k, kind in enumerate(self._kinds):
+            clear = None if kind.tile_layout is None else self._tile_layouts[kind.tile_layout]["clear"]
+            if clear is None:
+                continue
+            count, steps, starts = clear
+            tile_axes[k]["naxes"] = count
+            tile_axes[k]["strides"][:count] = steps
+            for a, values in enumerate(starts):
+                tile_axes[k]["starts"][a][:len(values)] = values
+        arrays["tile_axes"] = tile_axes
         for name, array in arrays.items():
             if not array.flags.c_contiguous:
                 raise ValueError(f"{name} is not contiguous")
         self.struct = ProgramStruct(nv=self.nv, holes=n, nirrep=self.nirrep,
                                     **{name: arrays[name].ctypes.data for name in _ARRAYS},
-                                    tile_irrep=int(self.irrep))
+                                    tile_irrep=int(self.irrep), tile_axes=tile_axes.ctypes.data)
         if not contiguous:
             self.struct.tile_runs = None
         self._arrays = arrays

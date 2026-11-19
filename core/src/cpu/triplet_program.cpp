@@ -298,6 +298,56 @@ struct Worker {
     std::vector<itercc::GemmSegment> segments;
 };
 
+// The symmetry-allowed entries of a compact tile (irreps of its stored axes
+// whose product is `target`), each a run of its last axis: its products
+// write and its gathers read no others. A chain keeps every irrep, so
+// clearing the whole compact tile cleared four times too much (C2v) and
+// pulled all of it through the caches.
+// A short run of zeros as a loop (a memset call per run of a few doubles
+// cost more than the stores).
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+inline void zero_run(double *x, i64 n)
+{
+    for (i64 i = 0; i < n; ++i) x[i] = 0.0;
+}
+
+void clear_allowed(double *tile, const itercc_slot_tile_axes &ax, i64 nirrep, i64 target)
+{
+    const i64 lead = ax.naxes - 1;
+    const int64_t (*st)[9] = ax.starts;
+    const int64_t *step = ax.strides;
+    i64 g[4] = {0, 0, 0, 0};
+    for (;;) {
+        i64 last = target;
+        for (i64 a = 0; a < lead; ++a) last ^= g[a];
+        if (last < nirrep && st[lead][last + 1] > st[lead][last]) {
+            const i64 lo = st[lead][last], n = st[lead][last + 1] - lo;
+            if (lead == 0) {
+                zero_run(tile + lo, n);
+            } else {
+                for (i64 i = st[0][g[0]]; i < st[0][g[0] + 1]; ++i) {
+                    double *x = tile + i * step[0] + lo;
+                    if (lead == 1) {
+                        zero_run(x, n);
+                        continue;
+                    }
+                    for (i64 j = st[1][g[1]]; j < st[1][g[1] + 1]; ++j) {
+                        double *y = x + j * step[1];
+                        if (lead == 2) {
+                            zero_run(y, n);
+                            continue;
+                        }
+                        for (i64 k = st[2][g[2]]; k < st[2][g[2] + 1]; ++k) zero_run(y + k * step[2], n);
+                    }
+                }
+            }
+        }
+        i64 a = lead - 1;
+        while (a >= 0 && ++g[a] == nirrep) g[a--] = 0;
+        if (a < 0) break;
+    }
+}
+
 // The packed T4 rows of descriptor `index` for the tile's occupied tuple:
 // rows over the hole letters' ranges in C order, bases and map addresses from
 // the layout's hole tables (as _spin_quadruples_storage.signed_rows).
@@ -483,15 +533,19 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
             const char *value = std::getenv("ITERCC_TILE_RUNS");
             return value == nullptr || value[0] != '0';
         }();
-        if (p.tile_sizes[m.kind] < nv4) {
-            std::fill(tile, tile + p.tile_sizes[m.kind], 0.0);   // a compact tile
+        i64 target = p.tile_irrep;
+        for (int k = 0; k < 4; ++k) target ^= p.occupied_irreps[job.fixed[k]];
+        if (p.tile_sizes[m.kind] < nv4) {   // a compact tile
+            const itercc_slot_tile_axes *axes = p.tile_axes != nullptr ? p.tile_axes + m.kind : nullptr;
+            if (axes == nullptr || axes->naxes == 0 || !runs)
+                std::fill(tile, tile + p.tile_sizes[m.kind], 0.0);
+            else
+                clear_allowed(tile, *axes, p.nirrep, target);
         } else if (p.tile_runs == nullptr || !runs) {
             std::fill(tile, tile + nv4, 0.0);
         } else {
             // Only the symmetry-allowed entries (one run of the last letter per
             // first three: the tile keeps its virtual axes in irrep order).
-            i64 target = p.tile_irrep;
-            for (int k = 0; k < 4; ++k) target ^= p.occupied_irreps[job.fixed[k]];
             for (i64 ga = 0; ga < p.nirrep; ++ga)
                 for (i64 gb = 0; gb < p.nirrep; ++gb)
                     for (i64 gc = 0; gc < p.nirrep; ++gc) {
