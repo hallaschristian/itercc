@@ -548,32 +548,13 @@ void run_tile(const itercc_slot_program &p, const Tile &job, const double *const
         }();
         i64 target = p.tile_irrep;
         for (int k = 0; k < 4; ++k) target ^= p.occupied_irreps[job.fixed[k]];
-        if (p.tile_sizes[m.kind] < nv4) {   // a compact tile
-            const itercc_slot_tile_axes *axes = p.tile_axes != nullptr ? p.tile_axes + m.kind : nullptr;
-            if (axes == nullptr || axes->naxes == 0 || !runs)
-                std::fill(tile, tile + p.tile_sizes[m.kind], 0.0);
-            else
-                clear_allowed(tile, *axes, p.nirrep, target);
-        } else if (p.tile_runs == nullptr || !runs) {
-            std::fill(tile, tile + nv4, 0.0);
-        } else {
-            // Only the symmetry-allowed entries (one run of the last letter per
-            // first three: the tile keeps its virtual axes in irrep order).
-            for (i64 ga = 0; ga < p.nirrep; ++ga)
-                for (i64 gb = 0; gb < p.nirrep; ++gb)
-                    for (i64 gc = 0; gc < p.nirrep; ++gc) {
-                        const i64 gd = target ^ ga ^ gb ^ gc;
-                        if (gd >= p.nirrep) continue;
-                        const i64 d0 = p.tile_runs[2 * gd], d1 = p.tile_runs[2 * gd + 1];
-                        if (d1 <= d0) continue;
-                        for (i64 a = p.tile_runs[2 * ga]; a < p.tile_runs[2 * ga + 1]; ++a)
-                            for (i64 b = p.tile_runs[2 * gb]; b < p.tile_runs[2 * gb + 1]; ++b) {
-                                double *row = tile + (a * nv + b) * nv * nv;
-                                for (i64 c = p.tile_runs[2 * gc]; c < p.tile_runs[2 * gc + 1]; ++c)
-                                    std::fill(row + c * nv + d0, row + c * nv + d1, 0.0);
-                            }
-                    }
-        }
+        // Only the symmetry-allowed entries, dense tile or compact, where the
+        // kind's stored axes keep each irrep as one run.
+        const itercc_slot_tile_axes *axes = p.tile_axes != nullptr ? p.tile_axes + m.kind : nullptr;
+        if (axes == nullptr || axes->naxes == 0 || !runs)
+            std::fill(tile, tile + p.tile_sizes[m.kind], 0.0);
+        else
+            clear_allowed(tile, *axes, p.nirrep, target);
     }
     const itercc_slot_instruction *code = p.instructions + p.kind_start[m.kind];
     const i64 ncode = p.kind_count[m.kind];

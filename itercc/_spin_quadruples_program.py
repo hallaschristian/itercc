@@ -97,7 +97,7 @@ _ARRAYS = ("kind_start", "kind_count", "inter_start", "inter_count", "instructio
            "plan_start", "plan_table", "plan_count", "plan_id", "ground_bases", "ground_keys",
            "direction_bases", "direction_keys", "occupied_irreps", "class_start", "class_count",
            "templates", "parts", "terms", "key_group_start", "groups", "slots", "fuse_start", "fuse_count",
-           "fuse_groups", "fuse_members", "tile_runs", "tile_sizes")
+           "fuse_groups", "fuse_members", "tile_sizes")
 
 
 class ProgramStruct(ctypes.Structure):
@@ -1045,25 +1045,21 @@ class SlotProgram:
                       parts=self.parts, terms=self.terms, key_group_start=self.key_group_start,
                       groups=self.groups_table, slots=self.slots, fuse_start=self.fuse_start,
                       fuse_count=self.fuse_count, fuse_groups=self.fuse_groups, fuse_members=self.fuse_members)
-        # The tile's virtual positions of each irrep as one run (irrep order:
-        # its products and gathers touch only the symmetry-allowed entries);
-        # none when an irrep's positions are not contiguous.
-        virtual = np.asarray(engine._spatial_labels["v"], dtype=np.int64)
-        stored = virtual if self._vpos is None else virtual[np.argsort(virtual, kind="stable")]
-        runs = np.zeros((self.nirrep, 2), dtype=np.int64)
-        contiguous = self.nirrep > 1
-        for g in range(self.nirrep):
-            where = np.flatnonzero(stored == g)
-            if len(where):
-                runs[g] = where[0], where[-1] + 1
-                contiguous &= len(where) == where[-1] + 1 - where[0]
-        arrays["tile_runs"] = runs
         arrays["tile_sizes"] = np.asarray([self.nv**4 if kind.tile_layout is None else
                                            self._tile_layouts[kind.tile_layout]["size"]
                                            for kind in self._kinds] or [self.nv**4], dtype=np.int64)
+        # Each kind's stored axes, irreps as index runs (`clear_allowed`): a
+        # dense tile's four virtual axes when they are in irrep order, a
+        # compact tile's chains and virtual axes.
+        virtual = np.asarray(engine._spatial_labels["v"], dtype=np.int64)
+        stored = virtual if self._vpos is None else np.sort(virtual, kind="stable")
+        dense = None
+        if 1 < self.nirrep <= 8 and np.all(np.diff(stored) >= 0):
+            plain = np.r_[0, np.cumsum(np.bincount(virtual, minlength=self.nirrep))]
+            dense = (4, [self.nv**3, self.nv**2, self.nv, 1], [plain] * 4)
         tile_axes = np.zeros(max(1, len(self._kinds)), dtype=TILE_AXES)
         for k, kind in enumerate(self._kinds):
-            clear = None if kind.tile_layout is None else self._tile_layouts[kind.tile_layout]["clear"]
+            clear = dense if kind.tile_layout is None else self._tile_layouts[kind.tile_layout]["clear"]
             if clear is None:
                 continue
             count, steps, starts = clear
@@ -1078,8 +1074,6 @@ class SlotProgram:
         self.struct = ProgramStruct(nv=self.nv, holes=n, nirrep=self.nirrep,
                                     **{name: arrays[name].ctypes.data for name in _ARRAYS},
                                     tile_irrep=int(self.irrep), tile_axes=tile_axes.ctypes.data)
-        if not contiguous:
-            self.struct.tile_runs = None
         self._arrays = arrays
 
     def run(self, blocks, ground, direction, result, *, cache_bytes, threads, slot_limit=None, fused=True,

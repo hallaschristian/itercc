@@ -52,7 +52,9 @@
   cleared whole, 20.5 s in letter order, 18.6 s (clearing 81 -> 49
   thread-s, gathers 168 -> 141, tile products 390 -> 343).
   `ITERCC_TILE_CHAINS_INNER=0` keeps letter order, `ITERCC_TILE_RUNS=0`
-  clears tiles whole.
+  clears tiles whole. Dense and compact tiles share the clearing routine
+  (`clear_allowed`; a dense tile is four virtual axes), so the program no
+  longer carries separate dense-tile runs (core ABI 37).
 - Triplet slot-program gathers (tile -> packed rows) run term by term over
   every row of a part, with each term's steps, chain members and rank tables
   hoisted and the common chain shapes (one or two chains of two or three

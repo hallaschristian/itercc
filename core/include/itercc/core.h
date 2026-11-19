@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 36
+#define ITERCC_CORE_ABI 37
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -812,19 +812,14 @@ typedef struct {
      * each (first, count) of fuse_members (instruction numbers within the
      * kind): products into the tile with equal output offset tables. */
     const int64_t *fuse_start, *fuse_count, *fuse_groups, *fuse_members;
-    /* Stored virtual positions of irrep g in a tile: tile_runs[2g] ..
-     * tile_runs[2g + 1] (one run each: the tile keeps them in irrep order),
-     * or null: every tile is cleared whole. A tile's products write, and its
-     * gathers read, only entries whose particle irreps multiply to its holes'
-     * product times tile_irrep, so only those are cleared. */
-    const int64_t *tile_runs;
-    /* Doubles of each kind's tile (nv^4 dense, fewer for a compact layout:
-     * then the first tile_sizes[kind] doubles are cleared). */
+    /* Doubles of each kind's tile (nv^4 dense, fewer for a compact layout). */
     const int64_t *tile_sizes;
     int64_t tile_irrep;
-    /* The stored axes of each kind's compact tile, so that a tile clears only
-     * its symmetry-allowed entries (null, or naxes 0 for a kind: the first
-     * tile_sizes[kind] doubles are cleared). */
+    /* The stored axes of each kind's tile (dense: four virtual axes; compact:
+     * chains and virtual axes). A tile's products write, and its gathers
+     * read, only entries whose particle irreps multiply to its holes'
+     * product times tile_irrep, so only those are cleared (null, or naxes 0
+     * for a kind whose irreps are not runs: its tile_sizes[kind] doubles). */
     const struct itercc_slot_tile_axes_s *tile_axes;
 } itercc_slot_program;
 

@@ -427,7 +427,7 @@ def test_irrep_ordered_program_arrays_keep_the_action(monkeypatch):
     engine._slot_programs = {}
     plain = engine.sigma(vector)
     program = next(p for p in engine._slot_programs.values() if p is not None)
-    assert program._vpos is None and not program.struct.tile_runs
+    assert program._vpos is None and not program._arrays["tile_axes"]["naxes"].any()
     engine.slot_program = False                      # the Python loop: the same action
     np.testing.assert_allclose(engine.sigma(vector), plain, rtol=1e-12, atol=1e-13 * np.abs(plain).max())
     engine.slot_program = True
@@ -435,7 +435,7 @@ def test_irrep_ordered_program_arrays_keep_the_action(monkeypatch):
     engine._slot_programs = {}
     np.testing.assert_array_equal(engine.sigma(vector), plain)
     program = next(p for p in engine._slot_programs.values() if p is not None)
-    assert program._vpos is not None and program.struct.tile_runs
+    assert program._vpos is not None and program._arrays["tile_axes"]["naxes"].all()
 
 
 def test_ordered_tiles_and_wave_sizes_keep_the_action(monkeypatch):
