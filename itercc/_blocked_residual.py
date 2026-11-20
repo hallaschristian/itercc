@@ -122,13 +122,15 @@ class PlaneTables:
                          b=(int((n_brow * b_ncols).sum()), b_base, b_ncols))
             self.planes.append((tables, sizes))
 
-    def _seed_plans(self, k, nv):
+    def _seed_plans(self, k, nv, source=0):
         """Executor tables of plane k's T2-seed products (they depend on k only
-        through its irrep): for each, (block table, offset tables)."""
-        gk = int(self.occ[k])
+        through its irrep): for each, (block table, offset tables). `source`:
+        the irrep of vooo and vvvo in these tables' labels (T2 then has the
+        irrep of the seeds XOR source); it selects the summed indices."""
+        gk, source = int(self.occ[k]), int(source)
         cache = self.__dict__.setdefault("_seed_cache", {})
-        if gk in cache:
-            return cache[gk]
+        if (gk, source) in cache:
+            return cache[gk, source]
         no = self.no
         _, sizes = self.planes[k]
         _, a_base, _ = sizes["a"]
@@ -141,7 +143,7 @@ class PlaneTables:
                 if kind == "a":
                     # A[r, (i,c)] = sum_d vvvo_rows[rows[r], d] t2(i, k, d, c)
                     rows = self.a_order[self.a_start[gamma]:self.a_start[gamma + 1]]
-                    summed = self.d_of[gamma]
+                    summed = self.d_of[gamma ^ source]
                     cols = self.ic_order[self.ic_start[gamma ^ gk]:self.ic_start[(gamma ^ gk) + 1]]
                     i, c = np.divmod(cols, nv)
                     parts = (rows * nv, summed, summed * nv, i * no * nv * nv + c)
@@ -149,7 +151,7 @@ class PlaneTables:
                 else:
                     # B[r, (b,c)] = sum_l vooo_rows[rows[r], l] t2(l, k, b, c)
                     rows = self.b_order[self.b_start[gamma]:self.b_start[gamma + 1]]
-                    summed = self.l_of[gamma]
+                    summed = self.l_of[gamma ^ source]
                     pb, pc = self.pair_lists[gamma ^ gk]
                     cols = pb * nv + pc
                     parts = (rows * no, summed, summed * no * nv * nv, cols)
@@ -166,14 +168,15 @@ class PlaneTables:
             offsets = tuple(np.ascontiguousarray(np.concatenate(c) if c else np.zeros(1, np.int64))
                             for c in columns)
             plans.append((table, offsets))
-        cache[gk] = plans
+        cache[gk, source] = plans
         return plans
 
-    def t2_seeds(self, vvvo_rows, vooo_rows, t2, k, a_out, b_out, threads=None):
+    def t2_seeds(self, vvvo_rows, vooo_rows, t2, k, a_out, b_out, threads=None, source=0):
         """Block products A = vvvo t2 and B = vooo t2 of plane k (see core.h).
 
         With the compiled core, each is one call of the GEMM executor that
-        reads the operands' blocks in place (no gathered copies).
+        reads the operands' blocks in place (no gathered copies). `source`: the
+        irrep of vooo and vvvo in these tables' labels (`_seed_plans`).
         """
         library = _cpu_kernels.library()
         nv = t2.shape[-1]
@@ -185,7 +188,7 @@ class PlaneTables:
             _, sizes = self.planes[k]
             plane = t2.ctypes.data + 8 * k * nv * nv          # t2(., k, ., .)
             for (table, offsets), rows, out, total in zip(
-                    self._seed_plans(k, nv), (vvvo_rows, vooo_rows), (a_out, b_out),
+                    self._seed_plans(k, nv, source), (vvvo_rows, vooo_rows), (a_out, b_out),
                     (sizes["a"][0], sizes["b"][0])):
                 if total:
                     library.scale(out.ctypes.data, int(total), 0.0, threads)
@@ -201,7 +204,7 @@ class PlaneTables:
         t2k = t2[:, k]                                    # (i or l, d or b, c)
         for gamma in range(self.groups):
             rows = self.a_order[self.a_start[gamma]:self.a_start[gamma + 1]]
-            d = self.d_of[gamma]
+            d = self.d_of[gamma ^ int(source)]
             columns = self.ic_order[self.ic_start[gamma ^ gk]:self.ic_start[(gamma ^ gk) + 1]]
             if len(rows) and len(columns):
                 left = vvvo_rows[np.ix_(rows, d)] if len(d) else np.zeros((len(rows), 0))
@@ -209,7 +212,7 @@ class PlaneTables:
                 np.matmul(left, right, out=a_out[a_base[gamma]:a_base[gamma] + len(rows) * len(columns)]
                           .reshape(len(rows), len(columns)))
             rows = self.b_order[self.b_start[gamma]:self.b_start[gamma + 1]]
-            l = self.l_of[gamma]
+            l = self.l_of[gamma ^ int(source)]
             pb, pc = self.pair_lists[gamma ^ gk]
             if len(rows) and len(pb):
                 left = vooo_rows[np.ix_(rows, l)]
@@ -243,11 +246,13 @@ class PlaneTables:
 
 
 def triples(blocked, tables, t2, t3, have_t3, im, vooo, vvvo, g, o, v, threads, *,
-            ladder_budget=LADDER_BUDGET, wvvvv=None, ladder_g=None, ladder_owned=False):
+            ladder_budget=LADDER_BUDGET, wvvvv=None, ladder_g=None, ladder_owned=False,
+            purified=True):
     """Blocked R3 from T2 and blocked T3, as `_cpu_triples.triples` (`wvvvv`
     replaces the ladder matrix built from g, t2 and im, as there; `ladder_g` =
     (LadderSectors, even, odd), the sector blocks of g(vvvv), builds the ladder
-    matrix in sector form instead, in those blocks when `ladder_owned`).
+    matrix in sector form instead, in those blocks when `ladder_owned`;
+    `purified=False` leaves the projection `purify` to the caller).
 
     Raises NotBlockable when an intermediate is not symmetry-blocked; the
     caller then uses the dense-slot path.
@@ -309,7 +314,109 @@ def triples(blocked, tables, t2, t3, have_t3, im, vooo, vvvo, g, o, v, threads, 
             if wvvvv is None:
                 wvvvv = _ladder_matrix(g, o, v, t2, im, nv, threads)
             ladder(blocked, residual, t3, wvvvv, threads, budget=ladder_budget)
-    purify(blocked, residual, threads)
+    if purified:
+        purify(blocked, residual, threads)
+    return residual
+
+
+def _shifted_blocks(matrix, out_order, out_start, in_order, in_start, groups, shift):
+    """The blocks of `matrix` (rows: output indices, columns: input indices)
+    from input sector x ^ shift to output sector x, packed row-major one after
+    another, and their offsets by output sector. Raises NotBlockable when any
+    entry outside them is nonzero (the check is exact)."""
+    blocks, offsets, total, kept = [], [], 0, 0
+    for x in range(groups):
+        rows = out_order[out_start[x]:out_start[x + 1]]
+        y = x ^ int(shift)
+        block = np.ascontiguousarray(matrix[np.ix_(rows, in_order[in_start[y]:in_start[y + 1]])])
+        kept += np.count_nonzero(block)
+        blocks.append(block.reshape(-1))
+        offsets.append(total)
+        total += block.size
+    if kept != np.count_nonzero(matrix):
+        raise NotBlockable("An operator is not of the direction's irrep")
+    return (np.concatenate(blocks) if blocks else np.empty(0)), offsets
+
+
+def triples_shifted(source, target, t2, t3, have_t3, im, vooo, vvvo, o, v, threads, *, shift,
+                    wvvvv, residual, ladder_budget=LADDER_BUDGET):
+    """Adds to `residual` (blocked in `target`) the R3 of a T2 and operators
+    (im, W) of irrep `shift` with totally symmetric vooo, vvvo and T3: the
+    derivative-operator half R3(dt2, T3; dim, vooo, vvvo, dW) of a Jacobian
+    action of irrep `shift` (`_cpu_tangent.triples`). Not purified.
+
+    `source` = (BlockedTriples, PlaneTables) of the orbital labels, in which T3
+    is blocked; `target` = those of the occupied labels XOR shift, where the
+    result is totally symmetric. Every T3 plane is gathered with the source
+    tables and assembled and scattered with the target ones: their virtual
+    triple and pair orders agree, and the products map input sectors to output
+    sectors as the operators do: pair sector x ^ shift -> x (pair labels do not
+    see the occupied shift) and particle-hole sector s -> s (the shift moves
+    the output rows by the operator's irrep). In the target labels vooo and
+    vvvo have irrep `shift`, which selects the seeds' summed indices. Raises
+    NotBlockable, before writing anything, when an operator is not exactly of
+    irrep `shift`."""
+    from ._cpu_triples import _plane_matrices, _Rows
+
+    (blocked_in, tables_in), (blocked_out, tables_out) = source, target
+    library = _cpu_kernels.library()
+    no, nv, groups, shift = tables_out.no, blocked_out.nv, blocked_out.groups, int(shift)
+    if blocked_in.groups != groups or tables_in.no != no:
+        raise ValueError("The source and target layouts do not match")
+    layout_in, layout_out = blocked_in.c_layout(), blocked_out.c_layout()
+    if have_t3:
+        occupied, _, _ = _plane_matrices(im, _Rows(None, no, nv), no, nv)
+        direct = np.ascontiguousarray(im.ovvo.transpose(3, 1, 0, 2)).reshape(no * nv, no * nv)
+        direct *= 0.25
+        crossed = np.ascontiguousarray(im.ovov.transpose(2, 1, 0, 3)).reshape(no * nv, no * nv)
+        occ_mats, occ_off = _shifted_blocks(occupied, tables_out.pair_order, tables_out.pair_start,
+                                            tables_in.pair_order, tables_in.pair_start, groups, shift)
+        ph = (tables_out.ph_order, tables_out.ph_start, tables_in.ph_order, tables_in.ph_start, groups, 0)
+        dir_mats, ph_off = _shifted_blocks(direct, *ph)
+        cro_mats, _ = _shifted_blocks(crossed, *ph)
+        del occupied, direct, crossed
+        prepared = _shifted_ladder(blocked_out, wvvvv, shift)
+        plane = np.empty(max(sizes["plane"] for _, sizes in tables_in.planes))
+        crossed_rhs, direct_rhs = (np.empty(max(sizes["ph"] for _, sizes in tables_in.planes))
+                                   for _ in range(2))
+        largest_rhs = max(sizes["ph"] for _, sizes in tables_out.planes)
+        direct_out, crossed_out = np.empty(largest_rhs), np.empty(largest_rhs)
+    vvvo_rows, vooo_rows = _seed_sources(vooo, vvvo, no, nv)
+    a_seed = np.zeros(max(sizes["a"][0] for _, sizes in tables_out.planes))
+    b_seed = np.zeros(max(sizes["b"][0] for _, sizes in tables_out.planes))
+    seeds = np.empty(max(sizes["plane"] for _, sizes in tables_out.planes))
+    if not have_t3:
+        direct_out = crossed_out = seeds
+    for k in range(no):
+        tables_out.t2_seeds(vvvo_rows, vooo_rows, t2, k, a_seed, b_seed, threads, source=shift)
+        planes_in, sizes_in = tables_in.planes[k]
+        planes_out, sizes_out = tables_out.planes[k]
+        if have_t3:
+            library.bt3_plane(ctypes.addressof(layout_in), ctypes.addressof(planes_in), t3.ctypes.data,
+                              plane.ctypes.data, crossed_rhs.ctypes.data, direct_rhs.ctypes.data,
+                              threads)
+            n_pairs, widths_out, base_out = sizes_out["pair"]
+            _, widths_in, base_in = sizes_in["pair"]
+            n_out, ncols_out, ph_out = sizes_out["rhs"]
+            n_in, ncols_in, ph_in = sizes_in["rhs"]
+            xs = np.arange(groups)
+            if not (np.array_equal(widths_out, widths_in[xs ^ shift]) and np.array_equal(ncols_out, ncols_in)):
+                raise ValueError("The source and target planes do not match")
+            _products(library, [(n_pairs[x], widths_out[x], n_pairs[x ^ shift], occ_off[x],
+                                 base_in[x ^ shift], base_out[x]) for x in xs],
+                      occ_mats, plane, seeds, threads)
+            ph_blocks = [(n_out[s], ncols_out[s], n_in[s], ph_off[s], ph_in[s], ph_out[s]) for s in xs]
+            _products(library, ph_blocks, dir_mats, direct_rhs, direct_out, threads)
+            _products(library, ph_blocks, cro_mats, crossed_rhs, crossed_out, threads)
+        library.bt3_seeds(ctypes.addressof(layout_out), ctypes.addressof(planes_out), int(have_t3),
+                          a_seed.ctypes.data, b_seed.ctypes.data, direct_out.ctypes.data,
+                          crossed_out.ctypes.data, seeds.ctypes.data, threads)
+        targets, start, contributions = tables_out.scatter[k]
+        library.bt3_scatter(ctypes.addressof(layout_out), ctypes.addressof(planes_out), len(targets),
+                            targets.ctypes.data, start.ctypes.data, contributions.ctypes.data,
+                            seeds.ctypes.data, residual.ctypes.data, threads)
+    if have_t3:
+        _ladder_shifted(blocked_in, blocked_out, residual, t3, prepared, threads, budget=ladder_budget)
     return residual
 
 
@@ -390,48 +497,59 @@ def feedback(blocked, tables, r1, r2, vooo, vvvo, f, g, t3, o, v, threads, *, sh
 _SECTOR_PLANS = {}
 
 
-def _sector_plan(sizes, a_offsets, bases):
-    """(block table, offset tables, zeroed regions) of `_grouped`, cached by shape."""
-    key = (sizes, a_offsets, bases)
-    plan = _SECTOR_PLANS.get(key)
+def _block_plan(blocks):
+    """(block table, offset tables, zeroed regions) of `_products`, cached by shape.
+
+    Each block (m, n, k, a_offset, b_base, o_base) is out (m x n, row-major at
+    o_base) = A (m x k, row-major at a_offset) @ B (k x n, row-major at b_base);
+    k = 0 leaves its output zero."""
+    plan = _SECTOR_PLANS.get(blocks)
     if plan is not None:
         return plan
-    blocks, columns, regions = [], [[] for _ in range(6)], []
-    r0 = c0 = 0
-    for (m, n), a_offset, base in zip(sizes, a_offsets, bases):
+    table, columns, regions = [], [[] for _ in range(6)], []
+    r0 = c0 = k0 = 0
+    for m, n, k, a_offset, b_base, o_base in blocks:
         if not (m and n):
             continue
-        # Row-major A (m x m) at a_offset; X and out (m x n) at base.
-        blocks.append((m, n, m, r0, c0, r0, a_offset, base, base))
+        regions.append((o_base, m * n))
+        if not k:
+            continue
+        table.append((m, n, k, r0, c0, k0, a_offset, b_base, o_base))
         rows, cols = np.arange(m, dtype=np.int64), np.arange(n, dtype=np.int64)
-        for column, part in zip(columns, (rows * m, rows, rows * n, cols, rows * n, cols)):
+        depth = np.arange(k, dtype=np.int64)
+        for column, part in zip(columns, (rows * k, depth, depth * n, cols, rows * n, cols)):
             column.append(part)
-        regions.append((base, m * n))
-        r0, c0 = r0 + m, c0 + n
-    table = np.array(blocks, dtype=np.int64).reshape(-1, 9)
+        r0, c0, k0 = r0 + m, c0 + n, k0 + k
+    table = np.array(table, dtype=np.int64).reshape(-1, 9)
     offsets = tuple(np.concatenate(c) if c else np.zeros(1, np.int64) for c in columns)
     if len(_SECTOR_PLANS) > 4096:
         _SECTOR_PLANS.clear()
-    plan = _SECTOR_PLANS[key] = (table, offsets, tuple(regions))
+    plan = _SECTOR_PLANS[blocks] = (table, offsets, tuple(regions))
     return plan
 
 
-def _grouped(library, sizes, a_offsets, matrices, operands, bases, out, threads=None):
-    """out[base] = block @ operand[base] for each sector, (m x m) @ (m x n), in one
-    call of the core's GEMM executor (the contraction engine of the CPU CCSDTQ
-    solver: no BLAS, all OpenMP threads, sectors and tiles in parallel)."""
+def _products(library, blocks, matrices, operands, out, threads=None):
+    """The `_block_plan` products of `blocks` in one call of the core's GEMM
+    executor (the contraction engine of the CPU CCSDTQ solver: no BLAS, all
+    OpenMP threads, sectors and tiles in parallel); every output block is
+    written (zero where its sum is empty)."""
     from ._runtime import cpu_threads
 
     threads = cpu_threads(threads)
-    sizes = tuple((int(m), int(n)) for m, n in sizes)
-    table, offsets, regions = _sector_plan(sizes, tuple(int(x) for x in a_offsets),
-                                           tuple(int(x) for x in bases))
-    if not len(table):
-        return
+    table, offsets, regions = _block_plan(tuple(tuple(int(x) for x in block) for block in blocks))
     for start, length in regions:           # the executor adds into out
         library.scale(out.ctypes.data + 8 * start, length, 0.0, threads)
-    library.sym_contract(len(table), table.ctypes.data, matrices.ctypes.data, operands.ctypes.data,
-                         out.ctypes.data, *(x.ctypes.data for x in offsets), 1.0, 0, threads)
+    if len(table):
+        library.sym_contract(len(table), table.ctypes.data, matrices.ctypes.data,
+                             operands.ctypes.data, out.ctypes.data,
+                             *(x.ctypes.data for x in offsets), 1.0, 0, threads)
+
+
+def _grouped(library, sizes, a_offsets, matrices, operands, bases, out, threads=None):
+    """out[base] = block @ operand[base] for each sector, (m x m) @ (m x n)."""
+    _products(library, [(m, n, m, a_offset, base, base)
+                        for (m, n), a_offset, base in zip(sizes, a_offsets, bases)],
+              matrices, operands, out, threads)
 
 
 def _sector_matrices(matrix, start, groups):
@@ -512,6 +630,92 @@ def ladder(blocked, residual, t3, wvvvv, threads, *, budget=LADDER_BUDGET, packe
         library.bt3_ladder_scatter(ctypes.addressof(layout), ctypes.addressof(tables),
                                    sym_out.ctypes.data, anti_out.ctypes.data,
                                    residual.ctypes.data, threads)
+
+
+def _shifted_ladder(blocked, wvvvv, shift):
+    """(shift, pair lists, even and odd sector blocks) of a ladder matrix W of
+    irrep `shift` for `_ladder_shifted`: each kind's blocks from pair sector
+    x ^ shift to x packed one after another, with offsets and a presence
+    flag by output sector. Raises NotBlockable when W couples other sectors."""
+    groups, irrep, shift = blocked.groups, blocked.virtual_irreps, int(shift)
+    (p, q, r, s), even_blocks, odd_blocks = _ladder_sectors(wvvvv, irrep)
+    p, q, r, s = (np.ascontiguousarray(x, dtype=np.int64) for x in (p, q, r, s))
+    kinds = []
+    for (x, y), found in (((p, q), even_blocks), ((r, s), odd_blocks)):
+        label = irrep[x] ^ irrep[y]
+        mats, offsets, present, total = [], np.zeros(groups, dtype=np.int64), np.zeros(groups, bool), 0
+        for rows, cols, block in found:
+            whole = rows.start is None
+            if whole or int(label[rows.start] ^ label[cols.start]) != shift:
+                if np.any(block):
+                    raise NotBlockable("The ladder matrix is not of the direction's irrep")
+                continue
+            sector = int(label[rows.start])
+            mats.append(np.ascontiguousarray(block).reshape(-1))
+            offsets[sector], present[sector] = total, True
+            total += block.size
+        kinds.append((np.concatenate(mats) if mats else np.empty(0), offsets, present))
+    return shift, (p, q, r, s), kinds[0], kinds[1]
+
+
+def _ladder_shifted(source, blocked, residual, t3, prepared, threads, *, budget=LADDER_BUDGET):
+    """`ladder` for a W of irrep `shift` (`_shifted_ladder`) on a T3 blocked
+    in `source` (orbital labels), into `residual` blocked in `blocked` (the
+    occupied labels XOR shift): pair rows are gathered with the source's slot
+    irreps and scattered with the target's; the columns of a slot agree."""
+    library = _cpu_kernels.library()
+    groups, nv = blocked.groups, blocked.nv
+    irrep = blocked.virtual_irreps
+    shift, (p, q, r, s), (even_mats, even_off, even_present), (odd_mats, odd_off, odd_present) = prepared
+    even_label, odd_label = irrep[p] ^ irrep[q], irrep[r] ^ irrep[s]
+    even_start = np.searchsorted(even_label, np.arange(groups + 1)).astype(np.int64)
+    odd_start = np.searchsorted(odd_label, np.arange(groups + 1)).astype(np.int64)
+    even_row = np.zeros((nv, nv), dtype=np.int64)
+    even_row[p, q] = even_row[q, p] = np.arange(len(p)) - even_start[even_label]
+    odd_row = np.zeros((nv, nv), dtype=np.int64)
+    odd_row[r, s] = odd_row[s, r] = np.arange(len(r)) - odd_start[odd_label]
+    odd_sign = np.zeros((nv, nv))
+    odd_sign[r, s], odd_sign[s, r] = 1.0, -1.0
+    n_even, n_odd = np.diff(even_start), np.diff(odd_start)
+    xs = np.arange(groups)
+    nslots = len(blocked.slot_irrep)
+    chunk = _ladder_chunk(max(1, nv // groups), nslots, len(p) + len(r), budget)
+
+    def tables(layout, first, count):
+        third = layout.count[xs[:, None] ^ layout.slot_irrep[first:first + count]]
+        widths = 3 * third                                   # (pi, slot) columns
+        colstart = np.ascontiguousarray(np.cumsum(widths, axis=1) - widths, dtype=np.int64)
+        ncols = widths.sum(axis=1).astype(np.int64)
+        sym_size, anti_size = n_even * ncols, n_odd * ncols
+        sym_base = (np.cumsum(sym_size) - sym_size).astype(np.int64)
+        anti_base = (np.cumsum(anti_size) - anti_size).astype(np.int64)
+        structure = _core.structure(_core.BlockedLadder, dict(first_slot=first, nslots=count), dict(
+            even_p=p, even_q=q, even_start=even_start, odd_r=r, odd_s=s, odd_start=odd_start,
+            even_row=even_row, odd_row=odd_row, odd_sign=odd_sign, colstart=colstart,
+            ncols=ncols, sym_base=sym_base, anti_base=anti_base))
+        return structure, ncols, sym_base, anti_base, int(sym_size.sum()), int(anti_size.sum())
+
+    for first in range(0, nslots, chunk):
+        count = min(chunk, nslots - first)
+        gather, ncols_in, sym_in_base, anti_in_base, sym_in_size, anti_in_size = tables(source, first, count)
+        scatter, ncols_out, sym_out_base, anti_out_base, sym_out_size, anti_out_size = tables(
+            blocked, first, count)
+        if not np.array_equal(ncols_out, ncols_in[xs ^ shift]):
+            raise ValueError("The source and target ladder columns do not match")
+        sym_in, anti_in = np.empty(sym_in_size), np.empty(anti_in_size)
+        library.bt3_ladder_gather(ctypes.addressof(source.c_layout()), ctypes.addressof(gather),
+                                  t3.ctypes.data, sym_in.ctypes.data, anti_in.ctypes.data, threads)
+        sym_out, anti_out = np.empty(sym_out_size), np.empty(anti_out_size)
+        _products(library, [(n_even[x], ncols_out[x], n_even[x ^ shift] if even_present[x] else 0,
+                             even_off[x], sym_in_base[x ^ shift], sym_out_base[x]) for x in xs],
+                  even_mats, sym_in, sym_out, threads)
+        _products(library, [(n_odd[x], ncols_out[x], n_odd[x ^ shift] if odd_present[x] else 0,
+                             odd_off[x], anti_in_base[x ^ shift], anti_out_base[x]) for x in xs],
+                  odd_mats, anti_in, anti_out, threads)
+        del sym_in, anti_in
+        library.bt3_ladder_scatter(ctypes.addressof(blocked.c_layout()), ctypes.addressof(scatter),
+                                   sym_out.ctypes.data, anti_out.ctypes.data, residual.ctypes.data,
+                                   threads)
 
 
 def _dense_sector_matrix(blocks, size):

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- CPU EOM-CCSDT and CCSDT response actions of a nonzero irrep G run both
+  halves of the triples tangent on symmetry-blocked T3. The half with the
+  derivative operators (irrep G) on the ground T3 ran on dense-slot T3, every
+  slot read and written; it now gathers the ground T3's planes and ladder
+  rows from its blocked copy in the orbital labels (the one the feedback
+  reads) and multiplies them by the operators' off-diagonal sector blocks
+  into the blocked R3 of the labels shifted by G
+  (`_blocked_residual.triples_shifted`; seed tables with the sources' irrep,
+  rectangular blocks on the GEMM executor, no new kernels). An operator that
+  is not exactly of irrep G falls back to the dense-slot half, before
+  anything is written; `ITERCC_SHIFTED_TANGENT=0` keeps it. Both halves of
+  any irrep are now purified once, on their sum (rounding-level changes).
+  CuF 13o/29v (C2v, 12 desktop threads): B1, B2 and A2 actions 1.10-1.16 ->
+  0.68-0.74 s, as A1, within 3.4e-16; water B1 roots (three) cc-pVDZ 1.54 ->
+  1.27 s, aug-cc-pVDZ 5.99 -> 4.83 s, the same roots and action counts.
+  `benchmarks.eom_ccsdt_actions` times actions by target irrep and path.
+
 - Benchmarks: `benchmarks.singlet_eom_ccsdtq` times singlet EOM-CCSDTQ
   actions by variant (no labels with the central difference, one residual
   per action, sector labels, sector-only outputs on and off, a

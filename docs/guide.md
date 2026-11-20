@@ -324,6 +324,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_OPEN_DRESSING` | call | `0`: CCSDT T1 dressing writes the dressed g(vvvv) instead of ladder sectors |
 | `ITERCC_DRESS_SLABS` | core | `1` or `0`: CCSD T1 dressing by slabs or by plane tasks (default: plane tasks with more than 3 threads per occupied orbital) |
 | `ITERCC_CPU_TANGENT` | construction | `0`: EOM/response actions on the generic path |
+| `ITERCC_SHIFTED_TANGENT` | call | `0`: CPU EOM/response actions of a nonzero irrep apply the derivative operators to dense-slot ground T3, not to the symmetry-blocked copy |
 | `ITERCC_TILE_BLOCKED_T3` | call | `0`: CCSDTQ tile programs read dense T3 |
 | `ITERCC_TILE_FUSED` | call | `0`: CCSDTQ tile programs make one pass per term |
 | `ITERCC_TILE_MEMORY` | call | CCSDTQ tile memory budget in bytes (default: host memory / 8) |

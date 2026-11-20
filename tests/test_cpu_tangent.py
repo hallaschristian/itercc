@@ -57,6 +57,55 @@ def test_cpu_tangent_matches_dual_numbers_without_labels(monkeypatch):
     np.testing.assert_allclose(compiled, reference, rtol=0, atol=1e-13)
 
 
+@pytest.mark.parametrize("irrep", [1, 2, 3])
+def test_shifted_derivative_half_matches_dense_slot(monkeypatch, irrep):
+    """Directions of irrep G != 0: the derivative operators act on the ground
+    T3 blocked in the orbital labels and add into the blocked R3 of the shifted
+    labels (`_blocked_residual.triples_shifted`; the dense-slot triples never
+    run), with the action of the dense-slot half (ITERCC_SHIFTED_TANGENT=0) to
+    rounding. An operator that is not of irrep G (here: a forced NotBlockable)
+    falls back to that half before anything is written, and the engine
+    remembers it."""
+    from itercc import _blocked_residual, _cpu_kernels, _cpu_triples
+
+    if _cpu_kernels.library() is None:
+        pytest.skip("no compiled core")
+    labels = np.array([0, 1, 3, 2, 0, 1, 2, 3, 3, 0, 1, 2, 0])
+    solver = RestrictedCC(*labelled_model(4, 9, labels), orbital_irreps=labels)
+    ground = solver.solve(max_iter=4, energy_tol=1e-30, residual_tol=1e-30, diis_size=0)
+    calls = {"shifted": 0, "dense": 0}
+
+    def counted(module, name, key):
+        original = getattr(module, name)
+
+        def wrapper(*args, **kwargs):
+            calls[key] += 1
+            return original(*args, **kwargs)
+        monkeypatch.setattr(module, name, wrapper)
+    counted(_blocked_residual, "triples_shifted", "shifted")
+    counted(_cpu_triples, "triples", "dense")
+    vector, actions = None, {}
+    for path in ("shifted", "fallback", "dense"):
+        if path == "fallback":
+            def refuse(*args, **kwargs):
+                raise _blocked_residual.NotBlockable("forced")
+            monkeypatch.setattr(_blocked_residual, "_shifted_blocks", refuse)
+        if path == "dense":
+            monkeypatch.setenv("ITERCC_SHIFTED_TANGENT", "0")
+        eom = EOMSinglet(solver, ground.amplitudes, orbital_irreps=labels, irrep=irrep,
+                         ground_residual_tol=1e9)
+        if vector is None:
+            vector = eom.space.project(np.random.default_rng(3 + irrep).normal(size=eom.space.size))
+        calls.update(shifted=0, dense=0)
+        actions[path] = eom.sigma(vector)
+        expected = dict(shifted=(1, 0), fallback=(1, 1), dense=(0, 1))[path]
+        assert (calls["shifted"], calls["dense"]) == expected
+        assert (("shifted off", irrep) in eom._cpu_ground) == (path == "fallback")
+    scale = float(np.max(np.abs(actions["dense"])))
+    for path in ("shifted", "fallback"):
+        np.testing.assert_allclose(actions[path], actions["dense"], rtol=0, atol=1e-13 * scale)
+
+
 def leaky_model(no, nv, labels, leak=3e-11):
     """A labelled model with rounding-level one-electron symmetry leakage."""
     h, eri, no, constant = labelled_model(no, nv, labels)

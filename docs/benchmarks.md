@@ -196,6 +196,15 @@ ccpy follows its CIS guesses root by root; in cc-pVDZ it converged to a
 higher state (31.0 eV) in place of the 23.04 eV state that IterCC and NWChem
 find. IterCC returns the lowest roots of the symmetry sector.
 
+The IterCC times above predate symmetry-blocked derivative operators in
+actions of other irreps than A1. With them the B1 roots take 18-19% less time
+on the 12-core desktop (cc-pVDZ 1.54 -> 1.27 s, aug-cc-pVDZ 5.99 -> 4.83 s;
+the same roots and action counts). `python -m benchmarks.eom_ccsdt_actions`
+times one Jacobian action per target irrep: for CuF (13 occupied, 29 virtual
+orbitals, C2v, 12 desktop threads) a B1, B2 or A2 action took 1.10-1.16 s with
+the derivative-operator half on dense-slot T3 (`ITERCC_SHIFTED_TANGENT=0`) and
+takes 0.68-0.74 s, as an A1 action does (0.69-0.80 s).
+
 ## Polarizabilities
 
 Static and 532 nm isotropic polarizabilities from coupled-cluster linear

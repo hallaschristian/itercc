@@ -65,6 +65,9 @@ SWITCHES = {
         "with more than 3 threads per occupied orbital)"),
     # EOM and response
     "ITERCC_CPU_TANGENT": Switch("1", "construction", "`0`: EOM/response actions on the generic path"),
+    "ITERCC_SHIFTED_TANGENT": Switch(
+        "1", "call", "`0`: CPU EOM/response actions of a nonzero irrep apply the derivative operators to "
+        "dense-slot ground T3, not to the symmetry-blocked copy"),
     # CCSDTQ
     "ITERCC_TILE_BLOCKED_T3": Switch("1", "call", "`0`: CCSDTQ tile programs read dense T3"),
     "ITERCC_TILE_FUSED": Switch("1", "call", "`0`: CCSDTQ tile programs make one pass per term"),

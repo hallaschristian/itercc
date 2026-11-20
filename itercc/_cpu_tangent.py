@@ -197,6 +197,28 @@ def _blocked_operands(proxy, labels, t2_0, t3_0, dt2, dt3, ground, threads, irre
     return layout, tables, t3_0b, dt3b
 
 
+def _ground_source(proxy, labels, ground, t3_0, dt2, irrep, threads):
+    """(blocked layout, plane tables, blocked ground T3) of the orbital labels
+    for the derivative-operator half of a direction of irrep `irrep`
+    (`_blocked_residual.triples_shifted`), else None: it needs the ground T3
+    exactly symmetric (`_packed`, the copy the feedback reads too) and the
+    direction's T2 exactly of the irrep (and ITERCC_SHIFTED_TANGENT on)."""
+    if ground.get(("shifted off", irrep)) or not _runtime.enabled("ITERCC_SHIFTED_TANGENT"):
+        return None
+    plan = _blocked_layout(proxy, labels, ground, 0)
+    if plan is None:
+        return None
+    layout, tables, _ = plan
+    no = proxy.layout.no
+    occupied, virtual = np.asarray(labels[:no]), np.asarray(labels[no:])
+    pairs = (occupied[:, None] ^ occupied)[:, :, None, None] ^ (virtual[:, None] ^ virtual)[None, None]
+    if np.any(dt2[pairs != int(irrep)]):
+        return None
+    t3_0b = _cached(ground, "blocked ground", (t3_0,),
+                    lambda: _packed(layout, t3_0, _runtime.cpu_threads(threads)))
+    return None if t3_0b is None else (layout, tables, t3_0b)
+
+
 def triples(proxy, t2, t3, have_t3, im, vooo, vvvo, g, *, threads=None, labels=None, ground=None,
             irrep=None):
     """Directional derivative of the triples residual (a plain array), as
@@ -208,9 +230,11 @@ def triples(proxy, t2, t3, have_t3, im, vooo, vvvo, g, *, threads=None, labels=N
     (the seeds and the T3 terms paired the other way). For a direction of
     irrep G (`irrep`) of a projected ground state, the first of these is
     totally symmetric in the occupied labels shifted by G and runs on blocked
-    T3 (`_blocked_layout`); for G = 0 both run there. Otherwise, and for the
-    second when G != 0, the dense-slot path runs with symmetry-blocked GEMMs
-    where its operators are exactly block-diagonal."""
+    T3 (`_blocked_layout`); for G = 0 both run there. For G != 0 the second
+    reads the ground T3 blocked in the orbital labels and adds into the same
+    blocked R3 (`_blocked_residual.triples_shifted`). When an operator is not
+    exactly of its irrep, the dense-slot path runs instead, with
+    symmetry-blocked GEMMs where its operators are exactly block-diagonal."""
     o, v, nv = proxy.o, proxy.v, proxy.layout.nv
     t2_0, dt2 = _parts(t2)
     t3_0, dt3 = _parts(t3)
@@ -243,13 +267,30 @@ def triples(proxy, t2, t3, have_t3, im, vooo, vvvo, g, *, threads=None, labels=N
         try:
             # Ground operators on dT3 with the derivative sources' seeds.
             shifted = _blocked_residual.triples(layout, tables, t2_0, dt3b, True, im0, dvooo, dvvvo,
-                                                g0, o, v, workers, wvvvv=w0)
+                                                g0, o, v, workers, wvvvv=w0, purified=False)
             if not irrep:
                 # Derivative operators on T3 with dT2's seeds: totally symmetric too.
                 shifted += _blocked_residual.triples(layout, tables, dt2, t3_0b, have_t3, dim,
-                                                     vooo_0, vvvo_0, dg, o, v, workers, wvvvv=dw)
+                                                     vooo_0, vvvo_0, dg, o, v, workers, wvvvv=dw,
+                                                     purified=False)
+                _blocked_residual.purify(layout, shifted, workers)
                 return layout.unpack(shifted, threads=workers)
+            # Derivative operators of irrep G on the ground T3 (blocked in the
+            # orbital labels) with dT2's seeds, into the same blocked R3.
+            source = _ground_source(proxy, labels, ground, t3_0, dt2, irrep, workers)
+            complete = False
+            if source is not None:
+                try:
+                    _blocked_residual.triples_shifted(
+                        source[:2], (layout, tables), dt2, source[2], have_t3, dim, vooo_0, vvvo_0,
+                        o, v, workers, shift=irrep, wvvvv=dw, residual=shifted)
+                    complete = True
+                except _blocked_residual.NotBlockable:
+                    ground[("shifted off", irrep)] = True       # an operator couples other irreps
+            _blocked_residual.purify(layout, shifted, workers)
             shifted = layout.unpack(shifted, threads=workers)
+            if complete:
+                return shifted
         except _blocked_residual.NotBlockable:
             ground[("blocked off", irrep)] = True       # an operator couples irreps: stay dense
             shifted = None
