@@ -29,6 +29,13 @@ for a converged RHF (or scalar-X2C RHF): `model.h`, `model.eri`, `model.nocc`,
 `model.mo_coeff`. `dipole_integrals(model, mol)` gives the dipole matrices and
 their irreps for response calculations.
 
+For active-space models, `itercc.fold_closed_shell(h, eri, constant, count)`
+integrates the `count` lowest closed-shell orbitals into `h` and `constant`,
+and `itercc.select_active_orbitals(h, eri, constant, labels, nocc, occupied,
+virtual)` keeps chosen occupied and virtual orbitals (indices within each
+block), in solver order, with their irreps; it returns `h`, `eri`, `constant`,
+the new `nocc` and the labels.
+
 Symmetry is free speed: with `orbital_irreps` and `symmetry_tolerance=1e-8`
 the integrals are projected onto their exact symmetry blocks (they deviate only
 by rounding) and every product skips the symmetry-forbidden blocks. Results do
@@ -248,6 +255,12 @@ damped = response.polarizability(532.0, damping_Eh=0.001).tensor_au      # compl
 by a one-electron SOC operator, from transition spin densities that the caller
 supplies. `x2c_spin_orbit(mf, mo_coeff=model.mo_coeff)` builds the bare
 one-electron X2C SOC operator (spin-traceless) in the correlated MO basis.
+`itercc.x2c_somf.two_electron_x2c_somf(mol, gamma_ll, gamma_ls, gamma_ss)`
+contracts the two-electron X2C spin-orbit mean-field integrals with
+large-large, large-small and small-small densities in the spherical X2C AO
+basis (block2's `get_x2c_hso2e` convention) and returns the three operator
+blocks (3 x n x n each); it holds about `block_mib=64` MiB of integrals at a
+time, whole shells per block.
 
 Conventions: densities store D_alpha[p,q] - D_beta[p,q] with
 D[p,q] = <bra|a_q^+ a_p|ket>, axis order (bra, ket, p, q); singlet-triplet

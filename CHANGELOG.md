@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `fold_closed_shell(h, eri, constant, count)` integrates the `count` lowest
+  closed-shell orbitals into the one-electron matrix and the constant, and
+  `select_active_orbitals(h, eri, constant, labels, nocc, occupied, virtual)`
+  keeps chosen occupied and virtual orbitals (indices within each block) in
+  solver order with their irreps, rejecting repeated or cross-block indices;
+  both serve comparisons with selected CI or FCI on the same active
+  Hamiltonian (`itercc.active_space`, exported from `itercc`).
+
+- `itercc.x2c_somf.two_electron_x2c_somf(mol, gamma_ll, gamma_ls, gamma_ss)`
+  contracts the two-electron X2C spin-orbit mean-field integrals of a PySCF
+  molecule with large-large, large-small and small-small AO densities (block2's
+  `get_x2c_hso2e` convention), in shell blocks of about `block_mib` MiB of
+  integrals (default 64) instead of the whole n^4 x 9 tensor.
+
 - CPU EOM-CCSDT and CCSDT response actions of a nonzero irrep G run both
   halves of the triples tangent on symmetry-blocked T3. The half with the
   derivative operators (irrep G) on the ground T3 ran on dense-slot T3, every

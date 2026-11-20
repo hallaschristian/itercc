@@ -83,8 +83,10 @@ More scripts: [examples](examples/).
 | CCSDT | `RestrictedCC` | `EOMSinglet` | `DipoleResponse` |
 | CCSDTQ | `RestrictedCCSDTQ` | triplet spin-flip EOM (experimental) | |
 
-Plus first-order spin-orbit state interaction (`spin_orbit_state_interaction`)
-and an X2C SOC operator from PySCF. Closed-shell (RHF) references only; no
+Plus first-order spin-orbit state interaction (`spin_orbit_state_interaction`),
+X2C SOC operators from PySCF (one-electron, and two-electron mean-field
+contractions) and active-space utilities (`fold_closed_shell`,
+`select_active_orbitals`). Closed-shell (RHF) references only; no
 perturbative (T)/(Q) corrections, gradients or open shells.
 
 ## Documentation
