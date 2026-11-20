@@ -81,7 +81,7 @@ More scripts: [examples](examples/).
 | --- | --- | --- | --- |
 | CCSD | `RestrictedCC(rank=2)` | `EOMSinglet(method="ccsd")` | `DipoleResponse(method="ccsd")` |
 | CCSDT | `RestrictedCC` | `EOMSinglet` | `DipoleResponse` |
-| CCSDTQ | `RestrictedCCSDTQ` | triplet spin-flip EOM (experimental) | |
+| CCSDTQ | `RestrictedCCSDTQ` | triplet spin-flip EOM (experimental) | static, by finite fields |
 
 Plus first-order spin-orbit state interaction (`spin_orbit_state_interaction`),
 X2C SOC operators from PySCF (one-electron, and two-electron mean-field

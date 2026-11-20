@@ -2,8 +2,9 @@
 
 > IterCC is a Python package for high-accuracy closed-shell coupled-cluster
 > calculations: full CCSD, CCSDT and CCSDTQ ground-state energies, singlet
-> EOM-CCSDT excitation energies, and CCSDT dipole polarizabilities (static,
-> frequency-dependent, damped). It runs on a compiled multi-core CPU core or on
+> EOM-CCSDT excitation energies, CCSDT dipole polarizabilities (static,
+> frequency-dependent, damped) and static polarizabilities of any method, CCSDTQ
+> included, from finite fields. It runs on a compiled multi-core CPU core or on
 > NVIDIA GPUs (CuPy). Inputs are molecular-orbital integrals; a PySCF adapter
 > builds them. Energies are in hartree (Eh), polarizabilities in atomic units.
 
@@ -142,6 +143,18 @@ Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
 - `Polarizability`: `tensor_au` (complex 3x3), `wavelength_nm`, `frequency_Eh`, `damping_Eh`.
 - Reuse one `DipoleResponse` for many wavelengths: later wavelengths start from earlier solutions and get cheaper.
 - `tol=1e-6` reproduces tightly converged tensors to about 2e-8 relative (measured on water).
+
+### finite_field_polarizability(solver_factory, h, dipoles, *, orbital_irreps=None, dipole_irreps=None, fields=(1e-3, 2e-3), components=None, initial=None, warm_start=True, solve_options=None, callback=None) -> FiniteFieldPolarizability
+Static tensor -d2E/dF_i dF_j for any ground-state method (the route for CCSDTQ), fixed orbitals.
+`solver_factory(h, labels)` returns the solver of the perturbed one-electron matrix, for example
+`lambda h, labels: RestrictedCCSDTQ(h, model.eri, model.nocc, model.constant, orbital_irreps=labels, backend="cpu")`;
+`h` and `dipoles` are `model.h` and the matrices of `dipole_integrals`.
+- `FiniteFieldPolarizability`: `tensor_au` (3x3, extrapolated to zero field; NaN where not solved),
+  `dipole_au` (-dE/dF, electronic), `centered_au`, `extrapolation_au`, `energy_Eh`, `points`, `converged`.
+- `initial` starts the zero-field solve (CCSDTQ from CCSDT: `lambda s: (t1, t2, s.expand_triples(t3))`).
+- Default `solve_options`: `energy_tol=1e-13, residual_tol=1e-11` (matches analytic CCSDT response to 1e-6 au on water).
+  Add `damping=0.2` for CCSDTQ. A solve that does not converge raises RuntimeError.
+- With labels, water (C2v) needs 9 solves for the whole tensor; CCSDTQ cc-pVDZ took 23 s on 12 cores.
 
 ### spin_orbit_state_interaction(singlet_energies, triplet_energies, pauli, singlet_triplet, triplet_singlet, triplet_triplet, *, backend="cpu") -> SpinOrbitResult
 First-order SOC state interaction from caller-supplied transition spin

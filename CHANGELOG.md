@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- `finite_field_polarizability` gives the static polarizability tensor of any
+  ground-state method, CCSDTQ included (analytic response stops at CCSDT), as
+  the second derivative of its energy in uniform fields with fixed orbitals.
+  A solver factory builds each point's solver from the perturbed
+  one-electron matrix and the labels the field conserves. Fields of 1e-3 and
+  2e-3 au are extrapolated to zero field in F^2. Off-diagonal elements come
+  from the lines (e_i + e_j)/sqrt(2). Symmetry skips the -F points of
+  components that are not totally symmetric and the elements between
+  different irreps (water: 9 solves instead of 25). Each point starts from
+  the amplitudes predicted by the solved points of its line
+  (`itercc.continuation`; 37% fewer iterations). Water CCSDT matches
+  `DipoleResponse` to 1e-6 au (cc-pVDZ) and 8e-8 au (aug-cc-pVDZ) with the
+  default tolerances (energy 1e-13, residual 1e-11); water CCSDTQ cc-pVDZ
+  takes 23 s for the whole tensor on 12 cores. Tests compare against
+  analytic CCSDT response and four-electron FCI (sum over states).
+
 - `fold_closed_shell(h, eri, constant, count)` integrates the `count` lowest
   closed-shell orbitals into the one-electron matrix and the constant, and
   `select_active_orbitals(h, eri, constant, labels, nocc, occupied, virtual)`

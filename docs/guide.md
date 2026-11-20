@@ -249,6 +249,52 @@ damped = response.polarizability(532.0, damping_Eh=0.001).tensor_au      # compl
 - `tol` is the relative residual of each linear solve (default 1e-8). On water,
   `tol=1e-6` reproduced tightly converged tensors to about 2e-8 relative.
 
+### Finite fields (CCSDTQ and any other ground state)
+
+Analytic response stops at CCSDT. `finite_field_polarizability` takes the
+second derivative of any ground-state energy in a uniform field, with the same
+fixed orbitals, so CCSDTQ gives its static tensor too:
+
+```python
+from itercc import RestrictedCCSDTQ, finite_field_polarizability
+
+t1, t2, t3 = ground.amplitudes                      # CCSDT at zero field
+def ccsdtq(h, labels):                              # the solver of a perturbed h
+    return RestrictedCCSDTQ(h, model.eri, model.nocc, model.constant,
+                            orbital_irreps=labels, backend="cpu")
+alpha = finite_field_polarizability(ccsdtq, model.h, dipoles,
+                                    orbital_irreps=model.orbital_irreps, dipole_irreps=dipole_irreps,
+                                    initial=lambda s: (t1, t2, s.expand_triples(t3)),
+                                    solve_options=dict(damping=0.2))
+alpha.tensor_au, alpha.dipole_au, alpha.points
+```
+
+- Each point solves `h - F (n . dipoles)` along an axis or, for an
+  off-diagonal element, along (e_i + e_j)/sqrt(2); the factory receives that
+  matrix and the labels the field conserves. The fields (default 1e-3 and
+  2e-3 au) are extrapolated to zero field in F^2, which removes the
+  hyperpolarizability terms; `extrapolation_au` is the size of that correction
+  and `centered_au` the tensors before it.
+- With labels, a component that is not totally symmetric needs +F only and
+  elements between different irreps are zero without solves: water (C2v)
+  needs 9 solves for the whole tensor, 25 without labels. `components=("zz",)`
+  restricts the solves.
+- Each point starts from the amplitudes predicted by the solved points of its
+  line (`itercc.continuation`): 37% fewer iterations on water. It keeps up to
+  four states of the line besides the zero-field one; `warm_start=False`
+  keeps none.
+- The second differences divide energy errors by F^2, so the default
+  `solve_options` are `energy_tol=1e-13, residual_tol=1e-11`. On water CCSDT
+  the tensor then matches `DipoleResponse` to 1e-6 au (cc-pVDZ) and 8e-8 au
+  (aug-cc-pVDZ); `energy_tol=1e-14, residual_tol=1e-12` reaches 3e-8 au for
+  20% more iterations, `1e-12/1e-10` only 1e-5 au. A solve that does not
+  converge raises RuntimeError; `callback(point)` sees every point as it is
+  solved.
+- `dipole_au` is -dE/dF of the given Hamiltonian, the electronic dipole of its
+  correlated orbitals (add the nuclear and frozen-core dipoles for the total).
+- Water cc-pVDZ (4 occupied, 19 virtual, 12 cores): CCSDT 1.6 s, CCSDTQ 23 s
+  for the whole tensor; the quadruples lower the diagonal by 0.0006 to 0.0012 au.
+
 ## Spin-orbit coupling
 
 `spin_orbit_state_interaction` diagonalizes singlet and triplet states coupled

@@ -12,9 +12,11 @@ from .eom_spin_quadruples import TripletEOMCCSDTQ
 from .response import DipoleResponse, Polarizability, ResponseCheckpoint
 from .spin_orbit import SpinOrbitResult, spin_orbit_from_components, spin_orbit_state_interaction
 from .active_space import fold_closed_shell, select_active_orbitals
+from .finite_field import FiniteFieldPolarizability, finite_field_polarizability
 
 __all__ = ["Hamiltonian", "Iteration", "RestrictedCC", "Result", "TensorCC", "EOMSinglet",
            "EOMResult", "TripletEOMCCSDTQ", "DipoleResponse", "Polarizability", "RestrictedCCSDTQ", "CCSDTQState",
            "ResponseCheckpoint", "SpinOrbitResult", "spin_orbit_from_components", "spin_orbit_state_interaction",
-           "fold_closed_shell", "select_active_orbitals"]
+           "fold_closed_shell", "select_active_orbitals", "FiniteFieldPolarizability",
+           "finite_field_polarizability"]
 

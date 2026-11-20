@@ -11,6 +11,7 @@ How IterCC gets its speed and how it keeps results exact. For usage see the
 | CCSD/CCSDT | `restricted.py`, `_restricted_equations.py`, `_triples_layout.py`, `_blocked*.py`, `_cpu_triples.py` | Spin-adapted closed-shell residuals on packed, symmetry-blocked T3 |
 | CCSDTQ | `quadruples.py`, `_quadruples_*.py`, `_cpu_quadruples.py`, `_cpu_tile_program.py`, `symmetry_blocks.py` | Packed T4, tile equations, compiled tile programs, host/device DIIS, checkpoints |
 | EOM and response | `eom.py`, `response.py`, `_directional.py`, `_cpu_tangent.py`, `krylov.py` | Exact Jacobian actions, Davidson, shifted GMRES, CC Lagrangian response |
+| Finite fields | `finite_field.py`, `continuation.py` | Static polarizabilities of any ground state from field energies, warm starts from neighbouring fields |
 | Compiled core | `core/` (C++17/OpenMP, CUDA), `_core.py`, `_cpu_kernels.py` | GEMM executor, element-wise kernels, CUDA kernels, behind a versioned C ABI |
 | Runtime | `_runtime.py` | Threads, host memory and the registry of ITERCC_* switches, shared by every method |
 | GPU | `_cuda_*.py`, `gemm_contract.py` | CuPy/cuBLAS contractions, fused layout kernels, autotuned GEMM routes |
