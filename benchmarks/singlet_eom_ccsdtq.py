@@ -1,7 +1,10 @@
 """Time singlet EOM-CCSDTQ Jacobian actions (`FiniteDifferenceEOM`) by variant.
 
 Every variant applies the same Jacobian of one symmetry sector to the same
-vector; the first variant is the reference the others are compared with:
+vector (random, then projected into the residual's range like every Davidson
+vector, `FiniteDifferenceEOM.in_range`: one transient copy of the amplitudes
+before the first action); the first variant is the reference the others are
+compared with:
 
 - `dense-central`: a solver without orbital labels (C1 GEMMs on dense T4) and
   the central difference (two residuals per action);
@@ -180,8 +183,11 @@ def main():
             emit(event="engine", variant=variant, seconds=round(time.perf_counter() - start, 2),
                  nirrep=int(solver.layout.nirrep), t4_GiB=round(solver.layout.size * 8 / 2**30, 3),
                  size=int(engine.space.size), one_sided=engine.one_sided)
-            vector = np.random.default_rng(args.seed).standard_normal(engine.space.size)
-            vector /= np.linalg.norm(vector)
+            if reference is None:
+                # In the residual's range like every Davidson vector (T4 with
+                # symmetric ties), where the variants agree.
+                vector = engine.in_range(np.random.default_rng(args.seed).standard_normal(engine.space.size))
+                vector /= np.linalg.norm(vector)
             os.environ["ITERCC_EOM_SECTOR_OUTPUTS"] = "0" if variant == "sector-every" else "1"
             for number in range(1, args.actions + 1):
                 tile_seconds.clear()

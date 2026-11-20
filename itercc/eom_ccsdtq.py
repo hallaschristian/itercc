@@ -387,6 +387,20 @@ class FiniteDifferenceEOM:
         value -= omega * vector
         return float(np.sqrt(float(value @ value)))
 
+    def in_range(self, vector):
+        """`vector` with its rank-four part projected as the residual is
+        (occupied ties symmetrized, spin-adapted, purified): the range the
+        ground amplitudes and every Davidson vector stay in. The compiled CPU
+        residual relies on that symmetry of T4 (its r2 term reads the P4_201
+        rows, `_cpu_packed.t4_into_lower_ranks`), so random vectors that
+        compare code paths go through this first. Allocates one set of
+        amplitudes."""
+        xp = self.xp
+        amplitudes = tuple(xp.zeros(a.shape) for a in self.amplitudes)
+        self.space.shift(amplitudes, vector, 1.0)
+        self.solver.layout.project(amplitudes[3])
+        return self.space.pack(amplitudes)
+
     @_runtime.threaded
     def sigma(self, vector):
         xp = self.xp

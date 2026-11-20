@@ -11,7 +11,36 @@
   `benchmarks/_memory.py` traces resident memory by phase (and glibc's heap
   in use, free and mapped), used by it and by the triplet CuF driver's
   `--memory-trace`. `docs/benchmarks.md` adds CuF aug-cc-pVDZ-DK CCSDTQ and
-  singlet EOM-CCSDTQ and CuF triplet EOM-CCSDTQ actions and memory.
+  singlet EOM-CCSDTQ and CuF triplet EOM-CCSDTQ actions and memory. Its
+  vectors are projected into the residual's range
+  (`FiniteDifferenceEOM.in_range`: T4 with symmetric occupied ties,
+  spin-adapted, like the ground amplitudes and every Davidson vector).
+
+- The CPU pass of T4 into ranks two and three reads T4 once per occupied
+  pair instead of three times, with fewer and contiguous products (results
+  change in rounding only, for amplitudes in the residual's range):
+  - The r2 term, (1/4) <mn|ef> P4_442(T)[mnij, efab], is needed only up to
+    the r2 + r2^T(ij, ab) that follows, and up to it equals (1/2) <mn|ef>
+    (S[mnij, efab] - S[mnij, eafb]) with S the P4_201 rows gathered for r3
+    (T4's pair symmetry and <mn|ef> = <nm|fe>): no P4_442_r2 gathers (two
+    per pair), and both orders of a pair in three products into r2[p, q].
+  - The r3 and W_vvvvoo terms of the order (q, p) are those of (p, q) with
+    b and c exchanged, which the projection of r3 and the symmetrization of
+    W_vvvvoo add anyway: one product each per pair, with twice the weight.
+  - Its chunks of m hold 2 GiB of packed rows rather than of dense ones (at
+    13o/63v two m per chunk with B1-subgroup labels and five with C2v,
+    instead of one), so the products add to their outputs fewer times.
+  - W_vvoooo and W_vvvvoo are stored with their occupied axes outermost on
+    the CPU from the start (`_empty_stored`), the order the R4 tiles read:
+    the pass adds to contiguous slabs instead of one cache line per entry,
+    and the 21 GB relayout of W_vvvvoo before R4 (13o/63v) is gone.
+    `add_transpose_` and `relayout` work through such transposed storage.
+  A synthetic 6o/40v model on 12 desktop threads: the C2v residual 12.0 ->
+  9.6 s (the pass 2.44 -> 1.21 s), the B1 one-sided singlet action 25.3 ->
+  21.0 s (the pass 5.60 -> 2.86 s). CuF aug-cc-pVDZ-DK (13o/63v) on a
+  56-core Sapphire Rapids socket: the C2v CCSDTQ residual 293 -> 260 s (the
+  pass 68 -> 33 s, the same residual norms), the B1 singlet action 12.6-12.9
+  -> 10.4-10.9 min (the pass 3.8-4.0 -> 1.6-1.7 min), peak 410 GiB.
 
 - One-sided singlet EOM-CCSDTQ actions form only the target sector's R4
   entries in the tile programs and the ring terms (`_cpu_packed.OutputSector`

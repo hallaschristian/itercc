@@ -330,7 +330,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TILE_TEAM` | call | CCSDTQ threads per tile-program team |
 | `ITERCC_LOWER_TEAMS` | call | CCSDTQ concurrent teams of the T4-into-lower-rank passes |
 | `ITERCC_TEAM_SCHEDULE` | call | `rounds`: CCSDTQ teams in fixed rounds (diagnostic) |
-| `ITERCC_LOWER_CHUNK` | call | occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB) |
+| `ITERCC_LOWER_CHUNK` | call | occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB of rows, packed on the compiled CPU path) |
 | `ITERCC_DIIS_COMPACT` | call | `0`: float64 instead of compact float32 host T4 DIIS history |
 | `ITERCC_EOM_SECTOR_OUTPUTS` | call | `0`: one-sided singlet EOM-CCSDTQ actions form every allowed R4 entry of the tile programs and ring terms, not only those of the target sector |
 | `ITERCC_TRIPLET_PROGRAM` | call | `0`: triplet EOM-CCSDTQ rank-four slots in the Python loop instead of the compiled program |

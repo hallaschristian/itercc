@@ -815,7 +815,8 @@ def test_cpu_singlet_eom_sector_paths_agree(irrep):
     dense = RestrictedCCSDTQ(*model, backend="cpu")
     ground = dense.solve(max_iter=3, damping=0.2, diis_size=0).amplitudes
     reference = FiniteDifferenceEOM(dense, ground, LABELS, irrep, one_sided=False)
-    vector = np.random.default_rng(13 + irrep).normal(size=reference.space.size)
+    # In the residual's range, as every Davidson vector (T4 with symmetric ties).
+    vector = reference.in_range(np.random.default_rng(13 + irrep).normal(size=reference.space.size))
     base = reference.sigma(vector)
     scale = np.abs(base).max()
     if irrep:
@@ -828,6 +829,9 @@ def test_cpu_singlet_eom_sector_paths_agree(irrep):
     engine = FiniteDifferenceEOM(solver, converted, LABELS, irrep)
     assert engine.one_sided == bool(irrep)
     np.testing.assert_array_equal(engine.diagonal, reference.diagonal)
+    # The projection is idempotent and the same in either layout.
+    for projector in (reference, engine):
+        np.testing.assert_allclose(projector.in_range(vector), vector, rtol=0, atol=1e-14)
     np.testing.assert_allclose(engine.sigma(vector), base, rtol=0, atol=(1e-14 if irrep else 1e-10) * scale)
     omega = float(vector @ base) / float(vector @ vector)
     assert engine.full_residual_norm(vector, omega) == pytest.approx(

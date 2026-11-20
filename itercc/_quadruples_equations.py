@@ -33,6 +33,20 @@ from ._quadruples_cuda import (
 from . import _runtime
 
 
+# R4 reads W_vvoooo and W_vvvvoo one tile (occupied indices) at a time, and
+# the T4 pass adds to them one occupied pair at a time: on the CPU they are
+# stored with their occupied axes outermost (same index order).
+_W_VVOOOO_ORDER = (3, 4, 5, 2, 0, 1)
+_W_VVVVOO_ORDER = (4, 5, 0, 1, 2, 3)
+
+
+def _empty_stored(xp, shape, order):
+    """xp.empty(shape) stored with the axes `order` outermost on the CPU."""
+    if xp is not np:
+        return xp.empty(shape)
+    return np.empty(tuple(shape[axis] for axis in order)).transpose(np.argsort(order))
+
+
 def _kernels(array):
     """The kernel module for an array: NumPy arrays use the CPU backend (its
     compiled kernels when the core is available, else plain NumPy)."""
@@ -315,7 +329,7 @@ def intermediates_t4_tri(mycc, imds, t2, t3):
     einsum('mnef,ijkaef->kjinma', t1_eris[:nocc, :nocc, nocc:, nocc:], t3, out=W_ooooov, alpha=0.5, beta=1.0)
     _kernels(W_ooooov).add_transpose_(W_ooooov, (1, 0, 2, 4, 3, 5))
 
-    W_vvoooo = xp.empty((nvir,) * 2 + (nocc,) * 4)
+    W_vvoooo = _empty_stored(xp, (nvir,) * 2 + (nocc,) * 4, _W_VVOOOO_ORDER)
     einsum('amef,ijkebf->abmijk', t1_eris[nocc:, :nocc, nocc:, nocc:], t3, out=W_vvoooo, alpha=1.0, beta=0.0)
     tmp_ovvo = t1_eris[:nocc, nocc:, nocc:, :nocc].copy()
     c_t2 = 2.0 * t2 - t2.transpose(0, 1, 3, 2)
@@ -328,7 +342,7 @@ def intermediates_t4_tri(mycc, imds, t2, t3):
     einsum('make,jibe->abmijk', W_ovov, t2, out=W_vvoooo, alpha=1.0, beta=1.0)
     einsum('mnki,njab->abmijk', W_oooo, t2, out=W_vvoooo, alpha=-0.5, beta=1.0)
 
-    W_vvvvoo = xp.empty((nvir,) * 4 + (nocc,) * 2)
+    W_vvvvoo = _empty_stored(xp, (nvir,) * 4 + (nocc,) * 2, _W_VVVVOO_ORDER)
     einsum('abef,jkfc->abcejk', W_vvvv, t2, out=W_vvvvoo, alpha=0.5, beta=0.0)
 
     imds.W_oovvvo, imds.W_ovovvo, imds.W_ooooov = W_oovvvo, W_ovovvo, W_ooooov
@@ -357,10 +371,15 @@ def t4_into_lower_ranks_(mycc, imds, r2, r3, t4, *, budget=2 * 2**30):
     # ITERCC_LOWER_CHUNK (diagnostic) fixes the number of m per chunk.
     chunk = _runtime.integer("ITERCC_LOWER_CHUNK") or max(1, min(nocc, budget // (8 * nocc * nvir**4)))
     if hasattr(mycc.layout, "add_oooo_pairs") and mycc.layout.symmetric:
-        # The compiled CPU layout: packed blocks and box-level plans.
+        # The compiled CPU layout: packed blocks and box-level plans, the
+        # budget for a chunk's packed rows (no symmetry zeros: 1/N of the
+        # dense size; at 13o/63v two m per chunk with B1-subgroup labels and
+        # five with C2v, instead of one).
         from . import _cpu_packed
         from ._runtime import cpu_threads
 
+        packed = 8 * nocc * int(max(mycc.layout._slot_sizes()))
+        chunk = _runtime.integer("ITERCC_LOWER_CHUNK") or max(1, min(nocc, budget // packed))
         _cpu_packed.t4_into_lower_ranks(mycc.layout, r2, r3, t4, eris_oovv, eris_vovv, fock_ov,
                                         t1_eris[o, o, v, o], W_vvoooo, W_vvvvoo, chunk, cpu_threads(None),
                                         single=getattr(mycc, "precision", "double") == "single")
@@ -608,9 +627,10 @@ def compute_r4_tri(mycc, imds, t2, t3, t4):
     if xp is np:
         # Every tile fixes the occupied indices of W_vvoooo and W_vvvvoo, which are
         # innermost: on the CPU each read would take its own cache line of a large
-        # array. Keep the same index order with the occupied indices outermost.
-        W_vvoooo = _kernels(W_vvoooo).relayout(W_vvoooo, (3, 4, 5, 2, 0, 1))
-        W_vvvvoo = _kernels(W_vvvvoo).relayout(W_vvvvoo, (4, 5, 0, 1, 2, 3))
+        # array. They are stored with the occupied indices outermost (no copy
+        # when the intermediates were made so, `_empty_stored`).
+        W_vvoooo = _kernels(W_vvoooo).relayout(W_vvoooo, _W_VVOOOO_ORDER)
+        W_vvvvoo = _kernels(W_vvvvoo).relayout(W_vvvvoo, _W_VVVVOO_ORDER)
         imds.W_vvoooo, imds.W_vvvvoo = W_vvoooo, W_vvvvoo
 
     def t4_terms(tile, i0, i1, j0, j1, k0, k1, l0, l1, out, t4_tile):

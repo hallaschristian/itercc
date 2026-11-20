@@ -309,13 +309,14 @@ iteration with 13 correlated occupied orbitals in C2v symmetry:
 | CCSDT | 88 | 2.5 | 7.9 |
 | CCSDT | 131 | 9.2 | 26.6 |
 | CCSDTQ | 47 | 85 | |
-| CCSDTQ | 63 | 293 | |
+| CCSDTQ | 63 | 260 | |
 
 The 63-virtual case is CuF in aug-cc-pVDZ-DK. Its CCSDTQ evaluation spends
 141 s in the R4 tile programs (1.04e14 multiply-adds, about two fifths of
 the socket's double-precision peak; 151 s with sum chunks of 256,
-`ITERCC_TILE_KC=0`), 65 s on T4 into ranks two and three, 49 s on the ring
-terms and 23 s on the oooo terms.
+`ITERCC_TILE_KC=0`), 33 s on T4 into ranks two and three (68 s when that
+pass read T4 three times per occupied pair), 50 s on the ring terms and 24 s
+on the oooo terms.
 
 ### Excited states with quadruples
 
@@ -326,8 +327,8 @@ Jacobian action on the same socket (7.3e9 parameters per sector):
 | --- | --- | --- | --- |
 | no labels (C1 on dense T4), central difference | any | over 83 (unfinished, 48 cores) | 1.0 TB |
 | C2v labels, central difference | A1 | 11.8 | 420 GiB |
-| B1-subgroup labels, one residual, sector-only R4 outputs | B1, A2 | 12.6-12.9 | 416-423 GiB |
-| the same, `precision="single"` solver | B1, A2 | 12.3-12.6 | |
+| B1-subgroup labels, one residual, sector-only R4 outputs | B1, A2 | 10.4-10.9 | 410 GiB |
+| the same, `precision="single"` solver, earlier pass into ranks two and three | B1, A2 | 12.3-12.6 | |
 
 With `sector_labels` both residuals keep the subgroup's symmetry blocks, and
 for a nonzero target irrep one residual replaces the two of the central
@@ -335,13 +336,17 @@ difference (the same action, bit for bit). The tile programs and the ring
 terms then form only the target sector's R4 entries (half the tiles'
 multiply-adds): in one process the B1 action took 15.0-15.6 min forming
 every allowed entry and 12.6-12.9 min with the sector's only, with identical
-results (4.9-5.3 min in the R4 tile programs, 3.8-4.0 min on T4 into ranks
-two and three, 1.9-2.0 min on the ring terms, 0.9 min on the oooo terms and
-0.4 min projecting R4), 2.6 C2v residuals. Shifting the ground amplitudes in
-place (one T4 fewer) brought its peak from 519 GiB, more than the socket's
-503 GiB, to 416-423 GiB. On a `precision="single"` solver (float32 T3 and
-summed T4 rows, products in double) the action took 12.3-12.6 min, within
-1.6e-9 relative of the double one, its Rayleigh quotient within 2e-13 Eh.
+results. Reading T4 once per occupied pair on the way into ranks two and
+three (3.8-4.0 min before, 1.6-1.7 min after) brought it to 10.4-10.9 min:
+5.0-5.2 min in the R4 tile programs, 2.0-2.1 min on the ring terms, 1.0-1.1
+min on the oooo terms and 0.4 min projecting R4, 2.5 C2v residuals.
+Shifting the ground amplitudes in place (one T4 fewer) brought its peak from
+519 GiB, more than the socket's 503 GiB, to 410 GiB. On a
+`precision="single"` solver (float32 T3 and summed T4 rows, products in
+double) the action took 12.3-12.6 min with the earlier pass into ranks two
+and three (its gain is in the tile programs), within 1.6e-9 relative of the
+double one, its Rayleigh quotient within 2e-13 Eh. The A1 row predates the
+tile and rank-two-and-three changes.
 `python -m
 benchmarks.singlet_eom_ccsdtq --synthetic 4 24 --irrep 2` compares every
 variant on a synthetic C2v model (12 desktop threads: 2.69 s per action

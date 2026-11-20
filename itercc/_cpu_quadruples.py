@@ -158,10 +158,22 @@ def permuted_add(out, a, b, wa=1.0, wb=1.0):
     return out
 
 
+def _stored_order(x):
+    """The axis order in which `x` is a C-contiguous array, or None."""
+    order = tuple(int(d) for d in np.argsort([-stride for stride in x.strides], kind="stable"))
+    return order if x.transpose(order).flags.c_contiguous else None
+
+
 def add_transpose_(x, perm):
     """x += x.transpose(perm) in place (pairwise, without a temporary, when perm is
-    its own inverse)."""
+    its own inverse; also for a transpose of a C-contiguous array, through it)."""
     perm = tuple(int(p) for p in perm)
+    if _compiled(x) and not x.flags.c_contiguous and 1 <= x.ndim <= 8:
+        order = _stored_order(x)
+        if order is not None:
+            inverse = np.argsort(order)
+            add_transpose_(x.transpose(order), [int(inverse[perm[d]]) for d in order])
+            return x
     if (_compiled(x) and x.flags.c_contiguous and 1 <= x.ndim <= 8
             and all(perm[p] == d for d, p in enumerate(perm))):
         shape = np.asarray(x.shape, dtype=np.int64)
@@ -180,7 +192,9 @@ def add_transposed(a, perm):
 
 def relayout(array, order):
     """The same array (same index order) stored with its axes `order` outermost
-    first in memory."""
+    first in memory (`array` itself if it is stored so)."""
+    if array.transpose(order).flags.c_contiguous:
+        return array
     stored = np.empty(tuple(array.shape[axis] for axis in order))
     permuted_add(stored, None, array.transpose(order), 0.0, 1.0)
     return stored.transpose(np.argsort(order))

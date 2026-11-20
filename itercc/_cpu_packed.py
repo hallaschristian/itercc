@@ -589,14 +589,22 @@ def add_rings(layout, r4, t4, F_oo, W_ovov, W_voov, threads):
     _run_ordered(_triple_rounds(nocc), _triple_keys, run_triple, lower_teams(threads), threads)
 
 
-# t4_into_lower_ranks_: (spec, A, out, alpha, row letters, fixed letters). The
-# r2 term reads the P4_442_r2 spin sum of T4[m, n, p, q]; the others read the
-# P4_201 one, where the t1 term also carries the Fock term (see below).
-_LOWER_R2 = ("mnef,mnijefab->ijab", "oovv", "r2", 0.25, "mn", "ij")
+# t4_into_lower_ranks_: (spec, A, out, alpha, row letters, fixed letters). All
+# read the P4_201 spin sum of T4[m, n, p, q]: the r2 term through several
+# letter orders (see below), the t1 term also carrying the Fock term.
+_LOWER_R2 = (("mnef,mnijefab->ijab", 0.5), ("mnef,mnijeafb->ijab", -0.5))
+# Both orders of a pair p < q into r2[p, q] (the second's terms transposed).
+_LOWER_R2_PAIR = (("mnef,mnijefab->ijab", 1.0), ("mnef,mnijeafb->ijab", -0.5),
+                  ("mnef,mnijebaf->ijab", -0.5))
 _LOWER_201 = (("amef,mijkfebc->ijkabc", "vovv", "r3", 0.5, "mi", "jk"),
               ("mjen,mijkeabc->inkabc", "vo", "r3q", 1.0, "mi", "jk"),
               ("mnef,nijkfabe->abmijk", "oovv_n", "W4", 0.5, "ni", "jk"),
               ("inef,nijkfabc->abcejk", "oovv_n", "W6", -0.5, "ni", "jk"))
+
+
+# Terms whose (q, p) order is the (p, q) one with b and c exchanged, which the
+# caller symmetrizes over: run once with twice the weight.
+_FOLDED = ("r3", "W6")
 
 
 def _swap_last(letters):
@@ -769,7 +777,23 @@ def t4_into_lower_ranks(layout, r2, r3, t4, eris_oovv, eris_vovv, fock_ov, t1_vo
       the n = j row of the t1 term t1[m, j, e, n] S[...] -> r3[i, n, k]; so
       one contraction with A[m, e, n] = -t1[m, j, e, n] / 2 + delta(n, j)
       f[m, e] / 6 adds both.
-    The r2 spin sum P4_442_r2 has neither symmetry and is gathered per order.
+    - The r2 term (1/4) <mn|ef> P4_442(T)[m, n, i, j, e, f, a, b] is only
+      needed up to r2 + r2^T(ij, ab), which the caller adds next; up to that
+      transpose it equals (1/2) <mn|ef> (S[m, n, i, j, e, f, a, b] -
+      S[m, n, i, j, e, a, f, b]) with S the P4_201 rows (T4's pair symmetry,
+      occupied ties included, and <mn|ef> = <nm|fe>). So r2 reads the rows
+      gathered for r3 through letter orders instead of its own spin sum
+      gathered per order (a third of the pass at 6o/40v). The transpose
+      also lets r2[p, q] take the terms of (q, p), whose rows are those of
+      (p, q) with virtual positions 2 and 3 exchanged: (1/2) <mn|ef>
+      (2 S[..., e, f, a, b] - S[..., e, a, f, b] - S[..., e, b, a, f]),
+      three products per pair p < q instead of four.
+    - Likewise the r3 term of (q, p) is that of (p, q) with b and c
+      exchanged, which the caller's projection of r3 (a sum over the joint
+      permutations of its index pairs) adds to r3[:, p, q] anyway; and the
+      W_vvvvoo term of (q, p) is that of (p, q) with b and c exchanged, which
+      `finish_intermediates_t4` adds (W += W^T(bc, jk)). For p < q both run
+      once, for (p, q), with twice the weight.
     With `single`, the summed rows are kept as floats (formed in double, then
     rounded; the GEMMs widen them as they pack): half the bytes for the gather
     to write and every contraction to read.
@@ -807,7 +831,7 @@ def t4_into_lower_ranks(layout, r2, r3, t4, eris_oovv, eris_vovv, fock_ov, t1_vo
 
     def run_pair(p, q, threads):
         """All contractions of the pair p <= q (both orders) on `threads` threads.
-        They write r2[i, j], r3 slabs [:, :, j] and W[..., i, j] for (i, j) in
+        They write r2[p, q], r3 slabs [:, :, j] and W[..., i, j] for (i, j) in
         {(p, q), (q, p)} only, so pairs without a common index can run at once."""
         orders = [(p, q, False)] + ([(q, p, True)] if q != p else [])
         G = int(occ[p] ^ occ[q])
@@ -820,21 +844,15 @@ def t4_into_lower_ranks(layout, r2, r3, t4, eris_oovv, eris_vovv, fock_ov, t1_vo
             if buffer is None or len(buffer) < rows.size:
                 buffer = local.summed = np.zeros(rows.size, dtype=np.float32 if single else np.float64)
             summed = buffer
-            # r2[p, q] and r2[q, p]: their own P4_442_r2 rows.
-            spec, a_name, out_name, alpha, row_letters, fixed = _LOWER_R2
-            A = eris_oovv[m0:m1]
-            for i, j, _ in orders:
-                out = r2[i:i + 1, j:j + 1]
-                plan = plan_of(spec, A, out, row_letters, fixed, (m0, m1), i, j, False)
-                slots, order = _row_slots(layout, [(m, n, i, j) for m in range(m0, m1)
-                                                   for n in range(nocc)])
-                _gather_permute(layout, t4, summed, rows, slots, order, "P4_442_r2", threads)
-                plan.run(library, A.ctypes.data, summed.ctypes.data, out.ctypes.data, alpha, threads,
-                         b_f32=single)
-            # The P4_201 rows of (p, q), read for both orders while they are in cache.
+            # The P4_201 rows of (p, q), read for both orders.
             slots, order = _row_slots(layout, [(m, n, p, q) for m in range(m0, m1)
                                                for n in range(nocc)])
             _gather_permute(layout, t4, summed, rows, slots, order, "P4_201", threads)
+            A, out = eris_oovv[m0:m1], r2[p:p + 1, q:q + 1]
+            for spec, alpha in _LOWER_R2 if p == q else _LOWER_R2_PAIR:
+                plan = plan_of(spec, A, out, "mn", "ij", (m0, m1), p, q, False)
+                plan.run(library, A.ctypes.data, summed.ctypes.data, out.ctypes.data, alpha, threads,
+                         b_f32=single)
             for i, j, swap in orders:
                 vo = -0.5 * t1_vo[m0:m1, i:i + 1]
                 vo[:, 0, :, i] += fock_ov[m0:m1] / 6.0
@@ -842,6 +860,10 @@ def t4_into_lower_ranks(layout, r2, r3, t4, eris_oovv, eris_vovv, fock_ov, t1_vo
                 outputs = dict(r3=r3[:, i:i + 1, j:j + 1], r3q=r3[:, :, j:j + 1],
                                W4=W_vvoooo[..., i:i + 1, j:j + 1], W6=W_vvvvoo[..., i:i + 1, j:j + 1])
                 for spec, a_name, out_name, alpha, row_letters, fixed in _LOWER_201:
+                    if out_name in _FOLDED and p != q:
+                        if swap:
+                            continue        # in the (p, q) term, twice the weight
+                        alpha = 2 * alpha
                     A, out = operands[a_name], outputs[out_name]
                     plan = plan_of(spec, A, out, row_letters, fixed, (m0, m1), i, j, swap)
                     plan.run(library, A.ctypes.data, summed.ctypes.data, out.ctypes.data, alpha, threads,

@@ -73,7 +73,8 @@ SWITCHES = {
     "ITERCC_LOWER_TEAMS": Switch("", "call", "CCSDTQ concurrent teams of the T4-into-lower-rank passes"),
     "ITERCC_TEAM_SCHEDULE": Switch("", "call", "`rounds`: CCSDTQ teams in fixed rounds (diagnostic)"),
     "ITERCC_LOWER_CHUNK": Switch(
-        "", "call", "occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB)"),
+        "", "call", "occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB of "
+        "rows, packed on the compiled CPU path)"),
     "ITERCC_DIIS_COMPACT": Switch("1", "call", "`0`: float64 instead of compact float32 host T4 DIIS history"),
     # Singlet EOM-CCSDTQ
     "ITERCC_EOM_SECTOR_OUTPUTS": Switch(

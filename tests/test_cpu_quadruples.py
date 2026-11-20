@@ -132,6 +132,13 @@ def test_array_helpers_match_numpy():
     stored = _cpu_quadruples.relayout(x, (4, 5, 0, 1, 2, 3))
     np.testing.assert_array_equal(stored, x)
     assert stored.strides[4] > stored.strides[5] > stored.strides[0] > stored.strides[3]
+    # Already stored so: the array itself; and pairwise symmetrization through
+    # the transposed storage (W_vvvvoo is made occupied-outermost on the CPU).
+    assert _cpu_quadruples.relayout(stored, (4, 5, 0, 1, 2, 3)) is stored
+    for perm in ((0, 2, 1, 3, 5, 4), (1, 0, 2, 4, 3, 5)):
+        through = _cpu_quadruples.relayout(x, (4, 5, 0, 1, 2, 3))
+        assert _cpu_quadruples.add_transpose_(through, perm) is through
+        np.testing.assert_array_equal(through, x + x.transpose(perm))
     eia = -1.0 - rng.random((3, 5))
     d2 = eia[:, None, :, None] + eia[None, :, None, :]
     r3 = rng.normal(size=t3.shape)
