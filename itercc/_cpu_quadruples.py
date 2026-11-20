@@ -517,13 +517,50 @@ class CompiledQuadruplesLayout(NumpyQuadruplesLayout):
             self._plans[key] = lists
         return self._plans[key]
 
+    def _oooo_blocks(self, p, q, classes, irreps):
+        """Fused blocks (blocks, segments, count) of the oooo products
+        Y[(r, x), s] = sum_mn W[(r, x), (m, n)] T4[(m, n), s] of the spectator
+        pair (p, q), one per class of row irrep g (rows (r, x), the W of
+        `irreps.index(g)`). They depend on (p, q) only through its irrep."""
+        occ = np.asarray(self.occupied_irreps, dtype=np.int64)
+        G = int(occ[p] ^ occ[q])
+        key = ("oooo blocks", G)
+        if key not in self._plans:
+            tables, keep = [], []
+            for g, start, count, length in classes:
+                if not (count and length):
+                    continue
+                # Y's rows (r, x) are T4's rows (m, n) of the class: same offsets.
+                sums = np.arange(count, dtype=np.int64)
+                y_sum = np.ascontiguousarray(start + sums * length)
+                cols = np.arange(length, dtype=np.int64)
+                x_rows = np.ascontiguousarray(sums * count)
+                keep += [sums, y_sum, cols, x_rows]
+                tables.append((irreps.index(g), y_sum, cols, x_rows, sums, y_sum, count))
+            blocks = (_core.FusedBlock * max(1, len(tables)))()
+            segments = (_core.FusedSegment * max(1, len(tables)))()
+            for k, (base, rpos, cols, x_rows, sums, y_sum, count) in enumerate(tables):
+                blocks[k].rows, blocks[k].cols, blocks[k].o_base = len(rpos), len(cols), 0
+                blocks[k].rpos, blocks[k].cpos = rpos.ctypes.data, cols.ctypes.data
+                blocks[k].seg_start, blocks[k].seg_count, blocks[k].tag = k, 1, 0
+                segment = segments[k]
+                segment.x_base, segment.y_base = base, len(irreps)
+                segment.x_rows, segment.x_sum = x_rows.ctypes.data, sums.ctypes.data
+                segment.y_sum, segment.y_cols = y_sum.ctypes.data, cols.ctypes.data
+                segment.depth, segment.alpha, segment.flags = count, 1.0, 0
+            self._plans[key] = (blocks, segments, len(tables), keep)
+        return self._plans[key][:3]
+
     def add_oooo_pairs(self, r4, t4, W_oooo):
         """The six W_oooo terms of R4 (see `_quadruples_equations.r4_add_oooo_pairs_`)
         on packed blocks: for each spectator pair (p, q), the rows T4[m, n, p, q]
         are gathered without symmetry zeros, every class of one row irrep is a
-        dense GEMM Y[(r, x)] = sum_mn W[m, n, r, x] T4[m, n, p, q] (W is totally
-        symmetric, so a class maps onto itself), and the packed rows of Y are
-        added to their slots."""
+        GEMM Y[(r, x)] = sum_mn W[m, n, r, x] T4[m, n, p, q] (W is totally
+        symmetric, so a class maps onto itself; all classes in one call of the
+        indirect GEMM, `_oooo_blocks`), and the packed rows of Y are added to
+        their slots. An `OutputSector` does not split them: their outputs are
+        rows of whole packed slots, and on a 13o/63v B1 action the split GEMMs
+        took longer than the whole ones."""
         threads = cpu_threads(None)
         nocc = self.nocc
         occ = np.asarray(self.occupied_irreps, dtype=np.int64)
@@ -535,6 +572,7 @@ class CompiledQuadruplesLayout(NumpyQuadruplesLayout):
             m, n = np.nonzero(pair_irrep == g)
             if len(m):
                 weights[g] = np.ascontiguousarray(W[m[:, None], n[:, None], m[None, :], n[None, :]].T)
+        irreps = sorted(weights)
         t4 = np.ascontiguousarray(t4, dtype=np.float64)
         rows_buffer = products = None
         for p in range(nocc):
@@ -545,10 +583,15 @@ class CompiledQuadruplesLayout(NumpyQuadruplesLayout):
                 self._kernels.quad_gather_rows(self._layout, t4.ctypes.data, len(slots), slots.ctypes.data,
                                                orders.ctypes.data, offsets.ctypes.data,
                                                rows_buffer.ctypes.data, self._n())
-                for g, start, count, length in classes:
-                    block = rows_buffer[start:start + count * length].reshape(count, length)
-                    out = products[start:start + count * length].reshape(count, length)
-                    einsum("xm,ms->xs", weights[g], block, out=out)
+                blocks, segments, count = self._oooo_blocks(p, q, classes, irreps)
+                self._kernels.scale(products.ctypes.data, size, 0.0, threads)
+                if count:
+                    bases = (ctypes.c_void_p * (len(irreps) + 1))(
+                        *[weights[g].ctypes.data for g in irreps], rows_buffer.ctypes.data)
+                    self._kernels.fused_contract(count, ctypes.cast(blocks, ctypes.c_void_p),
+                                                 ctypes.cast(segments, ctypes.c_void_p),
+                                                 ctypes.cast(bases, ctypes.c_void_p), None,
+                                                 products.ctypes.data, 1.0, threads)
                 # One call per split for all rows (r, s): enough boxes for
                 # every thread also when few irreps (Cs) give few per row.
                 at = np.ascontiguousarray(table.reshape(-1), dtype=np.int64)

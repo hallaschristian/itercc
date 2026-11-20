@@ -30,6 +30,7 @@ import numpy as np
 
 from . import _core, _cpu_kernels
 from . import _runtime
+from ._cpu_packed import output_sector
 
 
 @functools.lru_cache(maxsize=None)
@@ -148,9 +149,7 @@ class TileProgram:
         self._recorded = {}
         self._failed = set()
         self._pairs = None
-        # (virtual labels, class per slot): form only the tile entries of that
-        # sector (`_sector`); None forms every allowed entry.
-        self.output_sector = None
+        self._sector_classes = {}         # OutputSector key -> (virtual labels, class per slot)
 
     def pairs(self):
         """The pair blocking of T3-like bases (virtual irreps of the layout)."""
@@ -220,8 +219,9 @@ class TileProgram:
         self.team = team_size(threads, live)
         if fused and fusion_enabled():
             pattern = self.pattern
-            if self.output_sector is not None and fused.tables is not None:
-                pattern, fused = self._sector(fused, self.output_sector)
+            sector = output_sector(self.layout)
+            if sector is not None and fused.tables is not None:
+                pattern, fused = self._sector(fused, self.sector_classes(sector))
             narrow = {name: array for name, array in (narrow or {}).items()
                       if name in bases and array.shape == bases[name].shape and array.dtype == np.float32
                       and array.flags.c_contiguous and bases[name].flags.c_contiguous}
@@ -397,6 +397,16 @@ class TileProgram:
                 segments.extend(own)
         return _pack_fused(block_start, block_count, blocks, segments, keep,
                            {tag: rows for rows, tag in partitions.items()}, tables)
+
+    def sector_classes(self, sector):
+        """(virtual labels, class per slot) of an `OutputSector` for `_sector`:
+        per slot the XOR its virtual labels need, irrep ^ (its occupied labels)."""
+        hit = self._sector_classes.get(sector.key)
+        if hit is None:
+            classes = sector.irrep ^ np.bitwise_xor.reduce(sector.occupied[self.occupied], axis=1)
+            hit = self._sector_classes[sector.key] = (sector.virtual, np.ascontiguousarray(classes,
+                                                                                         dtype=np.int64))
+        return hit
 
     def _sector(self, fused, sector):
         """`fused` restricted to the tile entries of one symmetry sector: for

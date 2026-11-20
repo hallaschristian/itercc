@@ -4,22 +4,49 @@
 
 - Benchmarks: `benchmarks.singlet_eom_ccsdtq` times singlet EOM-CCSDTQ
   actions by variant (no labels with the central difference, one residual
-  per action, sector labels, sector-only tiles on and off) on a synthetic C2v
-  model or a saved ground state and checks that they agree;
+  per action, sector labels, sector-only outputs on and off, a
+  `precision="single"` solver) on a synthetic C2v model or a saved ground
+  state and checks that they agree (`--phases` adds seconds per residual
+  phase);
   `benchmarks/_memory.py` traces resident memory by phase (and glibc's heap
   in use, free and mapped), used by it and by the triplet CuF driver's
   `--memory-trace`. `docs/benchmarks.md` adds CuF aug-cc-pVDZ-DK CCSDTQ and
   singlet EOM-CCSDTQ and CuF triplet EOM-CCSDTQ actions and memory.
 
 - One-sided singlet EOM-CCSDTQ actions form only the target sector's R4
-  tile entries (`TileProgram._sector`, `ITERCC_EOM_SECTOR_TILES=0` forms
-  every allowed entry): an entry's tile offset is its rows' plus its
-  columns' (disjoint base-nv digits), so each fused block splits into the
-  row and column class pairs that reach the sector, half its multiply-adds
-  (counted on a 5o/36v C2v model, B1) with every product's segments and sum
-  order unchanged: the same action bit for bit. CuF aug-cc-pVDZ-DK B1 on one
-  Sapphire Rapids socket: tile programs 497 -> 375 s, the action 1186 ->
-  1040 s.
+  entries in the tile programs and the ring terms (`_cpu_packed.OutputSector`
+  on the layout during an action; `ITERCC_EOM_SECTOR_OUTPUTS=0` forms every
+  allowed entry), each from the same products in the same order: the same
+  action bit for bit. CuF aug-cc-pVDZ-DK B1 on one Sapphire Rapids socket,
+  in one process: action 902-933 -> 757-775 s.
+  - R4 tile programs (`TileProgram._sector`): an entry's tile offset is its
+    rows' plus its columns' (disjoint base-nv digits), so each fused block
+    splits into the row and column class pairs that reach the sector, half
+    its multiply-adds (counted on a 5o/36v C2v model, B1). CuF B1: tile
+    programs 430-447 -> 291-320 s.
+  - Ring terms: `_cpu_packed.build_plan` (`sector`) splits each block of a
+    packed plan the same way. CuF B1: 137-139 -> 116-121 s.
+  - Split the same way, the oooo GEMMs ran slower (54 -> 56-57 s) and the r2
+    and r3 terms of T4 no faster (230 s either way; their GEMMs stream T4),
+    so they form every entry. A synthetic 6o/40v action on 12 desktop
+    threads gains nothing from the ring split either (memory-bound GEMMs).
+- One-sided singlet EOM-CCSDTQ actions run on `precision="single"` solvers
+  (float32 copies of T3 and of the spin-summed T4 rows, every product formed
+  in double). The sector entries of Res(T + eps R) are O(eps) term by term,
+  so the copies move the action by their rounding relative to those terms;
+  the central difference (the totally symmetric sector) still refuses them,
+  since there they would round O(1) entries before the division by eps. CuF
+  aug-cc-pVDZ-DK B1 on one socket: 757-775 -> 737-758 s per action (tile
+  programs 291-320 -> 274-285 s), the action within 1.6e-9 relative and its
+  Rayleigh quotient within 2e-13 Eh; a synthetic 6o/40v action on 12 desktop
+  threads: 26.6 -> 23.8 s, within 4.3e-9. `benchmarks.singlet_eom_ccsdtq`
+  adds the `sector-single` variant.
+- The oooo products of the CPU CCSDTQ residual (one GEMM per row class and
+  spectator pair) run as the blocks of one call of the indirect GEMM
+  (`itercc_fused_contract`) instead of a dense product per class, whose
+  route (split sums, plain loops for small blocks) depends on block sizes.
+  Results change in rounding only. CuF aug-cc-pVDZ-DK on one socket: oooo
+  terms 57 -> 54 s in the B1 action, 23 -> 24 s in the C2v residual.
 - The R4 tile programs' fused GEMMs cut each product's sums into the fewest
   equal chunks of at most 1024 (`ITERCC_TILE_KC`; `0` keeps chunks of 256
   like the other GEMMs), so the deep pair products read and write their

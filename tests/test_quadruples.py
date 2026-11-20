@@ -725,6 +725,30 @@ def test_cpu_finite_difference_eom_refuses_single_precision():
         FiniteDifferenceEOM(solver, None, np.zeros(len(h), dtype=int), 0)   # refused before use
 
 
+def test_cpu_one_sided_singlet_eom_takes_single_precision():
+    """A one-sided action's sector entries are O(eps) term by term, so on a
+    precision='single' solver (float32 copies of T3 and of the spin-summed T4
+    rows) it stays within their rounding of the double action."""
+    from itercc import _cpu_quadruples
+    from itercc.eom_ccsdtq import FiniteDifferenceEOM
+    from itercc.spatial_symmetry import sector_labels
+
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    model = symmetric_model()
+    dense = RestrictedCCSDTQ(*model, backend="cpu")
+    ground = dense.solve(max_iter=3, damping=0.2, diis_size=0).amplitudes
+    images = []
+    for precision in ("double", "single"):
+        solver = RestrictedCCSDTQ(*model, backend="cpu", precision=precision,
+                                  orbital_irreps=sector_labels(LABELS, 2))
+        engine = FiniteDifferenceEOM(solver, solver.combine_states([(1.0, ground, None)]), LABELS, 2)
+        assert engine.one_sided
+        images.append(engine.sigma(np.random.default_rng(37).normal(size=engine.space.size)))
+    difference = np.linalg.norm(images[1] - images[0]) / np.linalg.norm(images[0])
+    assert 0 < difference < 1e-6
+
+
 def test_cpu_finite_difference_eom_ccsdtq_matches_fci():
     """EOM-CCSDTQ on the compiled CPU solver: four electrons, so CCSDTQ is FCI
     and the lowest singlet excitation equals the FCI gap."""
@@ -813,11 +837,12 @@ def test_cpu_singlet_eom_sector_paths_agree(irrep):
     np.testing.assert_array_equal(np.concatenate(engine.space.indices), np.concatenate(reference.space.indices))
 
 
-def test_cpu_singlet_eom_sector_tiles_keep_the_action(monkeypatch):
-    """One-sided actions form only the target sector's R4 tile entries (each
-    fused block split by the classes of its rows and columns): the same
-    action bit for bit, from half the tile multiply-adds."""
-    from itercc import _cpu_quadruples
+def test_cpu_singlet_eom_sector_outputs_keep_the_action(monkeypatch):
+    """One-sided actions form only the target sector's R4 entries in the tile
+    programs (each fused block split by the classes of its rows and columns)
+    and the ring terms (each GEMM block split likewise): the same action bit
+    for bit."""
+    from itercc import _cpu_packed, _cpu_quadruples
     from itercc.eom_ccsdtq import FiniteDifferenceEOM
     from itercc.spatial_symmetry import sector_labels
 
@@ -828,15 +853,53 @@ def test_cpu_singlet_eom_sector_tiles_keep_the_action(monkeypatch):
     ground = dense.solve(max_iter=3, damping=0.2, diis_size=0).amplitudes
     solver = RestrictedCCSDTQ(*model, backend="cpu", orbital_irreps=sector_labels(LABELS, 2))
     engine = FiniteDifferenceEOM(solver, solver.combine_states([(1.0, ground, None)]), LABELS, 2)
-    assert engine._tile_sector is not None
+    assert engine._sector is not None
     vector = np.random.default_rng(29).normal(size=engine.space.size)
-    monkeypatch.setenv("ITERCC_EOM_SECTOR_TILES", "0")
+    monkeypatch.setenv("ITERCC_EOM_SECTOR_OUTPUTS", "0")
     every = engine.sigma(vector)
-    monkeypatch.setenv("ITERCC_EOM_SECTOR_TILES", "1")
+    monkeypatch.setenv("ITERCC_EOM_SECTOR_OUTPUTS", "1")
     np.testing.assert_array_equal(engine.sigma(vector), every)
     fused = [f for recorded in solver._tile_program._recorded.values() for f in recorded.fused.values() if f]
     assert fused and all(f.sectors for f in fused)
-    assert solver._tile_program.output_sector is None          # only within the action
+    # Ring plans of the sector (shared by layouts of one symmetry).
+    sector = engine._sector.key
+    plans = [cache for key, cache in _cpu_packed._SHARED.items() if "packed rings" in str(key[0])]
+    assert any(sector in key for cache in plans for key in cache if isinstance(key, tuple))
+    assert solver.layout.output_sector is None                 # only within the action
+
+
+def test_cpu_packed_plan_sector_forms_the_sector_entries():
+    """`build_plan` with a sector forms exactly the output entries whose fine
+    labels XOR to the target, with the unfiltered plan's values bit for bit,
+    and leaves the others unwritten."""
+    from itercc import _cpu_kernels, _cpu_packed, _cpu_quadruples
+
+    if not _cpu_quadruples.available():
+        pytest.skip("compiled CPU core unavailable")
+    rng = np.random.default_rng(5)
+    fine = dict(i=np.array([0, 1, 2, 3, 1]), a=np.array([0, 0, 1, 1, 2, 2, 3, 3, 1]),
+                e=np.array([0, 1, 2, 3, 0, 1, 2]))
+    coarse = {c: np.sort(v % 2) for c, v in fine.items()}       # the subgroup labels mod 2, sorted
+    fine = {c: v[np.argsort(v % 2, kind="stable")] for c, v in fine.items()}
+    labels = dict(i=coarse["i"], a=coarse["a"], b=coarse["a"], e=coarse["e"])
+    fines = dict(i=fine["i"], a=fine["a"], b=fine["a"], e=fine["e"])
+    A = rng.normal(size=(5, 7))                                  # i e
+    B = rng.normal(size=(7, 9, 9))                               # e a b
+    library = _cpu_kernels.library()
+    outs = []
+    for sector in (None, (fines, 2)):                            # B1 of C2v: coarse 0
+        out = np.full((5, 9, 9), 7.0)
+        plan = _cpu_packed.build_plan("ie,eab->iab", labels, _cpu_packed.Dense("ie", A),
+                                      _cpu_packed.Dense("eab", B), _cpu_packed.Dense("iab", out), 2, sector)
+        plan.run(library, A.ctypes.data, B.ctypes.data, out.ctypes.data, 1.0, 1)
+        outs.append(out)
+    allowed = (labels["i"][:, None, None] ^ labels["a"][None, :, None] ^ labels["a"][None, None, :]) \
+        == 0
+    inside = (fines["i"][:, None, None] ^ fines["a"][None, :, None] ^ fines["a"][None, None, :]) == 2
+    np.testing.assert_array_equal(outs[0][~allowed], 7.0)
+    np.testing.assert_array_equal(outs[1][inside], outs[0][inside])
+    np.testing.assert_array_equal(outs[1][~inside], 7.0)
+    assert inside.any() and (allowed & ~inside).any()
 
 
 def test_cpu_singlet_eom_shifts_the_ground_amplitudes_in_place(tmp_path):
@@ -860,9 +923,9 @@ def test_cpu_singlet_eom_shifts_the_ground_amplitudes_in_place(tmp_path):
     vector = np.random.default_rng(31).normal(size=engine.space.size)
     shifted = tuple(a.copy() for a in before)
     engine.space.shift(shifted, vector, engine.step, assign=True)
-    solver._tile_program.output_sector = engine._tile_sector
+    solver.layout.output_sector = engine._sector
     expected = engine.space.pack(solver._residuals(shifted)) / engine.step
-    solver._tile_program.output_sector = None
+    solver.layout.output_sector = None
     np.testing.assert_array_equal(engine.sigma(vector), expected)
     marker = tuple(np.zeros(a.shape) for a in before)
     engine.space.shift(marker, np.ones(engine.space.size), 1.0, assign=True)
@@ -896,8 +959,10 @@ def test_singlet_eom_benchmark_variants_agree(tmp_path):
     records = [json.loads(line) for line in output.read_text().splitlines()]
     actions = [r for r in records if r["event"] == "action"]
     assert [r["variant"] for r in actions] == ["dense-central", "dense-one-sided", "sector", "sector-every",
-                                               "sector-central"]
-    assert all(r["relative_difference"] < 1e-12 for r in actions[1:])
+                                               "sector-single", "sector-central"]
+    # float32 copies of T3 and the summed T4 rows move the action by their rounding only.
+    assert all(r["relative_difference"] < (1e-6 if r["variant"] == "sector-single" else 1e-12)
+               for r in actions[1:])
 
 
 def test_cpu_singlet_eom_refuses_labels_that_split_the_sector():

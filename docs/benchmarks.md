@@ -326,19 +326,23 @@ Jacobian action on the same socket (7.3e9 parameters per sector):
 | --- | --- | --- | --- |
 | no labels (C1 on dense T4), central difference | any | over 83 (unfinished, 48 cores) | 1.0 TB |
 | C2v labels, central difference | A1 | 11.8 | 420 GiB |
-| B1-subgroup labels, one residual, sector-only R4 tiles | B1, A2 | 12.8 | 413 GiB |
+| B1-subgroup labels, one residual, sector-only R4 outputs | B1, A2 | 12.6-12.9 | 416-423 GiB |
+| the same, `precision="single"` solver | B1, A2 | 12.3-12.6 | |
 
 With `sector_labels` both residuals keep the subgroup's symmetry blocks, and
 for a nonzero target irrep one residual replaces the two of the central
-difference (the same action, bit for bit). The tile programs then form only
-the target sector's R4 entries, half their multiply-adds: on one node the B1
-action took 19.8 min forming every allowed entry and 17.3 min with the
-sector's only, with identical results. Shifting the ground amplitudes in
+difference (the same action, bit for bit). The tile programs and the ring
+terms then form only the target sector's R4 entries (half the tiles'
+multiply-adds): in one process the B1 action took 15.0-15.6 min forming
+every allowed entry and 12.6-12.9 min with the sector's only, with identical
+results (4.9-5.3 min in the R4 tile programs, 3.8-4.0 min on T4 into ranks
+two and three, 1.9-2.0 min on the ring terms, 0.9 min on the oooo terms and
+0.4 min projecting R4), 2.6 C2v residuals. Shifting the ground amplitudes in
 place (one T4 fewer) brought its peak from 519 GiB, more than the socket's
-503 GiB, to 413 GiB; with packed T4 boxes combined tile by tile it took
-12.8 min (4.9 min in the R4 tile programs, 3.8 min on T4 into ranks two and
-three, 2.3 min on the ring terms, 0.9 min on the oooo terms and 0.4 min
-projecting R4), 2.6 C2v residuals. `python -m
+503 GiB, to 416-423 GiB. On a `precision="single"` solver (float32 T3 and
+summed T4 rows, products in double) the action took 12.3-12.6 min, within
+1.6e-9 relative of the double one, its Rayleigh quotient within 2e-13 Eh.
+`python -m
 benchmarks.singlet_eom_ccsdtq --synthetic 4 24 --irrep 2` compares every
 variant on a synthetic C2v model (12 desktop threads: 2.69 s per action
 without labels, 0.57 s with sector labels); `--input zero.npz --state DIR`

@@ -14,6 +14,7 @@ from time import perf_counter
 import numpy as np
 
 from . import _cpu_kernels, _cpu_quadruples, _runtime
+from ._cpu_packed import OutputSector
 
 from itercc.eom import EOMSinglet
 
@@ -283,16 +284,25 @@ class FiniteDifferenceEOM:
     and zero after it; the totally symmetric entries are never written), so
     an action holds one copy of T rather than two (107 GB of T4 for CuF in
     aug-cc-pVDZ with B1-subgroup labels); amplitudes that are not writable
-    C-contiguous host arrays are copied once, here.
+    C-contiguous host arrays are copied once, here. Only the sector's
+    residual entries are formed where the residual's outputs allow it
+    (`_cpu_packed.OutputSector`; ITERCC_EOM_SECTOR_OUTPUTS=0 forms them all).
     """
     def __init__(self, solver, amplitudes, labels, irrep, *, step=5e-5, one_sided=None):
         if solver._host_r4:
             raise ValueError("The EOM pilot requires device-resident R4")
-        if getattr(solver, "precision", "double") != "double":
-            # float32 operands round both residuals; the central difference
-            # would turn that rounding into Jacobian errors of order 1e-3.
-            raise ValueError("Finite-difference EOM needs a precision='double' solver")
         self.xp = xp = solver.xp
+        if one_sided is None:
+            one_sided = int(irrep) != 0 and xp is np
+        if one_sided and (int(irrep) == 0 or xp is not np):
+            raise ValueError("One residual per action needs a nonzero target irrep on the CPU")
+        if getattr(solver, "precision", "double") != "double" and not one_sided:
+            # float32 operands round both residuals; for the totally symmetric
+            # sector the central difference would turn that rounding of O(1)
+            # entries into Jacobian errors of order 1e-3. A one-sided action's
+            # sector entries are O(eps) term by term, so float32 copies move
+            # it by their rounding relative to those terms.
+            raise ValueError("Finite-difference EOM needs a precision='double' solver unless one-sided")
         labels = np.asarray(labels)
         if labels.shape != (solver.nmo,) or labels.dtype.kind not in "iu":
             raise ValueError("Expected Abelian orbital irrep labels")
@@ -311,28 +321,20 @@ class FiniteDifferenceEOM:
         self.ground_energy = solver.reference_energy + solver._reference._energy(
             _host(xp, self.amplitudes[0]), _host(xp, self.amplitudes[1]))
         self.step = step
-        if one_sided is None:
-            one_sided = int(irrep) != 0 and xp is np
-        if one_sided and (int(irrep) == 0 or xp is not np):
-            raise ValueError("One residual per action needs a nonzero target irrep on the CPU")
         self.one_sided = bool(one_sided)
-        self._tile_sector = None
+        self._sector = None
         if self.one_sided:
             _check_integral_sectors(solver, labels)
             self.amplitudes = tuple(a if _writable(a) else _cpu_quadruples.copy(np.asarray(a))
                                     for a in self.amplitudes)
-            program = getattr(solver, "_tile_program", None)
-            if program is not None:
-                # Only the sector's R4 entries are packed: the tile programs
-                # form only those (`TileProgram._sector`), per slot the virtual
-                # class irrep ^ (its occupied irreps), in the solver's order.
-                no = solver.nocc
-                order = getattr(solver, "_virtual_order", None)
-                virtual = labels[no:] if order is None else labels[no:][order]
-                occupied = np.asarray(program.occupied, dtype=np.int64)
-                classes = int(irrep) ^ np.bitwise_xor.reduce(labels[:no][occupied], axis=1)
-                self._tile_sector = (np.ascontiguousarray(virtual, dtype=np.int64),
-                                     np.ascontiguousarray(classes, dtype=np.int64))
+            # Only the sector's residual entries are packed: during an action
+            # the layout carries the sector (labels in the solver's orbital
+            # order), and the R4 tile programs and ring terms form only those
+            # entries.
+            no = solver.nocc
+            order = getattr(solver, "_virtual_order", None)
+            virtual = labels[no:] if order is None else labels[no:][order]
+            self._sector = OutputSector(labels[:no], virtual, irrep)
         self.matvec_count = 0
         self.matvec_seconds = 0.0
 
@@ -368,16 +370,15 @@ class FiniteDifferenceEOM:
         """The sector part of Res(T + step R) over step (see the class); with
         `omega`, the norm of its difference from omega R."""
         shifted = self.amplitudes
-        program = getattr(self.solver, "_tile_program", None)
-        if self._tile_sector is not None and _runtime.enabled("ITERCC_EOM_SECTOR_TILES"):
-            program.output_sector = self._tile_sector
+        layout = self.solver.layout
+        if _runtime.enabled("ITERCC_EOM_SECTOR_OUTPUTS"):
+            layout.output_sector = self._sector
         try:
             self.space.shift(shifted, vector, step, assign=True)
             residuals = self.solver._residuals(shifted)
         finally:
             self.space.clear(shifted)
-            if program is not None:
-                program.output_sector = None
+            layout.output_sector = None
         value = self.space.pack(residuals)
         del residuals
         value /= step

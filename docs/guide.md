@@ -132,8 +132,14 @@ central difference: the sector part of Res(T + eps R) has only odd powers of
 eps, so over eps it equals the central difference term for term. Such an
 action shifts the ground amplitudes it was given in place (their target-sector
 entries, which symmetry keeps at zero, hold eps R during the residual and are
-zero again after it), so an action holds one copy of T rather than two. Without
-labels the solver runs every
+zero again after it), so an action holds one copy of T rather than two, and it
+forms only the target sector's R4 entries in the tile programs and the ring
+terms (`ITERCC_EOM_SECTOR_OUTPUTS=0` forms them all, with the same result bit
+for bit). One-sided actions also run on a `precision="single"` solver: its float32
+copies of T3 and of the summed T4 rows round the sector's O(eps) terms
+relative to themselves (2e-9 of the action for CuF in aug-cc-pVDZ-DK, B1), while the central
+difference, which would round O(1) entries before dividing by eps, needs
+`precision="double"`. Without labels the solver runs every
 GEMM as C1 on dense T4: on a C2v model (4 occupied, 20 virtual) an action
 took 1.07 s that way, 0.21 s (B1, A2) and 0.25 s (A1) with sector labels, the
 same action to 3e-16 (7e-13 for A1, the central difference's rounding). The
@@ -326,7 +332,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_TEAM_SCHEDULE` | call | `rounds`: CCSDTQ teams in fixed rounds (diagnostic) |
 | `ITERCC_LOWER_CHUNK` | call | occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB) |
 | `ITERCC_DIIS_COMPACT` | call | `0`: float64 instead of compact float32 host T4 DIIS history |
-| `ITERCC_EOM_SECTOR_TILES` | call | `0`: one-sided singlet EOM-CCSDTQ actions form every allowed R4 tile entry, not only those of the target sector |
+| `ITERCC_EOM_SECTOR_OUTPUTS` | call | `0`: one-sided singlet EOM-CCSDTQ actions form every allowed R4 entry of the tile programs and ring terms, not only those of the target sector |
 | `ITERCC_TRIPLET_PROGRAM` | call | `0`: triplet EOM-CCSDTQ rank-four slots in the Python loop instead of the compiled program |
 | `ITERCC_TRIPLET_FUSED` | call | `0`: triplet slot program adds products into a tile one by one (the loop's action bit for bit) |
 | `ITERCC_DIRECT_DENSE` | call | `0`: triplet direct packed T4 terms by per-row sparse lookups instead of contexts |

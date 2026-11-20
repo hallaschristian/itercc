@@ -17,6 +17,11 @@ as the segments of one fused GEMM (`itercc_fused_contract`: their sums laid
 end to end, the output updated once per 256 of them), and the output-disjoint
 fused blocks all run in one parallel call. Plans depend only on the
 spectators' irreps and are cached.
+
+With an `OutputSector` on the layout (a one-sided singlet EOM-CCSDTQ action)
+the ring plans form only the R4 entries of that sector: each block splits into
+the row and column classes that reach it, its sum whole (`build_plan`'s
+`sector`).
 """
 from functools import lru_cache, reduce
 from itertools import product
@@ -28,6 +33,35 @@ import numpy as np
 
 from .symmetry_blocks import _parse
 from . import _runtime
+
+
+class OutputSector:
+    """The residual entries of one symmetry sector of a finer group than the
+    layout's: the target sector of a one-sided singlet EOM-CCSDTQ action on a
+    solver with `spatial_symmetry.sector_labels` (the sector part of the
+    residual is all it packs). `occupied` and `virtual` are the finer irrep
+    labels of the orbitals in the layout's order; an entry belongs to the
+    sector when the labels of its indices XOR to `irrep`. While a layout
+    carries one (`layout.output_sector`), the R4 tile programs and the ring
+    terms form only those entries, each from the same products in the same
+    order (the others are left unformed). The oooo terms and the r2 and r3
+    terms of T4 form every entry: split by sector their GEMMs ran no faster
+    (13o/63v B1 on one socket: oooo 54 -> 57 s, r2/r3 within noise)."""
+
+    def __init__(self, occupied, virtual, irrep):
+        self.occupied = np.ascontiguousarray(occupied, dtype=np.int64)
+        self.virtual = np.ascontiguousarray(virtual, dtype=np.int64)
+        self.irrep = int(irrep)
+        self.key = (self.occupied.tobytes(), self.virtual.tobytes(), self.irrep)
+
+    def target(self, *occupied):
+        """The XOR the other indices' labels need with these occupied ones fixed."""
+        return reduce(xor, (int(self.occupied[i]) for i in occupied), self.irrep)
+
+
+def output_sector(layout):
+    """The layout's `OutputSector`, or None (every allowed entry)."""
+    return getattr(layout, "output_sector", None)
 
 
 class PackedRows:
@@ -303,10 +337,16 @@ def _assignments(letters, options, operands):
     yield from visit(0)
 
 
-def build_plan(spec, labels, a, b, out, nirrep):
+def build_plan(spec, labels, a, b, out, nirrep, sector=None):
     """Box-level plan of out += alpha * einsum(spec, a, b) for Dense or Packed
     operand descriptors; `labels` maps every letter to the irreps of its
-    positions (the same index range in every operand)."""
+    positions (the same index range in every operand). With `sector` =
+    (fine, irrep), `fine` mapping the output letters to finer irrep labels of
+    the same positions, only the output entries whose letters' fine labels
+    XOR to `irrep` are formed: a block's rows and columns take the classes of
+    their letters, and each block splits into the class pairs that reach the
+    sector, its sum whole (those entries get the same products in the same
+    order; the others are not written)."""
     if len(_STEPS) > 1 << 16:          # not during a build: its grids key on these arrays
         _STEPS.clear()
     sa, sb, so = _parse(spec)
@@ -361,6 +401,30 @@ def build_plan(spec, labels, a, b, out, nirrep):
             hit = grids[index] = (index, _grid(group, offsets))
         return hit
 
+    classes, picks = {}, {}
+
+    def classes_of(group, g):
+        """(key, fine class of every entry of the grid over `group`)."""
+        key = (group, tuple(g[c] for c in group))
+        hit = classes.get(key)
+        if hit is None:
+            total = np.zeros(1, dtype=np.int64)
+            for c in group:
+                total = np.bitwise_xor.outer(total, fine[c][members[c][g[c]]]).reshape(-1)
+            hit = classes[key] = (key, total)
+        return hit
+
+    def pick(entries, cls, value):
+        """(key, offsets) of the grid entries of one class."""
+        key = (entries[0], cls[0], value)
+        hit = picks.get(key)
+        if hit is None:
+            hit = picks[key] = (key, np.ascontiguousarray(entries[1][cls[1] == value]))
+        return hit
+
+    if sector is not None:
+        fine, wanted = sector
+        fine = {c: np.asarray(fine[c], dtype=np.int64) for c in rows + cols}
     rows_, cols_, sums_ = tuple(rows), tuple(cols), tuple(sums)
     for g in _assignments(letters, options, operands):
         (ka, (ca, oa)), (kb, (cb, ob)), (ko, (co, oo)) = (place(i, g) for i in range(3))
@@ -368,23 +432,31 @@ def build_plan(spec, labels, a, b, out, nirrep):
             for name, offsets in (("a", oa), ("b", ob), ("o", oo)):
                 for c, values in offsets.items():
                     steps[name, c] = int(values[1] - values[0]) if len(values) > 1 else 1 << 60
-        out_rows, out_cols = grid(rows_, oo), grid(cols_, oo)
-        r0 = segment("r", grid(rows_, oa), out_rows)
-        c0 = segment("c", grid(cols_, ob), out_cols)
+        pieces = [(grid(rows_, oa), grid(rows_, oo), grid(cols_, ob), grid(cols_, oo))]
+        if sector is not None:
+            # The rows of one class with the columns that complete the sector.
+            a_rows, out_rows, b_cols, out_cols = pieces[0]
+            r_class, c_class = classes_of(rows_, g), classes_of(cols_, g)
+            pieces = [(pick(a_rows, r_class, value), pick(out_rows, r_class, value),
+                       pick(b_cols, c_class, value ^ wanted), pick(out_cols, c_class, value ^ wanted))
+                      for value in np.unique(r_class[1]).tolist()
+                      if np.any(c_class[1] == value ^ wanted)]
         k0 = segment("k", grid(sums_, oa), grid(sums_, ob))
-        nr = prod(len(members[c][g[c]]) for c in rows)
-        nc = prod(len(members[c][g[c]]) for c in cols)
         nk = prod(len(members[c][g[c]]) for c in sums)
-        # Blocks with the same output entries go to successive waves.
-        token = (co, out_rows[0], out_cols[0])
-        target = targets.get(token)
-        if target is None:
-            target = targets[token] = (co, out_rows[1].tobytes(), out_cols[1].tobytes())
-        wave = seen.get(target, 0)
-        seen[target] = wave + 1
-        while len(table) <= wave:
-            table.append([])
-        table[wave].append((nr, nc, nk, r0, c0, k0, ca, cb, co))
+        for a_rows, out_rows, b_cols, out_cols in pieces:
+            r0 = segment("r", a_rows, out_rows)
+            c0 = segment("c", b_cols, out_cols)
+            nr, nc = len(out_rows[1]), len(out_cols[1])
+            # Blocks with the same output entries go to successive waves.
+            token = (co, out_rows[0], out_cols[0])
+            target = targets.get(token)
+            if target is None:
+                target = targets[token] = (co, out_rows[1].tobytes(), out_cols[1].tobytes())
+            wave = seen.get(target, 0)
+            seen[target] = wave + 1
+            while len(table) <= wave:
+                table.append([])
+            table[wave].append((nr, nc, nk, r0, c0, k0, ca, cb, co))
 
     def fastest(name, group):
         return min((steps.get((name, c), 1 << 60) for c in group), default=1 << 60)
@@ -458,7 +530,8 @@ def add_rings(layout, r4, t4, F_oo, W_ovov, W_voov, threads):
     sorted spectator triple (p, q, r) the rows T4[m, p, q, r] are gathered
     without symmetry zeros, the ring and spin sums are formed on the packed
     rows, the six contractions write packed rows A[x], and A is added to the
-    slots of every target position."""
+    slots of every target position. With an `OutputSector` the contractions
+    form only A's entries in the sector (A[x] goes to slots of x, p, q, r)."""
     nocc, N = layout.nocc, layout.nirrep
     occ = np.asarray(layout.occupied_irreps, dtype=np.int64)
     vir = np.asarray(layout.virtual_irreps, dtype=np.int64)
@@ -469,19 +542,25 @@ def add_rings(layout, r4, t4, F_oo, W_ovov, W_voov, threads):
     t4 = np.ascontiguousarray(t4, dtype=np.float64)
     library = layout._kernels
     local = threading.local()
+    sector = output_sector(layout)
+    if sector is not None:
+        fine = dict(x=sector.occupied, a=sector.virtual, b=sector.virtual, c=sector.virtual,
+                    d=sector.virtual)
 
     def run_triple(p, q, r, threads):
         G = int(occ[p] ^ occ[q] ^ occ[r])
-        if G not in cache:
+        key = G if sector is None else (G, sector.key, sector.target(p, q, r))
+        if key not in cache:
             rows = PackedRows(layout, [occ], G)
+            within = None if sector is None else (fine, sector.target(p, q, r))
             plans = []
             for spec, index, _, _ in _RING_SPECS:
                 sa, sb, so = _parse(spec)
                 plans.append(build_plan(spec, labels, Dense(sa, weights[index]),
                                         Packed(sb, rows, sb[:1], sb[1:], layout, G),
-                                        Packed(so, rows, so[:1], so[1:], layout, G), N))
-            cache[G] = (rows, plans)
-        rows, plans = cache[G]
+                                        Packed(so, rows, so[:1], so[1:], layout, G), N, within))
+            cache[key] = (rows, plans)
+        rows, plans = cache[key]
         buffers = getattr(local, "buffers", None)
         if buffers is None or len(buffers[0]) < rows.size:
             buffers = local.buffers = [np.zeros(rows.size) for _ in range(4)]

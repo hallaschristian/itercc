@@ -8,10 +8,12 @@ vector; the first variant is the reference the others are compared with:
 - `dense-one-sided`: the same solver, one residual per action (nonzero irrep);
 - `sector`: a solver labelled with `spatial_symmetry.sector_labels` (the full
   group for irrep 0, the half-order subgroup otherwise) and the engine's
-  defaults (one residual per action and sector-only R4 tiles for a nonzero
-  irrep, the central difference for irrep 0);
-- `sector-every`: as `sector`, with every allowed R4 tile entry formed
-  (ITERCC_EOM_SECTOR_TILES=0);
+  defaults (one residual per action, forming only the target sector's
+  residual entries, for a nonzero irrep; the central difference for irrep 0);
+- `sector-every`: as `sector`, with every allowed residual entry formed
+  (ITERCC_EOM_SECTOR_OUTPUTS=0);
+- `sector-single`: as `sector` on a `precision="single"` solver (float32
+  copies of T3 and of the spin-summed T4 rows; one-sided actions only);
 - `sector-central`: as `sector`, with the central difference.
 
 A synthetic C2v model takes its ground amplitudes from a few iterations of
@@ -39,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-VARIANTS = ("dense-central", "dense-one-sided", "sector", "sector-every", "sector-central")
+VARIANTS = ("dense-central", "dense-one-sided", "sector", "sector-every", "sector-single", "sector-central")
 
 
 def _emit(output):
@@ -132,6 +134,8 @@ def main():
     emit = _emit(args.output)
     variants = (args.variants.split(",") if args.variants else
                 [v for v in VARIANTS if args.irrep or v in ("dense-central", "sector")])
+    if not args.irrep and "sector-single" in variants:
+        parser.error("sector-single needs a nonzero irrep (one-sided actions)")
     unknown = set(variants) - set(VARIANTS)
     if unknown:
         parser.error(f"Unknown variants {sorted(unknown)}")
@@ -167,6 +171,7 @@ def main():
             sector = variant.startswith("sector")
             start = time.perf_counter()
             solver = RestrictedCCSDTQ(h, eri, no, constant, **options,
+                                      precision="single" if variant == "sector-single" else "double",
                                       orbital_irreps=sector_labels(labels, args.irrep) if sector else None)
             ground = solver.combine_states([(1.0, *source)])
             one_sided = {"dense-central": False, "dense-one-sided": True, "sector-central": False}.get(variant)
@@ -177,7 +182,7 @@ def main():
                  size=int(engine.space.size), one_sided=engine.one_sided)
             vector = np.random.default_rng(args.seed).standard_normal(engine.space.size)
             vector /= np.linalg.norm(vector)
-            os.environ["ITERCC_EOM_SECTOR_TILES"] = "0" if variant == "sector-every" else "1"
+            os.environ["ITERCC_EOM_SECTOR_OUTPUTS"] = "0" if variant == "sector-every" else "1"
             for number in range(1, args.actions + 1):
                 tile_seconds.clear()
                 if phases is not None:
@@ -202,7 +207,7 @@ def main():
             if reference is None:
                 reference = image
             del engine, solver, image
-            os.environ.pop("ITERCC_EOM_SECTOR_TILES", None)
+            os.environ.pop("ITERCC_EOM_SECTOR_OUTPUTS", None)
     if trace is not None:
         emit(event="memory_peak", peak_GiB=trace.overall_peak_GiB)
 

@@ -76,9 +76,9 @@ SWITCHES = {
         "", "call", "occupied rows per chunk of the CCSDTQ T4-into-lower-rank pass (default: 2 GiB)"),
     "ITERCC_DIIS_COMPACT": Switch("1", "call", "`0`: float64 instead of compact float32 host T4 DIIS history"),
     # Singlet EOM-CCSDTQ
-    "ITERCC_EOM_SECTOR_TILES": Switch(
-        "1", "call", "`0`: one-sided singlet EOM-CCSDTQ actions form every allowed R4 tile entry, not only "
-        "those of the target sector"),
+    "ITERCC_EOM_SECTOR_OUTPUTS": Switch(
+        "1", "call", "`0`: one-sided singlet EOM-CCSDTQ actions form every allowed R4 entry of the tile "
+        "programs and ring terms, not only those of the target sector"),
     # Triplet EOM-CCSDTQ
     "ITERCC_TRIPLET_PROGRAM": Switch(
         "1", "call", "`0`: triplet EOM-CCSDTQ rank-four slots in the Python loop instead of the "
