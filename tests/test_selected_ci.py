@@ -267,6 +267,26 @@ def test_polarizability_series_continues_from_a_space(model):
     np.testing.assert_allclose(more.tensors_au[0], exact, atol=1e-7)
 
 
+def test_sorted_stages_give_the_same_results(model, monkeypatch):
+    import itercc.selected_ci as selected_ci
+    from test_finite_field import symmetric_dipoles
+
+    h, eri, no, constant, labels = model
+    dipoles = symmetric_dipoles(labels, (3, 2, 0))
+    options = dict(spin_parity=1, epsilons=(3e-2, 1e-2, 1e-14), residual_tol=1e-10)
+    plain = solver(model).solve(1, **options)
+    plain_pol = solver(model).polarizability(dipoles, epsilons=(3e-2, 1e-14), tol=1e-10, ground_tol=1e-10)[-1]
+    monkeypatch.setattr(selected_ci, "SORT_FROM", 0)          # sort every stage of these small spaces
+    sorted_run = solver(model).solve(1, **options)
+    sorted_pol = solver(model).polarizability(dipoles, epsilons=(3e-2, 1e-14), tol=1e-10, ground_tol=1e-10)[-1]
+    assert [s.determinants for s in sorted_run.stages] == [s.determinants for s in plain.stages]
+    np.testing.assert_allclose([s.energies[0] for s in sorted_run.stages], [s.energies[0] for s in plain.stages],
+                               atol=1e-10)
+    view = lambda d: np.sort(d.view([("w", np.uint64, (d.shape[1],))]).ravel())
+    np.testing.assert_array_equal(view(sorted_pol.space), view(plain_pol.space))
+    np.testing.assert_allclose(sorted_pol.tensors_au, plain_pol.tensors_au, atol=1e-8)
+
+
 def test_damped_response_in_a_fixed_space_equals_full_ci(model):
     from test_finite_field import symmetric_dipoles
 

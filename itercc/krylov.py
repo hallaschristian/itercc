@@ -287,12 +287,15 @@ class DavidsonOutcome:
 
 def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, max_iter=100,
              max_space=20, guesses=None, callback=None, checkpoint_callback=None, certify=None,
-             matvecs=None, retain_previous=True, olsen=False, precondition=None, minimum=1e-7):
+             matvecs=None, retain_previous=True, olsen=False, precondition=None, minimum=1e-7,
+             sigma_block=None):
     """Lowest `nroots` roots with real part above `minimum` of a real non-Hermitian operator.
 
     `sigma(v)` applies the operator to a physical vector, `project(v)` maps
     any vector onto the physical subspace and `diagonal` preconditions the
     correction, unless `precondition(residual, energy, vector)` returns it.
+    With `sigma_block(vectors)` (a k x size block of rows to their images) the
+    images of each iteration's new directions come from one call.
     Converged roots are certified with `certify(root, energy)` (a fresh,
     independent residual norm) before acceptance. With `olsen`, the diagonal
     correction is made orthogonal to the Ritz vector (Olsen's correction).
@@ -365,6 +368,9 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
     start = perf_counter()
     for iteration in range(1, max_iter + 1):
         m, known = basis.count, images.count
+        if sigma_block is not None and m - images.count > 1:
+            for image in sigma_block(basis.data[images.count:m]):
+                images.append(image)
         while images.count < m:
             images.append(sigma(basis.data[images.count]))
         if known < m:

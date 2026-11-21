@@ -225,9 +225,15 @@ template <int W> inline int set_bits(const u64 *m, int *out, int limit)
 
 // <y| H |x> for distinct determinants, zero beyond double excitations.
 // occ (may be null): x's occupied alpha orbitals (na of them), then beta.
-template <int W> double element(const Ctx &c, const Det<W> &x, const Det<W> &y, const int *occ = nullptr,
-                                int occ_na = 0, int occ_nb = 0)
+template <int W>
+double element_strings(const Ctx &c, const u64 *xa, const u64 *xb, const u64 *ya, const u64 *yb,
+                       const int *occ = nullptr, int occ_na = 0, int occ_nb = 0)
 {
+    struct View {
+        const u64 *pa, *pb;
+        const u64 *a() const { return pa; }
+        const u64 *b() const { return pb; }
+    } x{xa, xb}, y{ya, yb};
     u64 da[W], db[W];
     int ca = 0, cb = 0;
     for (int k = 0; k < W; ++k) {
@@ -282,6 +288,12 @@ template <int W> double element(const Ctx &c, const Det<W> &x, const Det<W> &y, 
     set_bits<W>(hole, &q, 1);
     set_bits<W>(part, &s, 1);
     return phase<W>(x.a(), p, r) * phase<W>(x.b(), q, s) * c.E(p, r, q, s);
+}
+
+template <int W> double element(const Ctx &c, const Det<W> &x, const Det<W> &y, const int *occ = nullptr,
+                                int occ_na = 0, int occ_nb = 0)
+{
+    return element_strings<W>(c, x.a(), x.b(), y.a(), y.b(), occ, occ_na, occ_nb);
 }
 
 // Every determinant y connected to x with |<y|H|x>| >= threshold:
@@ -601,10 +613,13 @@ template <int W> struct Space : SpaceBase {
     std::vector<int32_t> aid, bid;
     std::vector<int64_t> amajor_start, bmajor_start, asingle_start, bsingle_start;
     std::vector<int32_t> amajor, bmajor, asingle, bsingle;
-    // Each alpha string's determinants again, sorted by beta string id
-    // (ab_bid) with their indices (ab_det): a determinant with a given alpha
-    // and beta string is found by binary search.
-    std::vector<int32_t> ab_bid, ab_det;
+    // The other string's id of each member, in the alpha-major (amajor_b)
+    // and beta-major (bmajor_a) orders: the searches read these contiguous
+    // ids and the small string tables instead of the determinants.
+    std::vector<int32_t> amajor_b, bmajor_a;
+    // Summed group sizes of each string's single-excitation neighbours: the
+    // cost of finding a determinant's opposite-spin doubles from that side.
+    std::vector<int64_t> asingle_cost, bsingle_cost;
 
     Space(const Ctx *c, const u64 *data, int64_t count, int threads) : ctx(c), dets(count)
     {
@@ -703,20 +718,27 @@ template <int W> struct Space : SpaceBase {
         singles_graph(astr, asingle_start, asingle, threads);
         singles_graph(bstr, bsingle_start, bsingle, threads);
         const int64_t nastr = astr.size() / W;
-        ab_bid.resize(amajor.size());
-        ab_det.resize(amajor.size());
-#pragma omp parallel for schedule(dynamic, 256) num_threads(threads)
-        for (int64_t a = 0; a < nastr; ++a) {
-            const int64_t lo = amajor_start[a], hi = amajor_start[a + 1];
-            std::vector<std::pair<int32_t, int32_t>> pairs;
-            pairs.reserve(hi - lo);
-            for (int64_t t = lo; t < hi; ++t) pairs.emplace_back(bid[amajor[t]], amajor[t]);
-            std::sort(pairs.begin(), pairs.end());
-            for (int64_t t = lo; t < hi; ++t) {
-                ab_bid[t] = pairs[t - lo].first;
-                ab_det[t] = pairs[t - lo].second;
-            }
+        amajor_b.resize(amajor.size());
+        bmajor_a.resize(bmajor.size());
+#pragma omp parallel for schedule(static) num_threads(threads)
+        for (int64_t t = 0; t < static_cast<int64_t>(amajor.size()); ++t) {
+            amajor_b[t] = bid[amajor[t]];
+            bmajor_a[t] = aid[bmajor[t]];
         }
+        auto costs = [&](const std::vector<int64_t> &single_start, const std::vector<int32_t> &single,
+                         const std::vector<int64_t> &major_start, std::vector<int64_t> &out) {
+            const int64_t nstr = static_cast<int64_t>(single_start.size()) - 1;
+            out.assign(nstr, 0);
+#pragma omp parallel for schedule(static) num_threads(threads)
+            for (int64_t s = 0; s < nstr; ++s) {
+                int64_t c = 0;
+                for (int64_t u = single_start[s]; u < single_start[s + 1]; ++u)
+                    c += major_start[single[u] + 1] - major_start[single[u]];
+                out[s] = c;
+            }
+        };
+        costs(asingle_start, asingle, amajor_start, asingle_cost);
+        costs(bsingle_start, bsingle, bmajor_start, bsingle_cost);
         strings = true;
     }
 
@@ -765,7 +787,8 @@ template <int W> struct Space : SpaceBase {
 // stripe writes its rows' U x part directly and its U^T x part into its own
 // buffer (entries from the stripe's first row on), and the buffers are added
 // in stripe order, so the result does not depend on the thread count.
-template <int W, class F> void for_each_upper(const Space<W> &sp, int64_t i, int64_t from, F &&f)
+template <int W, class F> void for_each_upper(const Space<W> &sp, int64_t i, int64_t from, F &&f,
+                                               int64_t *stats = nullptr)
 {
     // Every determinant j >= from (> i) connected to i: the per-string lists
     // hold increasing determinant indices, so each scan starts at `from`.
@@ -774,60 +797,75 @@ template <int W, class F> void for_each_upper(const Space<W> &sp, int64_t i, int
         return std::lower_bound(list.begin() + lo, list.begin() + hi, static_cast<int32_t>(from)) - list.begin();
     };
     const int32_t a = sp.aid[i], b = sp.bid[i];
-    for (int64_t t = after(sp.amajor, sp.amajor_start[a], sp.amajor_start[a + 1]); t < sp.amajor_start[a + 1]; ++t) {
-        const int32_t j = sp.amajor[t];
-        int d = 0;
-        for (int k = 0; k < W; ++k) d += popc(x.b()[k] ^ sp.dets[j].b()[k]);
-        if (d <= 4) f(j, 0, d);
-    }
-    for (int64_t t = after(sp.bmajor, sp.bmajor_start[b], sp.bmajor_start[b + 1]); t < sp.bmajor_start[b + 1]; ++t) {
-        const int32_t j = sp.bmajor[t];
-        int d = 0;
-        for (int k = 0; k < W; ++k) d += popc(x.a()[k] ^ sp.dets[j].a()[k]);
-        if (d <= 4) f(j, d, 0);
-    }
-    // Opposite-spin doubles: alpha strings one excitation away, and in each
-    // of their groups the determinants whose beta string is one excitation
-    // from b. A group is scanned (from `from` on) when that is shorter than
-    // looking up the beta singles of b by binary search in its beta-sorted copy.
-    const int64_t s_lo = sp.bsingle_start[b], s_hi = sp.bsingle_start[b + 1];
-    const int64_t singles = s_hi - s_lo;
-    for (int64_t u = sp.asingle_start[a]; u < sp.asingle_start[a + 1]; ++u) {
-        const int32_t a2 = sp.asingle[u];
-        const int64_t g_lo = sp.amajor_start[a2], g_hi = sp.amajor_start[a2 + 1];
-        const int64_t first = after(sp.amajor, g_lo, g_hi);
-        const int64_t scan = g_hi - first;
-        if (scan <= 0) continue;
-        int64_t log_g = 1;
-        while ((int64_t(1) << log_g) < g_hi - g_lo) ++log_g;
-        if (scan <= singles * (log_g + 2)) {
-            for (int64_t t = first; t < g_hi; ++t) {
-                const int32_t j = sp.amajor[t];
-                int d = 0;
-                for (int k = 0; k < W; ++k) d += popc(x.b()[k] ^ sp.dets[j].b()[k]);
-                if (d == 2) f(j, 2, 2);
-            }
-        } else {
-            const int32_t *gb = sp.ab_bid.data() + g_lo;
-            const int32_t *gd = sp.ab_det.data() + g_lo;
-            const int64_t g = g_hi - g_lo;
-            int64_t pos = 0;
-            for (int64_t v = s_lo; v < s_hi && pos < g; ++v) {     // both sorted: galloping merge
-                const int32_t target = sp.bsingle[v];
-                if (gb[pos] < target) {
-                    int64_t step = 1, hi = pos + 1;
-                    while (hi < g && gb[hi] < target) {
-                        pos = hi;
-                        step <<= 1;
-                        hi = pos + step;
-                    }
-                    pos = std::lower_bound(gb + pos, gb + std::min(hi + 1, g), target) - gb;
-                    if (pos >= g) break;
-                }
-                if (gb[pos] == target && gd[pos] >= from) f(gd[pos], 2, 2);
+    {
+        const int64_t t0 = after(sp.amajor, sp.amajor_start[a], sp.amajor_start[a + 1]);
+        if (stats) stats[0] += sp.amajor_start[a + 1] - t0;
+        const u64 *xb = x.b();
+        const u64 *xa_self = &sp.astr[static_cast<int64_t>(a) * W];
+        for (int64_t t = t0; t < sp.amajor_start[a + 1]; ++t) {
+            const u64 *yb = &sp.bstr[static_cast<int64_t>(sp.amajor_b[t]) * W];
+            int d = 0;
+            for (int k = 0; k < W; ++k) d += popc(xb[k] ^ yb[k]);
+            if (d <= 4) {
+                f(sp.amajor[t], xa_self, yb);
+                if (stats) ++stats[1];
             }
         }
     }
+    {
+        const int64_t t0 = after(sp.bmajor, sp.bmajor_start[b], sp.bmajor_start[b + 1]);
+        if (stats) stats[2] += sp.bmajor_start[b + 1] - t0;
+        const u64 *xa = x.a();
+        const u64 *xb_self = &sp.bstr[static_cast<int64_t>(b) * W];
+        for (int64_t t = t0; t < sp.bmajor_start[b + 1]; ++t) {
+            const u64 *ya = &sp.astr[static_cast<int64_t>(sp.bmajor_a[t]) * W];
+            int d = 0;
+            for (int k = 0; k < W; ++k) d += popc(xa[k] ^ ya[k]);
+            if (d <= 4) {
+                f(sp.bmajor[t], ya, xb_self);
+                if (stats) ++stats[3];
+            }
+        }
+    }
+    // Opposite-spin doubles j = (a2, b2), a2 one excitation from a and b2 one
+    // from b: from the side whose neighbours' groups are shorter in total,
+    // walk each neighbour's group (from `from` on, contiguous other-string
+    // ids) and test the other string against the singles of this
+    // determinant's other string, marked in a per-thread bitmap.
+    static thread_local std::vector<u64> amark, bmark;
+    const bool alpha_side = sp.asingle_cost[a] <= sp.bsingle_cost[b];
+    const auto &near_start = alpha_side ? sp.asingle_start : sp.bsingle_start;
+    const auto &near = alpha_side ? sp.asingle : sp.bsingle;
+    const auto &far_start = alpha_side ? sp.bsingle_start : sp.asingle_start;
+    const auto &far = alpha_side ? sp.bsingle : sp.asingle;
+    const auto &major_start = alpha_side ? sp.amajor_start : sp.bmajor_start;
+    const auto &major = alpha_side ? sp.amajor : sp.bmajor;
+    const auto &major_other = alpha_side ? sp.amajor_b : sp.bmajor_a;
+    auto &mark = alpha_side ? bmark : amark;
+    const int32_t own = alpha_side ? a : b, other = alpha_side ? b : a;
+    const size_t mark_words = (alpha_side ? sp.bstr.size() : sp.astr.size()) / W / 64 + 1;
+    if (mark.size() < mark_words) mark.assign(mark_words, 0);
+    const int64_t f_lo = far_start[other], f_hi = far_start[other + 1];
+    for (int64_t v = f_lo; v < f_hi; ++v) mark[far[v] >> 6] |= u64(1) << (far[v] & 63);
+    for (int64_t u = near_start[own]; u < near_start[own + 1]; ++u) {
+        const int32_t s2 = near[u];
+        const int64_t g_lo = major_start[s2], g_hi = major_start[s2 + 1];
+        const int64_t first = after(major, g_lo, g_hi);
+        if (stats) {
+            ++stats[4];
+            stats[5] += g_hi - first;
+        }
+        for (int64_t t = first; t < g_hi; ++t) {
+            const int32_t o = major_other[t];
+            if ((mark[o >> 6] >> (o & 63)) & 1) {
+                const u64 *s2_str = &(alpha_side ? sp.astr : sp.bstr)[static_cast<int64_t>(s2) * W];
+                const u64 *o_str = &(alpha_side ? sp.bstr : sp.astr)[static_cast<int64_t>(o) * W];
+                f(major[t], alpha_side ? s2_str : o_str, alpha_side ? o_str : s2_str);
+                if (stats) ++stats[7];
+            }
+        }
+    }
+    for (int64_t v = f_lo; v < f_hi; ++v) mark[far[v] >> 6] = 0;
 }
 
 // Rows are kept in chunks of CHUNK rows, each with its own arrays (no copy
@@ -898,6 +936,10 @@ void finish_stripes(Hamiltonian &H)
 // Each of the fixed STRIPES row ranges is one task: its rows' own entries go
 // to y, the transposed (lower-triangle) ones to the stripe's buffer, and the
 // buffers are added in stripe order (results independent of the thread count).
+// Entries ahead whose vector and buffer lines are requested early (16-64 measured
+// alike on a 12-core desktop; 32 is the middle).
+static constexpr int64_t PREFETCH = 32;
+
 template <class V, int K>
 void spmm(Hamiltonian &H, const std::vector<std::vector<V>> &vals, const double *x, double *y, int threads)
 {
@@ -923,7 +965,15 @@ void spmm(Hamiltonian &H, const std::vector<std::vector<V>> &vals, const double 
                     xi[r] = x[i * K + r];
                     v[r] = H.diag[i] * xi[r];
                 }
-                for (int64_t t = st[local]; t < st[local + 1]; ++t) {
+                const int64_t t_end = st[local + 1];
+                for (int64_t t = st[local]; t < t_end; ++t) {
+                    // The columns are known ahead: request the vector and
+                    // buffer lines early (the product waits on these reads).
+                    if (t + PREFETCH < t_end) {
+                        const int64_t jp = col[t + PREFETCH];
+                        __builtin_prefetch(x + jp * K, 0, 1);
+                        __builtin_prefetch(buf + jp * K, 1, 1);
+                    }
                     const int64_t j = col[t];
                     const double h = val[t];
                     for (int r = 0; r < K; ++r) {
@@ -996,9 +1046,18 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
     // copied (old rows are a prefix, chunked the same way; their values are
     // converted when the precisions differ).
     auto *old_mut = const_cast<Hamiltonian *>(old);
+    // ITERCC_SCI_PROFILE=3: connection-search counters on stderr; =4 also
+    // skips the matrix elements (search cost alone; the matrix is not usable).
+    const char *profile_mode = std::getenv("ITERCC_SCI_PROFILE");
+    const bool profile = profile_mode && (profile_mode[0] == '3' || profile_mode[0] == '4');
+    const bool search_only = profile_mode && profile_mode[0] == '4';
+    std::vector<int64_t> totals(8, 0);
+    const double t_start = omp_get_wtime();
 #pragma omp parallel num_threads(threads)
     {
         std::vector<std::pair<int32_t, double>> row;
+        int64_t local_stats[8] = {0};
+        int64_t *stats = profile ? local_stats : nullptr;
 #pragma omp for schedule(dynamic, 1)
         for (int64_t ch = 0; ch < nchunks; ++ch) {
             const int64_t lo = ch * chunk, hi = std::min(count, lo + chunk);
@@ -1013,10 +1072,11 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
                 const int na = occupied<W>(sp.dets[i].a(), occ);
                 const int nb = occupied<W>(sp.dets[i].b(), occ + na);
                 const bool kept = i < n_old;
-                for_each_upper(sp, i, kept ? n_old : i + 1, [&](int32_t j, int, int) {
-                    const double v = element<W>(c, sp.dets[i], sp.dets[j], occ, na, nb);
+                for_each_upper(sp, i, kept ? n_old : i + 1, [&](int32_t j, const u64 *ya, const u64 *yb) {
+                    if (search_only) return;
+                    const double v = element_strings<W>(c, sp.dets[i].a(), sp.dets[i].b(), ya, yb, occ, na, nb);
                     if (std::fabs(v) > drop) row.emplace_back(j, v);
-                });
+                }, stats);
                 std::sort(row.begin(), row.end(),
                           [](const std::pair<int32_t, double> &x, const std::pair<int32_t, double> &y) {
                               return x.first < y.first;
@@ -1056,7 +1116,21 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
                 if (ch < static_cast<int64_t>(old_mut->val32.size())) std::vector<float>().swap(old_mut->val32[ch]);
             }
         }
+        if (profile) {
+#pragma omp critical
+            for (int k = 0; k < 8; ++k) totals[k] += local_stats[k];
+        }
     }
+    if (profile)
+        std::fprintf(stderr,
+                     "itercc_sci_hamiltonian: %lld rows (%lld new) in %.2f s%s: same-alpha scanned %lld hits %lld; "
+                     "same-beta scanned %lld hits %lld; opposite-spin groups %lld scanned %lld merged %lld hits %lld\n",
+                     static_cast<long long>(count), static_cast<long long>(count - n_old), omp_get_wtime() - t_start,
+                     search_only ? " (search only)" : "", static_cast<long long>(totals[0]),
+                     static_cast<long long>(totals[1]), static_cast<long long>(totals[2]),
+                     static_cast<long long>(totals[3]), static_cast<long long>(totals[4]),
+                     static_cast<long long>(totals[5]), static_cast<long long>(totals[6]),
+                     static_cast<long long>(totals[7]));
     int64_t nnz = 0;
     for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->col[ch].size();
     H->nnz = nnz;
@@ -1571,7 +1645,6 @@ void rdm1_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double 
 // <S^2> of M_S = 0 states (equal alpha and beta counts).
 template <int W> void s2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, double *out, int threads)
 {
-    sp.build_strings(threads);
     const int64_t count = sp.dets.size();
     const int nt = threads > 0 ? threads : omp_get_max_threads();
     std::vector<i128> acc(static_cast<size_t>(nt) * nroots, 0);
@@ -1585,34 +1658,28 @@ template <int W> void s2_impl(Space<W> &sp, const double *coeffs, int64_t nroots
             for (int k = 0; k < W; ++k) open += popc(x.b()[k] & ~x.a()[k]);
             for (int64_t r = 0; r < nroots; ++r)
                 mine[r] += to_fixed(open * coeffs[r * count + i] * coeffs[r * count + i]);
-            // Spin exchange: alpha q -> p, beta p -> q.
-            const int32_t a = sp.aid[i];
-            for (int64_t u = sp.asingle_start[a]; u < sp.asingle_start[a + 1]; ++u) {
-                const int32_t a2 = sp.asingle[u];
-                for (int64_t t = sp.amajor_start[a2]; t < sp.amajor_start[a2 + 1]; ++t) {
-                    const int32_t j = sp.amajor[t];
-                    const Det<W> &y = sp.dets[j];
-                    u64 ah[W], ap[W], bh[W], bp[W];
-                    int d = 0;
-                    for (int k = 0; k < W; ++k) {
-                        ah[k] = x.a()[k] & ~y.a()[k];
-                        ap[k] = y.a()[k] & ~x.a()[k];
-                        bh[k] = x.b()[k] & ~y.b()[k];
-                        bp[k] = y.b()[k] & ~x.b()[k];
-                        d += popc(x.b()[k] ^ y.b()[k]);
-                    }
-                    if (d != 2) continue;
-                    int q = 0, p = 0, bq = -1, bpp = -1;
-                    set_bits<W>(ah, &q, 1);
-                    set_bits<W>(ap, &p, 1);
-                    set_bits<W>(bh, &bq, 1);
-                    set_bits<W>(bp, &bpp, 1);
-                    if (bq != p || bpp != q) continue;
+            // Spin exchange: alpha q -> p, beta p -> q, for q occupied in alpha
+            // only and p in beta only; the partner is found by direct lookup.
+            int aonly[MAX_ORB], bonly[MAX_ORB];
+            int na1 = 0, nb1 = 0;
+            for (int k = 0; k < W; ++k) {
+                for (u64 bits = x.a()[k] & ~x.b()[k]; bits; bits &= bits - 1) aonly[na1++] = (k << 6) + lowest(bits);
+                for (u64 bits = x.b()[k] & ~x.a()[k]; bits; bits &= bits - 1) bonly[nb1++] = (k << 6) + lowest(bits);
+            }
+            for (int u = 0; u < na1; ++u)
+                for (int v = 0; v < nb1; ++v) {
+                    const int q = aonly[u], p = bonly[v];
+                    Det<W> y = x;
+                    flip(y.a(), q);
+                    flip(y.a(), p);
+                    flip(y.b(), p);
+                    flip(y.b(), q);
+                    const int64_t j = sp.index.find(y, hash_det<W>(y));
+                    if (j < 0) continue;
                     const double e = -phase<W>(x.a(), q, p) * phase<W>(x.b(), p, q);
                     for (int64_t r = 0; r < nroots; ++r)
                         mine[r] += to_fixed(e * coeffs[r * count + i] * coeffs[r * count + j]);
                 }
-            }
         }
     }
     for (int64_t r = 0; r < nroots; ++r) {

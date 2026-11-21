@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Selected CI, second speed round. The Hamiltonian build finds each
+  determinant's opposite-spin doubles from the cheaper side (the alpha or
+  the beta neighbours' groups, by their summed sizes), tests the other
+  string against a per-thread bitmap of its singles, reads contiguous
+  string ids and the small string tables instead of the determinants, and
+  evaluates elements from those tables: 2.4x faster on a CuF space of 1.8
+  million determinants (33 -> 14 s), the same matrix. From `SORT_FROM`
+  (200,000) determinants each stage starts by sorting the space by alpha,
+  then beta string, so connected determinants are close: products 1.45x
+  (one vector) and 1.7x (two) faster at 1.8-3.5 million determinants; a
+  stage's space is then no longer a prefix of the next one's (`checkpoint`
+  receives each). Products prefetch the vector and buffer lines they will
+  read (10-17%), Davidson applies several roots' new directions in one pass
+  (`krylov.davidson(sigma_block=)`), and the <S^2> exchange partners come
+  from direct lookups (75x faster; it had taken a third of a two-root
+  series). `ITERCC_SCI_PROFILE=3` prints the build's search counters. A
+  two-root CuF series to 0.94 million determinants: 47.9 -> 28.3 s on 12
+  cores; the polarizability series to 1.8 million: 161 -> 143 s.
+
 - Scalar-relativistic RHF without PySCF: `itercc.scf.run(molecule,
   x2c=True)` uses the spin-free one-electron X2C Hamiltonian
   (`itercc.integrals.SpinFreeX2C`) of PySCF's `scf.RHF(mol).sfx2c1e()`. The

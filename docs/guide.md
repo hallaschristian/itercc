@@ -447,6 +447,10 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   5.272 in 50 s on 12 cores. `sci.field_solver_factory(space)` runs the
   finite-field route (`finite_field_polarizability`) in a fixed space; it
   matches the linear response there to 2e-6 au.
+- Large spaces: from `SORT_FROM` (200,000) determinants each stage starts
+  by sorting the space by alpha and beta string (faster products and
+  builds), so a stage's space is not a prefix of the next stage's; pass
+  `checkpoint` to `solve` to keep each stage's space.
 - Large spaces: from a million determinants the Hamiltonian stores
   single-precision values (`hamiltonian_precision="auto"`; "double" or
   "single" force one), a third less memory at about 1e-8 Eh. The response
@@ -588,7 +592,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_DIRECT_OPENED` | call | `0`: triplet rank-four direct packed T4 terms by contexts per output slot (`ITERCC_DIRECT_DENSE`) instead of one GEMM per hole tuple and class |
 | `ITERCC_SLOT_SHARE_WORK` | call | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
 | `ITERCC_SLOT_PROFILE` | core | `1`: slot-program phase timers (`itercc_triplet_profile`) |
-| `ITERCC_SCI_PROFILE` | core | `1`: selected-CI PT2 phase timers on stderr; `2`: excitation generation alone (diagnostic, no PT2) |
+| `ITERCC_SCI_PROFILE` | core | `1`: selected-CI PT2 phase timers on stderr; `2`: excitation generation alone (diagnostic, no PT2); `3`: Hamiltonian-build search counters; `4`: the search alone (diagnostic, no matrix) |
 | `ITERCC_SLOT_SORT` | core | `0`: with `ITERCC_SLOT_WAVES=1`, a wave's tiles in slot order (diagnostic) |
 | `ITERCC_MERGE_TILES` | call | `0`: with fused slot-program products, every tile is cleared and gathered on its own, not merged with the tiles of its kind whose gathers agree up to a sign |
 | `ITERCC_SLOT_WAVES` | core | `1`: slot-program tiles run in waves of slots whose partial sums (`partial_sums_gib`) are added at the end of each wave, not slot by slot |

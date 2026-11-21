@@ -47,6 +47,19 @@ _SELECT_GROUND_TOL = 1e-4
 _SELECT_RESPONSE_TOL = 1e-2
 
 
+# From this size each stage starts by sorting the space by alpha string, then
+# beta string: connected determinants then lie close together, and products
+# with the Hamiltonian, limited by their scattered reads, run 1.5x faster
+# (CuF, 1.8 and 3.5 million determinants). Rounds within a stage append.
+SORT_FROM = 200_000
+
+
+def _locality_order(dets, words):
+    """The order of `dets` by alpha string, then beta string."""
+    keys = [dets[:, words + k] for k in range(words)] + [dets[:, k] for k in range(words)]
+    return np.lexsort(keys)
+
+
 # Determinants in the exactly inverted block of the preconditioner.
 BLOCK_PRECONDITIONER = 1500
 
@@ -358,7 +371,10 @@ class SelectedCI:
         E2[pt2_deterministic] estimated from `pt2_sample_batches` batches of
         `pt2_samples` determinants (seeded by `seed`; `stage.pt2_error`).
         `max_determinants` ends the series at the first stage that would
-        outgrow it (that stage keeps the space reached so far). Davidson
+        outgrow it (that stage keeps the space reached so far). From
+        `SORT_FROM` determinants each stage starts by sorting the space by
+        alpha and beta string (faster products), so a stage's space is not a
+        prefix of the next one's; `checkpoint` receives each stage's space. Davidson
         stops at `residual_tol` (the energy error is about its square over
         the gap to the next root: 1e-5 gives about 1e-9 Eh).
         `checkpoint(stage, determinants, vectors)` runs after each stage;
@@ -439,6 +455,15 @@ class SelectedCI:
         for eps in epsilons:
             cycles = 0
             seconds = dict(hamiltonian=0.0, davidson=0.0, select=0.0, pt2=0.0)
+            if len(dets) >= SORT_FROM:
+                order = _locality_order(dets, self.words)
+                if np.any(order != np.arange(len(order))):
+                    dets = np.ascontiguousarray(dets[order])
+                    if vectors is not None:
+                        vectors = np.ascontiguousarray(vectors[:, order])
+                    if self._kept is not None:          # its rows follow the old order
+                        self.kernels.sci_ham_free(self._kept)
+                        self._kept = None
             while True:
                 cycles += 1
                 space = self._space(dets)
@@ -609,10 +634,18 @@ class SelectedCI:
             ratio = _dot(vector, u) / _dot(vector, w)
             return -(u - ratio * w)
 
+        def sigma_block(rows):
+            # The new directions of several roots in one pass over H.
+            block_in = np.ascontiguousarray(np.asarray(rows, dtype=np.float64).T)
+            block_out = np.empty_like(block_in)
+            self.kernels.sci_matmat(ham, block_in.shape[1], block_in.ctypes.data, block_out.ctypes.data, threads)
+            return np.ascontiguousarray(block_out.T)
+
         outcome = krylov.davidson(sigma, diagonal, project, size=size, nroots=nroots, xp=np,
                                   residual_tol=residual_tol, max_iter=200, max_space=space_size,
                                   guesses=guesses, minimum=-np.inf,
-                                  precondition=precondition if block is not None else None)
+                                  precondition=precondition if block is not None else None,
+                                  sigma_block=sigma_block if nroots > 1 else None)
         if not outcome.converged:
             raise RuntimeError("Davidson did not converge")
         roots = np.array([np.asarray(v).real for v in outcome.vectors])
@@ -705,8 +738,8 @@ class SelectedCI:
         record's `pt2` is then its stage's correction, for extrapolating the
         tensors against it). `initial` (determinants, for example a
         record's `.space`, or (determinants, ground vector)) continues a
-        series: the ground state's selection starts from that space, which
-        stays the prefix of every later space, with the given `epsilons`."""
+        series: the ground state's selection starts from that space, with
+        the given `epsilons`."""
         dipoles = _symmetric(dipoles)
         wavelengths = tuple(float(w) for w in np.atleast_1d(wavelengths_nm))
         irreps = self._dipole_irreps(dipoles, dipole_irreps)
@@ -736,14 +769,19 @@ class SelectedCI:
             return results
         if initial is not None and not isinstance(initial, tuple):
             initial = (initial, None)
+        stage_spaces = []
+
+        def keep(stage, dets, vectors):
+            stage_spaces.append((dets.copy(), vectors[0].copy()))
+
         ground = self.solve(1, references=references, spin_parity=spin_parity, epsilons=epsilons,
                             pt2_epsilon=pt2_epsilon, max_determinants=max_determinants, initial=initial,
-                            **(solve_options or {}))
+                            checkpoint=keep, **(solve_options or {}))
         union, response = None, None
         try:
-            for stage in ground.stages:
+            for stage, (base, base_vector) in zip(ground.stages, stage_spaces):
                 start = time.perf_counter()
-                base = ground.determinants[:stage.determinants]
+                order = None
                 if union is None:
                     union = base
                 else:
@@ -751,13 +789,17 @@ class SelectedCI:
                     if max_determinants is not None and len(grown) > max_determinants:
                         break       # the cap ends the series; earlier stages stand
                     union = grown
+                    if len(union) >= SORT_FROM:      # each stage starts from a sorted space
+                        order = _locality_order(union, self.words)
+                        union = np.ascontiguousarray(union[order])
                 for cycle in range(max_cycles):
                     guess = None
-                    if response is None:        # the series' final ground vector, on this prefix
-                        guess = ground.vectors[0][:len(union)].copy()
+                    if response is None:        # this stage's ground vector
+                        guess = base_vector.copy()
                     response = SelectedCIResponse(self, dipoles, union, spin_parity=spin_parity,
                                                   dipole_irreps=irreps, previous=response, guess=guess,
-                                                  residual_tol=_SELECT_GROUND_TOL)
+                                                  residual_tol=_SELECT_GROUND_TOL,
+                                                  order=order if cycle == 0 else None)
                     c0 = np.ascontiguousarray(np.abs(response.ground))
                     fresh = []
                     for d in dipoles:
@@ -893,7 +935,7 @@ class SelectedCIResponse:
     """
 
     def __init__(self, sci, dipoles, determinants, *, spin_parity=1, dipole_irreps=None, guess=None,
-                 residual_tol=1e-9, previous=None):
+                 residual_tol=1e-9, previous=None, order=None):
         self.sci, self.kernels, self.spin_parity = sci, sci.kernels, spin_parity
         threads = sci._threads()
         self.determinants = np.ascontiguousarray(determinants, dtype=np.uint64).reshape(-1, 2 * sci.words)
@@ -901,9 +943,20 @@ class SelectedCIResponse:
         self._dipoles = _symmetric(dipoles)
         self.irreps = sci._dipole_irreps(self._dipoles, dipole_irreps)
         self._ham, self._space, self._ops, self._guesses = None, None, [None, None, None], {}
-        extend = (previous is not None and previous._ham is not None and previous.size <= n
+        extend = (order is None and previous is not None and previous._ham is not None and previous.size <= n
                   and np.array_equal(previous.determinants, self.determinants[:previous.size]))
         carried = {}
+        if order is not None and previous is not None:
+            # A re-sorted space: `order` maps its rows to those of the previous
+            # space padded with the new determinants; the previous ground
+            # state and solutions, permuted, start this space's solves.
+            order = np.asarray(order)
+
+            def moved(v):
+                return np.concatenate([v, np.zeros(n - len(v), dtype=v.dtype)])[order]
+
+            guess = moved(previous.ground)
+            carried = {key: [(moved(x), shift) for x, shift in stored] for key, stored in previous._guesses.items()}
         try:
             self._space = sci._space(self.determinants)
             single = sci._single(n)
@@ -947,9 +1000,10 @@ class SelectedCIResponse:
         except BaseException:
             self.close()
             raise
-        # The previous space's solutions, zero-padded, start this space's solves.
+        # The previous space's solutions (zero-padded, or permuted) start this space's solves.
         for key, stored in carried.items():
-            self._guesses[key] = [(np.concatenate([x, np.zeros(n - len(x), dtype=x.dtype)]), s) for x, s in stored]
+            self._guesses[key] = [(x if len(x) == n else np.concatenate([x, np.zeros(n - len(x), dtype=x.dtype)]), s)
+                                  for x, s in stored]
 
     def _ground_state(self, guess, residual_tol, fill_from=None):
         sci, threads = self.sci, self.sci._threads()
