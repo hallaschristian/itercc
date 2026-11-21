@@ -25,7 +25,8 @@ polarizabilities converged to tight thresholds.
 - **Big calculations.** One 56-core CPU socket runs a CCSDT iteration with 13
   occupied and 131 virtual orbitals in 9.2 s (an A100 GPU: 26.6 s), and a
   CCSDTQ iteration with 13 occupied and 47 virtual orbitals in 85 s.
-- **Beyond energies.** Singlet EOM-CCSDT excitation energies and full CCSDT
+- **Beyond energies.** EOM-CCSDT excitation energies (singlets and triplets,
+  with left eigenvectors for spin-orbit couplings) and full CCSDT
   linear-response polarizabilities (static, dynamic, damped) with exact
   analytic Jacobians.
 - **Exact and reproducible.** Every rank's raw residual is converged, results
@@ -80,7 +81,7 @@ More scripts: [examples](examples/).
 | | Ground state | Excited states | Properties |
 | --- | --- | --- | --- |
 | CCSD | `RestrictedCC(rank=2)` | `EOMSinglet(method="ccsd")` | `DipoleResponse(method="ccsd")` |
-| CCSDT | `RestrictedCC` | `EOMSinglet` | `DipoleResponse` |
+| CCSDT | `RestrictedCC` | `EOMSinglet`; singlets and triplets, right and left: `SpinEOMCCSDT` | `DipoleResponse` |
 | CCSDTQ | `RestrictedCCSDTQ` | triplet spin-flip EOM (experimental) | static, by finite fields |
 
 Plus first-order spin-orbit state interaction (`spin_orbit_state_interaction`),

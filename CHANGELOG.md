@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- `SpinEOMCCSDT` (`itercc.eom_spin_ccsdt`): closed-shell EOM-CCSDT for
+  singlets and triplets (M_S = 0 vectors of one irrep and spin parity), with
+  left eigenvectors: `solve(left=True)` and `sigma_left` act with the exact
+  transpose of the Jacobian, as spin-orbit and transition matrix elements
+  need, and `lambda_source()` gives dE/dT for the ground-state left vector.
+  The T1-dressed spin-orbital CCSDT residual (pdaggerq) is differentiated
+  along the direction (the T1 legs of the dressed integrals give the r1
+  terms) and integrated over spin onto the alpha-dominant blocks a, aa, ab,
+  aaa, aab: 469 terms with one direction factor each
+  (`itercc._spin_ccsdt_terms`). Every term runs as a binary contraction tree
+  whose ground-state subtrees are formed once; the left action runs the
+  same trees backwards, at the same cost. Products whose outputs are
+  antisymmetric in letters of one operand write only their ordered entries,
+  and sums over pairs antisymmetric in both operands run over ordered
+  tuples. All products run on the symmetry-blocked executor, and the packed
+  vectors are gathered and scattered by compiled kernels. Singlet roots equal
+  `EOMSinglet`'s; the terms match finite differences of the dense
+  spin-orbital residual for both parities. On CuF in aug-cc-pVDZ-DK (13
+  occupied, 63 virtual orbitals, B2 triplet) the right and left actions equal
+  those of the CCpy spin-integrated equations to 1.7e-15 and 1.3e-15 (on the
+  same packed vector). One 56-core Sapphire Rapids socket takes about 24 s per
+  action, right or left (the first one 51 s while plans build; 40 s of setup,
+  38 GiB of cached intermediates, 106 GB peak); the CCpy equations took 585 s
+  (right) and 775 s (left) on 32 cores. Ordered outputs move the right action
+  from 21.7 to 23.5 s and the left one from 27.6 to 24.5 s. `share=` lets
+  engines of other irreps and spins reuse the ground blocks and intermediates.
+
 - `finite_field_polarizability` gives the static polarizability tensor of any
   ground-state method, CCSDTQ included (analytic response stops at CCSDT), as
   the second derivative of its energy in uniform fields with fixed orbitals.

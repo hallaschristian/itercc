@@ -114,8 +114,52 @@ states.excitation_energies, states.total_energies, states.converged
   converged roots on water, with about 30% fewer Jacobian actions than 1e-9.
 - `max_space` (default 20, at least `2 * nroots + 1`) bounds the Davidson
   subspace; `memory_budget_gib` rejects a space that would not fit.
-- Not implemented: left eigenvectors, transition moments, oscillator
-  strengths. Experimental: triplet (spin-flip) EOM-CCSDTQ (`TripletEOMCCSDTQ`).
+- Left eigenvectors and triplets: `SpinEOMCCSDT` (below). Not implemented:
+  transition moments, oscillator strengths. Experimental: triplet (spin-flip)
+  EOM-CCSDTQ (`TripletEOMCCSDTQ`).
+
+### Singlets and triplets, right and left (`SpinEOMCCSDT`)
+
+```python
+from itercc.eom_spin_ccsdt import SpinEOMCCSDT
+
+eom = SpinEOMCCSDT(cc, ground.amplitudes, orbital_irreps=labels, irrep=2, spin="triplet")
+right = eom.solve(nroots=1, residual_tol=1e-8)
+left = eom.solve(nroots=1, left=True, residual_tol=1e-8, guesses=list(right.vectors))
+l, r = left.vectors[0].real, right.vectors[0].real
+l /= l @ r                                   # biorthonormal: l . r = 1
+```
+
+- The closed-shell CCSDT Jacobian on M_S = 0 vectors of one irrep and one spin
+  parity (`spin="singlet"`: +1, `"triplet"`: -1), and its exact transpose
+  (`sigma_left`, `solve(left=True)`), whose eigenvectors spin-orbit and
+  transition matrix elements need. `lambda_source()` is dE/dT for the
+  ground-state left vector (J^T l = -dE/dT, singlet irrep 0).
+- Spin-integrated: the T1-dressed spin-orbital CCSDT residual (pdaggerq) is
+  differentiated along the direction and integrated over spin onto the
+  alpha-dominant blocks a, aa, ab, aaa, aab (469 terms with one direction
+  factor each; `itercc._spin_ccsdt_terms`). Each term runs as a binary
+  contraction tree whose ground-state subtrees are formed once (an H-bar-like
+  cache, `cache_elements` entries per intermediate); the left action runs the
+  same trees backwards, so it is the transpose of the right one to rounding
+  at the same cost. Products whose outputs are antisymmetric in letters of
+  one operand write only their ordered entries, and sums over letters in
+  which both operands are antisymmetric run over ordered tuples
+  (`ordered=False` keeps the dense products). All contractions run on the
+  symmetry-blocked executor.
+- Vectors are packed by block with a < b and i < j in equal-spin groups and
+  sqrt(2) on the blocks that stand for an alpha and a beta copy (the
+  determinant-basis dot product); `amplitude_blocks` and `space.pack` turn
+  `EOMSinglet` vectors into this layout. Singlet roots equal `EOMSinglet`'s;
+  triplets are the M_S = 0 components.
+- CuF in aug-cc-pVDZ-DK (13 occupied, 63 virtual orbitals, 34 million
+  coordinates per irrep): about 24 s per action, right or left, on one 56-core
+  Sapphire Rapids socket, after 40 s of setup; the cached intermediates take
+  38 GiB (`cache_elements`) and an action peaks at 106 GB. Engines for other
+  irreps and spins of the same ground state can share them: `share=engine`.
+- The M_S = 0 singlet space also holds quintet-type vectors, so Davidson may
+  need more actions than `EOMSinglet` for the same singlet roots (242 against
+  184 on a small C2v model); use `EOMSinglet` for singlet right roots alone.
 
 Singlet EOM-CCSDTQ (`itercc.eom_ccsdtq.FiniteDifferenceEOM`) differentiates
 the CCSDTQ residual numerically. Give its solver the labels of the subgroup in

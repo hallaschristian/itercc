@@ -137,6 +137,16 @@ Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
 - `residual_tol=1e-6` puts excitation energies within about 3e-8 Eh (1 micro-eV) of tightly
   converged roots and needs about 30% fewer Jacobian actions than 1e-9 (measured on water).
 
+### SpinEOMCCSDT(solver, amplitudes, *, orbital_irreps=None, irrep=0, spin="triplet", cache_elements=200_000_000, cpu_threads=None, ordered=True, share=None)
+`from itercc.eom_spin_ccsdt import SpinEOMCCSDT`. Closed-shell EOM-CCSDT on M_S = 0 vectors of one irrep:
+`spin="singlet"` or `"triplet"`, right and left (transpose) eigenvectors. CPU.
+- `.solve(nroots=1, *, left=False, residual_tol=1e-8, max_iter=100, max_space=20, guesses=None) -> EOMResult`
+- `.sigma(v)`, `.sigma_left(v)` (exact transpose), `.full_residual_norm(v, omega, left=False)`, `.lambda_source()` (dE/dT, singlet irrep 0).
+- Vectors packed by spin block a, aa, ab, aaa, aab (`.space`); normalize left roots with `l /= l @ r`.
+- Singlet roots equal `EOMSinglet`'s; `amplitude_blocks(solver, (x1, x2, x3))` + `.space.pack` converts its vectors.
+- `share=other_engine` (same ground state and labels) reuses its ground blocks and cached intermediates
+  (38 GiB for CuF aug-cc-pVDZ-DK, 13 occupied/63 virtual: about 24 s per action on one 56-core socket).
+
 ### DipoleResponse(solver, amplitudes, dipoles, *, orbital_irreps=None, dipole_irreps=None, backend="cpu", method="ccsdt", cpu_threads=None)
 - `.polarizability(wavelength_nm, *, damping_Eh=0.0, tol=1e-8) -> Polarizability`
 - `float("inf")` = static. `damping_Eh > 0` gives the complex damped tensor (absorption in the imaginary part).
