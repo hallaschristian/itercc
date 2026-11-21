@@ -29,6 +29,39 @@ for a converged RHF (or scalar-X2C RHF): `model.h`, `model.eri`, `model.nocc`,
 `model.mo_coeff`. `dipole_integrals(model, mol)` gives the dipole matrices and
 their irreps for response calculations.
 
+Without PySCF, `itercc.molecule.Molecule` and `itercc.scf` give the same
+inputs from the package's own integrals (McMurchie-Davidson on the compiled
+core) and basis sets (bundled NWChem-format files, or `ITERCC_BASIS_PATH`; no
+effective core potentials):
+
+```python
+from itercc.molecule import Molecule
+from itercc.scf import dipole_integrals, from_scf, run
+
+mol = Molecule("Cu 0 0 0; F 0 0 1.76", "aug-cc-pVDZ-DK")       # Abelian group found (C2v)
+result, hcore, eri = run(mol, x2c=True)                         # scalar-relativistic RHF
+model = from_scf(result, hcore, eri, mol.energy_nuc(), frozen=6)
+dipoles, dipole_irreps = dipole_integrals(mol, model, x2c=True)
+```
+
+- `run(mol, x2c=True)` uses the spin-free one-electron X2C Hamiltonian
+  (sfX2C-1e, `itercc.integrals.SpinFreeX2C`) of PySCF's
+  `scf.RHF(mol).sfx2c1e()`: the modified Dirac equation is solved in the
+  decontracted basis (point nuclei), and the decoupled, renormalized
+  one-electron Hamiltonian is projected onto the contracted functions. The
+  two-electron integrals stay the Coulomb ones. RHF energies agree with
+  PySCF's to 2e-10 Eh (Cu+ and CuF in aug-cc-pVDZ-DK; CuF -1752.7103132582 Eh).
+  aug-cc-pVDZ-DK and aug-cc-pwCVTZ-DK are bundled.
+- `dipole_integrals(mol, model, x2c=True)` gives the electronic dipoles in the
+  same X2C picture (`SpinFreeX2C.dipole`: R^T (r + X^T p.r.p X / 4c^2) R, as
+  PySCF's `picture_change`); with `x2c=False` (or `itercc.integrals.dipole`)
+  they stay the unrelaxed nonrelativistic-picture operator. The picture change
+  moves the CuF RHF dipole moment by 2.3e-7 au.
+- The X2C step itself is cheap (0.4 s for CuF), but the two-electron integrals
+  treat each general contraction of the DK sets as a shell of its own (about
+  20 primitives per copper s function): 12 s for CuF in aug-cc-pVDZ-DK.
+- Spin-orbit X2C still comes from PySCF (see Spin-orbit coupling).
+
 For active-space models, `itercc.fold_closed_shell(h, eri, constant, count)`
 integrates the `count` lowest closed-shell orbitals into `h` and `constant`,
 and `itercc.select_active_orbitals(h, eri, constant, labels, nocc, occupied,
@@ -282,7 +315,8 @@ damped = response.polarizability(532.0, damping_Eh=0.001).tensor_au      # compl
   folded in by an extra zero-frequency solve), clamped nuclei and fixed
   orbitals, in atomic units. `method="ccsd"` gives CCSD response.
 - `dipoles` are the electronic dipole matrices (-r) in the same orbital frame
-  as the amplitudes; for scalar X2C, supply picture-changed dipoles.
+  as the amplitudes; for scalar X2C, supply picture-changed dipoles
+  (`itercc.scf.dipole_integrals(mol, model, x2c=True)` on the native path).
 - Keep one `DipoleResponse` for a sweep of wavelengths: every converged
   solution can seed later solves. A positive `recycle_gib` budget that is too
   small for the image store still enables projected real dipole guesses.

@@ -38,3 +38,10 @@ Exchange (https://www.basissetexchange.org). Each file's header lists the
 original publication of every element's basis; please cite those, and
 B. P. Pritchard, D. Altarawy, B. Didier, T. D. Gibson and T. L. Windus,
 J. Chem. Inf. Model. 59, 4814 (2019), for the Basis Set Exchange.
+
+`itercc.integrals.SpinFreeX2C` (spin-free one-electron X2C) follows the
+algorithm of PySCF 2.14.0's `pyscf/x2c` (`sfx2c1e.py`, `x2c.py`: the
+decontracted basis, the electronic eigenpairs of the modified Dirac equation,
+the renormalization and the picture change; Apache License 2.0), reimplemented
+on IterCC's own integrals, including PySCF's value of the speed of light so
+that energies agree.

@@ -3,9 +3,10 @@ basis sets read from NWChem-format files, and Abelian point-group symmetry.
 
 Basis sets are read by name from `ITERCC_BASIS_PATH` (directories of
 NWChem-format files, separated like PATH), then from the sets bundled in
-`itercc/basis_sets` (STO-3G, Pople, cc-pVXZ, aug-cc-pVXZ, def2; see
-THIRD_PARTY.md), then from the basis-set data of an installed PySCF (its files
-only; no PySCF code runs). Effective core potentials are not supported: an
+`itercc/basis_sets` (STO-3G, Pople, cc-pVXZ, aug-cc-pVXZ, def2, and the
+Douglas-Kroll recontracted aug-cc-pVDZ-DK and aug-cc-pwCVTZ-DK for
+scalar-relativistic X2C; see THIRD_PARTY.md), then from the basis-set data of
+an installed PySCF (its files only; no PySCF code runs). Effective core potentials are not supported: an
 element whose basis comes with one is refused.
 """
 import os

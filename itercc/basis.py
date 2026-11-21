@@ -117,6 +117,36 @@ class Basis:
         offsets[1:] = np.cumsum([nsph(s.l) for s in self.shells])
         return offsets
 
+    def decontracted(self):
+        """(primitives, contraction): the uncontracted basis, one normalized
+        primitive shell per distinct exponent of each atom and angular
+        momentum (exponents equal to 9 decimals merged, steepest first, atoms
+        in order), and the (primitive AO x AO) matrix whose columns are this
+        basis's functions in it: AO = primitives @ contraction. PySCF's
+        `mol.decontract_basis(aggregate=True)`, the basis X2C decouples in."""
+        groups = {}
+        for index, shell in enumerate(self.shells):
+            groups.setdefault((shell.atom, shell.l), []).append(index)
+        rows = {}                                  # (atom, l, rounded exponent) -> primitive shell
+        primitives = []
+        for (atom, l) in sorted(groups):
+            exps = np.concatenate([self.shells[i].exponents for i in groups[(atom, l)]])
+            _, first = np.unique(np.round(exps, 9), return_index=True)
+            for exponent in sorted(exps[first], reverse=True):
+                rows[(atom, l, float(np.round(exponent, 9)))] = len(primitives)
+                primitives.append(Shell(atom, l, np.array([exponent]), np.array([gto_norm(l, exponent)])))
+        basis = Basis(primitives, self.coords, self.charges)
+        prim_offsets, offsets = basis.ao_offsets(), self.ao_offsets()
+        contraction = np.zeros((basis.nao, self.nao))
+        for index, shell in enumerate(self.shells):
+            m = nsph(shell.l)
+            for exponent, coefficient in zip(shell.exponents, shell.coefficients):
+                row = rows[(shell.atom, shell.l, float(np.round(exponent, 9)))]
+                value = coefficient / primitives[row].coefficients[0]
+                for k in range(m):
+                    contraction[prim_offsets[row] + k, offsets[index] + k] += value
+        return basis, contraction
+
     @classmethod
     def from_pyscf(cls, mol):
         """The shells of a PySCF molecule (spherical basis), one per contraction."""

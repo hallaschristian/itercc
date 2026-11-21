@@ -6,8 +6,10 @@ core (`itercc_jk_s8`), Pulay DIIS, and with a symmetry-adapted basis one
 eigenproblem per irrep, so every orbital carries an exact Abelian irrep.
 `from_scf` then gives the correlated-orbital integrals the coupled-cluster
 solvers take, with the native transformation (`itercc.integrals.mo_eri`).
-The AO integrals still come from elsewhere (`integrals_from_pyscf`) until the
-package computes them itself.
+`run` computes the AO integrals natively (`itercc.integrals`), with the
+spin-free X2C one-electron Hamiltonian on request (`x2c=True`), and
+`dipole_integrals` the matching (picture-changed) dipoles;
+`integrals_from_pyscf` takes the AO integrals from PySCF instead.
 """
 from dataclasses import dataclass
 
@@ -164,6 +166,31 @@ def from_scf(result, hcore, eri_s8, energy_nuc=0.0, *, frozen=0, threads=None):
     return SpatialIntegrals(active.T @ h @ active, eri, nocc - frozen, constant, active, labels)
 
 
+def dipole_integrals(molecule, model, *, origin=None, x2c=False, threads=None):
+    """Electronic dipole matrices (-r, atomic units) in the orbitals of
+    `model` (`from_scf`; anything with `mo_coeff` and `orbital_irreps`) and the
+    Abelian irrep of each Cartesian component (None without orbital irreps),
+    as `pyscf_interface.dipole_integrals` gives them: origin at the centre of
+    nuclear charge unless given (Bohr). With `x2c=True` the picture-changed
+    X2C dipole (`integrals.SpinFreeX2C.dipole`), consistent with a
+    `run(..., x2c=True)` reference; otherwise the plain integrals."""
+    from . import integrals
+    from .pyscf_interface import _operator_irrep
+
+    charges = np.asarray(molecule.charges, dtype=np.float64)
+    if origin is None:
+        origin = charges @ molecule.coords / charges.sum()
+    if x2c:
+        r = integrals.SpinFreeX2C(molecule.basis, threads=threads).dipole(origin)
+    else:
+        r = integrals.dipole(molecule.basis, origin, threads)
+    coeff = np.asarray(model.mo_coeff)
+    dipoles = -np.einsum("pi,xpq,qj->xij", coeff, r, coeff)
+    if model.orbital_irreps is None:
+        return dipoles, None
+    return dipoles, tuple(_operator_irrep(d, np.asarray(model.orbital_irreps)) for d in dipoles)
+
+
 def integrals_from_pyscf(mol):
     """(hcore, overlap, 8-fold packed ERIs, electrons, nuclear repulsion,
     symmetry-adapted basis or None) of a PySCF molecule, from libcint: the
@@ -174,14 +201,20 @@ def integrals_from_pyscf(mol):
             mol.energy_nuc(), so_basis)
 
 
-def run(molecule, *, threads=None, screen=1e-14, **options):
+def run(molecule, *, x2c=False, threads=None, screen=1e-14, **options):
     """Native RHF of a `molecule.Molecule`: the package's own AO integrals
-    (`itercc.integrals`), symmetry-adapted basis and `rhf`. Returns
-    (RHFResult, hcore, 8-fold packed ERIs) for `from_scf`."""
+    (`itercc.integrals`), symmetry-adapted basis and `rhf`. With `x2c=True`
+    the one-electron Hamiltonian is the spin-free X2C one
+    (`integrals.SpinFreeX2C`, PySCF's `scf.RHF(mol).sfx2c1e()`); the
+    two-electron integrals stay the Coulomb ones. Returns (RHFResult, hcore,
+    8-fold packed ERIs) for `from_scf`."""
     from . import integrals
 
     b = molecule.basis
-    hcore = integrals.kinetic(b, threads) + integrals.nuclear(b, threads)
+    if x2c:
+        hcore = integrals.SpinFreeX2C(b, threads=threads).hcore()
+    else:
+        hcore = integrals.kinetic(b, threads) + integrals.nuclear(b, threads)
     overlap = integrals.overlap(b, threads)
     eri = integrals.eri_s8(b, screen=screen, threads=threads)
     so = molecule.symmetry.so_basis if molecule.symmetry is not None else None

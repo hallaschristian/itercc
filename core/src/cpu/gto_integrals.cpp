@@ -153,15 +153,20 @@ extern "C" void itercc_int1e(int kind, int64_t nshell, const int32_t *shell_l, c
 {
     // kind 0 overlap, 1 kinetic energy, 2 nuclear attraction (-sum_C Z_C /
     // |r - C|), 3 dipole (x, y, z of r - origin: out holds three nao^2
-    // matrices). Shell pairs a >= b in parallel, both triangles written.
+    // matrices), 4 pVp: sum_k <d_k a| -sum_C Z_C / |r - C| |d_k b> (libcint's
+    // int1e_pnucp), 5 the spin-free p.(r - origin).p: sum_k <d_k a| (r -
+    // origin)_c |d_k b> for c = x, y, z (three matrices; the scalar part of
+    // libcint's int1e_sprsp). Shell pairs a >= b in parallel, both triangles
+    // written.
     const Shells sh{nshell, shell_l, shell_atom, shell_nprim, shell_prim0, ao_off, c2s_off,
                     exps, coefs, atom_xyz, c2s};
-    const int nmat = kind == 3 ? 3 : 1;
+    const int nmat = kind == 3 || kind == 5 ? 3 : 1;
+    const bool derivative = kind == 4 || kind == 5;   // d/dx_k on both functions
     const i64 npairs = nshell * (nshell + 1) / 2;
 #pragma omp parallel num_threads(threads)
     {
         Hermite1 ex, ey, ez;
-        std::vector<double> r, prev, cart, sph;
+        std::vector<double> r, prev, cart, sph, table;
         double f[64];
 #pragma omp for schedule(dynamic, 1)
         for (i64 pair = 0; pair < npairs; ++pair) {
@@ -176,7 +181,7 @@ extern "C" void itercc_int1e(int kind, int64_t nshell, const int32_t *shell_l, c
             const double ab2 = (A[0] - B[0]) * (A[0] - B[0]) + (A[1] - B[1]) * (A[1] - B[1]) +
                                (A[2] - B[2]) * (A[2] - B[2]);
             cart.assign(size_t(nmat * nca * ncb), 0.0);
-            const int extra = kind == 1 ? 2 : 0;
+            const int extra_a = derivative ? 1 : 0, extra_b = kind == 1 ? 2 : extra_a;
             for (int ip = 0; ip < sh.nprim[a]; ++ip)
                 for (int jp = 0; jp < sh.nprim[b]; ++jp) {
                     const double ea = sh.exps[sh.prim0[a] + ip], eb = sh.exps[sh.prim0[b] + jp];
@@ -185,10 +190,103 @@ extern "C" void itercc_int1e(int kind, int64_t nshell, const int32_t *shell_l, c
                     double P[3];
                     for (int k = 0; k < 3; ++k) P[k] = (ea * A[k] + eb * B[k]) / p;
                     const double kab = std::exp(-mu * ab2);
-                    ex.build(la, lb + extra, p, P[0] - A[0], P[0] - B[0], 1.0);
-                    ey.build(la, lb + extra, p, P[1] - A[1], P[1] - B[1], 1.0);
-                    ez.build(la, lb + extra, p, P[2] - A[2], P[2] - B[2], 1.0);
+                    ex.build(la + extra_a, lb + extra_b, p, P[0] - A[0], P[0] - B[0], 1.0);
+                    ey.build(la + extra_a, lb + extra_b, p, P[1] - A[1], P[1] - B[1], 1.0);
+                    ez.build(la + extra_a, lb + extra_b, p, P[2] - A[2], P[2] - B[2], 1.0);
                     const double s1 = std::sqrt(kPi / p);
+                    // A 1D factor g(i, j) with d/dx on both Gaussians: d G_i = i G_(i-1)
+                    // - 2 ea G_(i+1) (and eb for G_j), so <d G_i|.|d G_j> combines
+                    // g at (i -+ 1, j -+ 1).
+                    auto both = [ea, eb](auto g, int i, int j) {
+                        double v = 4.0 * ea * eb * g(i + 1, j + 1);
+                        if (i > 0) v -= 2.0 * eb * i * g(i - 1, j + 1);
+                        if (j > 0) v -= 2.0 * ea * j * g(i + 1, j - 1);
+                        if (i > 0 && j > 0) v += double(i * j) * g(i - 1, j - 1);
+                        return v;
+                    };
+                    if (kind == 4) {
+                        // Per axis, Hermite coefficients of the plain (0) and the
+                        // differentiated (1) pair: table[((axis * 2 + d) * (la + 1)
+                        // + i) * (lb + 1) + j) * s + t], t <= i + j + 2.
+                        const int L = la + lb + 2, s = L + 1;
+                        const Hermite1 *axes[3] = {&ex, &ey, &ez};
+                        table.assign(size_t(6 * (la + 1) * (lb + 1) * s), 0.0);
+                        auto slot = [&](int axis, int d, int i, int j) {
+                            return table.data() + size_t((((axis * 2 + d) * (la + 1) + i) * (lb + 1) + j) * s);
+                        };
+                        for (int axis = 0; axis < 3; ++axis) {
+                            const Hermite1 &e = *axes[axis];
+                            for (int i = 0; i <= la; ++i)
+                                for (int j = 0; j <= lb; ++j) {
+                                    double *plain = slot(axis, 0, i, j), *diff = slot(axis, 1, i, j);
+                                    for (int t = 0; t <= i + j; ++t) plain[t] = e.get(i, j, t);
+                                    for (int t = 0; t <= i + j + 2; ++t)
+                                        diff[t] = both([&e, t](int i1, int j1) { return e.get(i1, j1, t); }, i, j);
+                                }
+                        }
+                        for (i64 c = 0; c < natm; ++c) {
+                            const double *C = sh.xyz + 3 * c;
+                            hermite_r(L, p, P[0] - C[0], P[1] - C[1], P[2] - C[2], r, prev, f);
+                            const double pref = -charges[c] * 2.0 * kPi / p * kab * coef;
+                            for (int i = 0; i < nca; ++i)
+                                for (int j = 0; j < ncb; ++j) {
+                                    const Comp &u = ca[size_t(i)], &w = cb[size_t(j)];
+                                    double sum = 0.0;
+                                    for (int k = 0; k < 3; ++k) {
+                                        const double *gx = slot(0, k == 0, u.x, w.x), *gy = slot(1, k == 1, u.y, w.y),
+                                                     *gz = slot(2, k == 2, u.z, w.z);
+                                        const int nx = u.x + w.x + (k == 0 ? 2 : 0), ny = u.y + w.y + (k == 1 ? 2 : 0),
+                                                  nz = u.z + w.z + (k == 2 ? 2 : 0);
+                                        for (int t = 0; t <= nx; ++t) {
+                                            if (gx[t] == 0.0) continue;
+                                            for (int q = 0; q <= ny; ++q) {
+                                                const double eu = gx[t] * gy[q];
+                                                if (eu == 0.0) continue;
+                                                const double *rr = r.data() + size_t((t * s + q) * s);
+                                                for (int v = 0; v <= nz; ++v) sum += eu * gz[v] * rr[v];
+                                            }
+                                        }
+                                    }
+                                    cart[size_t(i * ncb + j)] += pref * sum;
+                                }
+                        }
+                        continue;
+                    }
+                    if (kind == 5) {
+                        const Hermite1 *axes[3] = {&ex, &ey, &ez};
+                        const double pref = kab * coef;
+                        for (int i = 0; i < nca; ++i)
+                            for (int j = 0; j < ncb; ++j) {
+                                const int ui[3] = {ca[size_t(i)].x, ca[size_t(i)].y, ca[size_t(i)].z};
+                                const int wj[3] = {cb[size_t(j)].x, cb[size_t(j)].y, cb[size_t(j)].z};
+                                // Per axis: overlap, moment, derivative, derivative moment.
+                                double ov[3], mo[3], dv[3], dm[3];
+                                for (int axis = 0; axis < 3; ++axis) {
+                                    const Hermite1 &e = *axes[axis];
+                                    const double shift = P[axis] - origin[axis];
+                                    auto overlap1 = [&e, s1](int i1, int j1) { return e.get(i1, j1, 0) * s1; };
+                                    auto moment1 = [&e, s1, shift](int i1, int j1) {
+                                        return (e.get(i1, j1, 1) + shift * e.get(i1, j1, 0)) * s1;
+                                    };
+                                    ov[axis] = overlap1(ui[axis], wj[axis]);
+                                    mo[axis] = moment1(ui[axis], wj[axis]);
+                                    dv[axis] = both(overlap1, ui[axis], wj[axis]);
+                                    dm[axis] = both(moment1, ui[axis], wj[axis]);
+                                }
+                                for (int comp = 0; comp < 3; ++comp) {
+                                    double sum = 0.0;
+                                    for (int k = 0; k < 3; ++k) {
+                                        double term = 1.0;
+                                        for (int axis = 0; axis < 3; ++axis)
+                                            term *= axis == k ? (axis == comp ? dm[axis] : dv[axis])
+                                                              : (axis == comp ? mo[axis] : ov[axis]);
+                                        sum += term;
+                                    }
+                                    cart[size_t((comp * nca + i) * ncb + j)] += pref * sum;
+                                }
+                            }
+                        continue;
+                    }
                     if (kind == 2) {
                         const int L = la + lb;
                         for (i64 c = 0; c < natm; ++c) {

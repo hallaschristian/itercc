@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 44
+#define ITERCC_CORE_ABI 45
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -237,7 +237,9 @@ void itercc_scatter_pairs(const double *blocks, int64_t items, int64_t first, in
 void itercc_jk_s8(const double *s8, int64_t nao, const double *dm, double *vj, double *vk, int threads);
 /* Gaussian AO integrals (gto_integrals.cpp, itercc.integrals): kind 0
  * overlap, 1 kinetic, 2 nuclear attraction, 3 dipole of r - origin (three
- * matrices) over spherical contracted shells (libcint conventions), and the
+ * matrices), 4 pVp (sum_k <d_k a|V_nuc|d_k b>, libcint's int1e_pnucp), 5
+ * sum_k <d_k a|(r - origin)_c|d_k b> (three matrices; for X2C picture
+ * changes) over spherical contracted shells (libcint conventions), and the
  * 8-fold packed two-electron integrals with Schwarz screening. */
 void itercc_int1e(int kind, int64_t nshell, const int32_t *shell_l, const int32_t *shell_atom,
                   const int32_t *shell_nprim, const int64_t *shell_prim0, const double *exps, const double *coefs,

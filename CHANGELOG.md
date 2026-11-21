@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Scalar-relativistic RHF without PySCF: `itercc.scf.run(molecule,
+  x2c=True)` uses the spin-free one-electron X2C Hamiltonian
+  (`itercc.integrals.SpinFreeX2C`) of PySCF's `scf.RHF(mol).sfx2c1e()`. The
+  modified Dirac equation is solved in the decontracted basis
+  (`Basis.decontracted`, PySCF's `decontract_basis(aggregate=True)`), and the
+  renormalized Foldy-Wouthuysen Hamiltonian is projected onto the contracted
+  functions. New core integral kinds give pVp (`integrals.pvp`, libcint's
+  `int1e_pnucp`) and p.r.p (`integrals.prp`, the spin-free part of
+  `int1e_sprsp`) (core ABI 45); `SpinFreeX2C.dipole` and
+  `scf.dipole_integrals(molecule, model, x2c=True)` give picture-changed
+  dipoles. RHF energies agree with PySCF's to 2e-10 Eh for Cu+ and CuF
+  (1.76 A, C2v) in aug-cc-pVDZ-DK (the CuF production model,
+  -1752.7103132582 Eh), dipole moments to 1.3e-9 au. aug-cc-pVDZ-DK and
+  aug-cc-pwCVTZ-DK are bundled.
+
 - Faster selected CI (core ABI 44). Spaces from a million determinants keep
   the Hamiltonian's values in single precision (`hamiltonian_precision=
   "auto"`; products accumulate in double, about 1e-8 Eh in energies): a
