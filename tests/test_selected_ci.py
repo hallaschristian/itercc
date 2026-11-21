@@ -190,6 +190,49 @@ def test_extrapolation_approaches_full_ci(model):
     assert np.isfinite(gap)
 
 
+def sum_over_states(model, dipoles, frequency):
+    """Full-CI alpha_ij(w) and <0|mu|0> from the oracle's eigenstates."""
+    h, eri, no, constant, labels = model
+    matrix, _ = determinant_problem(Hamiltonian.restricted(h, eri, no, constant), no, no)
+    energies, states = np.linalg.eigh(matrix)
+    operators = [determinant_problem(Hamiltonian.restricted(d, np.zeros_like(eri), no), no, no)[0] for d in dipoles]
+    moments = np.asarray([states[:, 1:].T @ op @ states[:, 0] for op in operators])
+    gaps = energies[1:] - energies[0]
+    weights = 1 / (gaps - frequency) + 1 / (gaps + frequency)
+    return (moments * weights) @ moments.T, np.asarray([states[:, 0] @ op @ states[:, 0] for op in operators])
+
+
+def test_polarizability_full_space_equals_full_ci(model):
+    from test_finite_field import symmetric_dipoles
+
+    h, eri, no, constant, labels = model
+    dipoles = symmetric_dipoles(labels, (3, 2, 0))
+    sci = solver(model)
+    results = sci.polarizability(dipoles, frequencies=(0.0, 0.05), epsilons=(1e-2, 1e-14), tol=1e-11)
+    final = results[-1]
+    assert results[0].determinants < final.determinants
+    for k, w in enumerate((0.0, 0.05)):
+        exact, moment = sum_over_states(model, dipoles, w)
+        np.testing.assert_allclose(final.tensors_au[k], exact, atol=1e-8)
+        np.testing.assert_allclose(final.dipole_au, moment, atol=1e-9)
+    # components of different irreps couple through no state
+    assert final.tensors_au[0][0, 1] == 0 and final.tensors_au[0][0, 2] == 0
+
+
+def test_fixed_space_finite_field_matches_linear_response(model):
+    from itercc.finite_field import finite_field_polarizability
+    from test_finite_field import symmetric_dipoles
+
+    h, eri, no, constant, labels = model
+    dipoles = symmetric_dipoles(labels, (3, 2, 0))
+    sci = solver(model)
+    space = sci.polarizability(dipoles, epsilons=(3e-2,))[0].space
+    response = sci.polarizability(dipoles, spaces=[space], tol=1e-12)[0]
+    found = finite_field_polarizability(sci.field_solver_factory(space, residual_tol=1e-11), h, dipoles,
+                                        orbital_irreps=labels, fields=(1e-3, 2e-3))
+    np.testing.assert_allclose(found.tensor_au, response.tensors_au[0], atol=2e-6)
+
+
 def test_water_against_pyscf_full_ci():
     pyscf = pytest.importorskip("pyscf")
     from pyscf import fci, gto, scf

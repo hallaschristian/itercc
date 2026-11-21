@@ -158,6 +158,11 @@ Epstein-Nesbet PT2 (near-full CI) of any real orbital Hamiltonian, compiled CPU 
 - `result.extrapolate(root, renormalized=False)` and `extrapolate_gap(lower, upper, renormalized=False)`: (full-CI
   estimate, spread), linear in PT2 (or E2/(1+norm)); `stage.pt2_norm`, `stage.renormalized_pt2`.
 - `solve(..., checkpoint=f(stage, dets, vectors), initial=(dets, vectors))` resumes a series exactly.
+- `.polarizability(dipoles, *, frequencies=(0.0,), references=None, spin_parity=1, epsilons=(1e-3, 3e-4, 1e-4),
+  dipole_irreps=None, pt2_epsilon=None, max_cycles=8, tol=1e-9, spaces=None) -> [SCIPolarizability]` per stage
+  (`tensors_au`, `frequencies_au`, `dipole_au`, `determinants`, `space`): linear response in a space grown with
+  dipole- and response-coupled determinants; equals full CI in the full space. `.field_solver_factory(space)` for
+  `finite_field_polarizability`.
 - `.density_matrix(result, weights)`, `.natural_orbitals(result)` -> (occupations, coefficients, irreps);
   `rotate_integrals(h, eri, coefficients)`.
 - PT2 memory: about 96 bytes per external determinant (two roots, <= 128 orbitals); `pt2_batches=k` divides it by k

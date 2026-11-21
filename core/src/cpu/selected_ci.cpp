@@ -779,16 +779,26 @@ template <int W, class F> void for_each_upper(const Space<W> &sp, int64_t i, int
     }
 }
 
+// Rows are kept in chunks of CHUNK rows, each with its own arrays (no copy
+// into one array after the build, so a build peaks at the matrix's size), and
+// an extension releases each old chunk once its rows are copied.
 struct Hamiltonian {
     static constexpr int64_t STRIPES = 64;
-    int64_t n = 0;
+    static constexpr int64_t CHUNK = 512;
+    int64_t n = 0, nnz = 0;
     std::vector<double> diag;
-    std::vector<int64_t> start;
-    std::vector<int32_t> col;
-    std::vector<double> val;
-    std::vector<int64_t> stripe;          // STRIPES + 1 row boundaries
-    std::vector<int64_t> offset;          // each stripe's buffer offset
+    std::vector<std::vector<int64_t>> start;   // per chunk: CHUNK + 1 (or fewer) local row offsets
+    std::vector<std::vector<int32_t>> col;
+    std::vector<std::vector<double>> val;
+    std::vector<int64_t> stripe;               // STRIPES + 1 row boundaries
+    std::vector<int64_t> offset;               // each stripe's buffer offset
     std::vector<double> buffer;
+
+    int64_t row_length(int64_t i) const
+    {
+        const auto &st = start[i / CHUNK];
+        return st[i % CHUNK + 1] - st[i % CHUNK];
+    }
 };
 
 struct Buffer {
@@ -836,17 +846,24 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
     } else {
         diagonal_impl(sp, H->diag.data(), threads);
     }
-    const int64_t chunk = 512;
+    const int64_t chunk = Hamiltonian::CHUNK;
     const int64_t nchunks = (count + chunk - 1) / chunk;
-    std::vector<std::vector<int32_t>> ccol(nchunks);
-    std::vector<std::vector<double>> cval(nchunks);
-    std::vector<int64_t> rowlen(count, 0);
+    H->start.resize(nchunks);
+    H->col.resize(nchunks);
+    H->val.resize(nchunks);
+    // The extension reads old chunks and releases each one after its rows are
+    // copied (old rows are a prefix, chunked the same way).
+    auto *old_mut = const_cast<Hamiltonian *>(old);
 #pragma omp parallel num_threads(threads)
     {
         std::vector<std::pair<int32_t, double>> row;
 #pragma omp for schedule(dynamic, 1)
         for (int64_t ch = 0; ch < nchunks; ++ch) {
             const int64_t lo = ch * chunk, hi = std::min(count, lo + chunk);
+            auto &st = H->start[ch];
+            auto &cc = H->col[ch];
+            auto &cv = H->val[ch];
+            st.assign(hi - lo + 1, 0);
             for (int64_t i = lo; i < hi; ++i) {
                 row.clear();
                 int occ[2 * MAX_ORB];
@@ -861,40 +878,39 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
                           [](const std::pair<int32_t, double> &x, const std::pair<int32_t, double> &y) {
                               return x.first < y.first;
                           });
-                int64_t length = row.size();
                 if (kept) {         // the old row's columns all precede the new ones
-                    const int64_t a = old->start[i], b = old->start[i + 1];
-                    ccol[ch].insert(ccol[ch].end(), old->col.begin() + a, old->col.begin() + b);
-                    cval[ch].insert(cval[ch].end(), old->val.begin() + a, old->val.begin() + b);
-                    length += b - a;
+                    const auto &os = old->start[ch];
+                    const int64_t a = os[i - lo], b = os[i - lo + 1];
+                    cc.insert(cc.end(), old->col[ch].begin() + a, old->col[ch].begin() + b);
+                    cv.insert(cv.end(), old->val[ch].begin() + a, old->val[ch].begin() + b);
                 }
-                rowlen[i] = length;
                 for (auto &e : row) {
-                    ccol[ch].push_back(e.first);
-                    cval[ch].push_back(e.second);
+                    cc.push_back(e.first);
+                    cv.push_back(e.second);
                 }
+                st[i - lo + 1] = static_cast<int64_t>(cc.size());
+            }
+            cc.shrink_to_fit();
+            cv.shrink_to_fit();
+            if (old_mut && ch < static_cast<int64_t>(old_mut->col.size())) {
+                std::vector<int64_t>().swap(old_mut->start[ch]);
+                std::vector<int32_t>().swap(old_mut->col[ch]);
+                std::vector<double>().swap(old_mut->val[ch]);
             }
         }
     }
-    H->start.assign(count + 1, 0);
-    for (int64_t i = 0; i < count; ++i) H->start[i + 1] = H->start[i] + rowlen[i];
-    H->col.resize(H->start[count]);
-    H->val.resize(H->start[count]);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (int64_t ch = 0; ch < nchunks; ++ch) {
-        const int64_t at = H->start[ch * chunk];
-        std::copy(ccol[ch].begin(), ccol[ch].end(), H->col.begin() + at);
-        std::copy(cval[ch].begin(), cval[ch].end(), H->val.begin() + at);
-        std::vector<int32_t>().swap(ccol[ch]);
-        std::vector<double>().swap(cval[ch]);
-    }
-    const int64_t nnz = H->start[count];
+    int64_t nnz = 0;
+    for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->col[ch].size();
+    H->nnz = nnz;
     H->stripe.assign(Hamiltonian::STRIPES + 1, count);
     H->stripe[0] = 0;
-    for (int64_t s = 1, i = 0; s < Hamiltonian::STRIPES; ++s) {
-        const int64_t goal = (nnz + count) * s / Hamiltonian::STRIPES;
-        while (i < count && H->start[i] + i < goal) ++i;
-        H->stripe[s] = i;
+    {
+        int64_t i = 0, cumulative = 0;          // nonzeros of rows before i
+        for (int64_t s = 1; s < Hamiltonian::STRIPES; ++s) {
+            const int64_t goal = (nnz + count) * s / Hamiltonian::STRIPES;
+            while (i < count && cumulative + i < goal) cumulative += H->row_length(i++);
+            H->stripe[s] = i;
+        }
     }
     H->offset.assign(Hamiltonian::STRIPES + 1, 0);
     for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s)
@@ -1450,7 +1466,7 @@ void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old,
     });
 }
 
-int64_t itercc_sci_ham_nnz(const void *ham) { return static_cast<const Hamiltonian *>(ham)->col.size(); }
+int64_t itercc_sci_ham_nnz(const void *ham) { return static_cast<const Hamiltonian *>(ham)->nnz; }
 
 void itercc_sci_ham_free(void *ham) { delete static_cast<Hamiltonian *>(ham); }
 
@@ -1464,8 +1480,6 @@ void itercc_sci_matvec(void *ham, const double *x, double *y, int threads)
 {
     auto *H = static_cast<Hamiltonian *>(ham);
     const int64_t count = H->n;
-    const int32_t *col = H->col.data();
-    const double *val = H->val.data();
 #pragma omp parallel num_threads(threads)
     {
 #pragma omp for schedule(dynamic, 1)
@@ -1474,9 +1488,13 @@ void itercc_sci_matvec(void *ham, const double *x, double *y, int threads)
             double *buf = H->buffer.data() + H->offset[s] - lo;      // buf[j] for j >= lo
             std::fill(buf + lo, buf + count, 0.0);
             for (int64_t i = lo; i < hi; ++i) {
+                const int64_t ch = i / Hamiltonian::CHUNK, local = i % Hamiltonian::CHUNK;
+                const int64_t *st = H->start[ch].data();
+                const int32_t *col = H->col[ch].data();
+                const double *val = H->val[ch].data();
                 const double xi = x[i];
                 double v = H->diag[i] * xi;
-                for (int64_t t = H->start[i]; t < H->start[i + 1]; ++t) {
+                for (int64_t t = st[local]; t < st[local + 1]; ++t) {
                     v += val[t] * x[col[t]];
                     buf[col[t]] += val[t] * xi;
                 }

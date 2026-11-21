@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- `SelectedCI.polarizability`: static and dynamic dipole polarizabilities
+  of the selected-CI ground state by linear response in a selected space.
+  Each stage grows the space with the determinants coupled to the ground
+  state by a dipole component and those coupled through H to the static
+  response vectors (normalized), then solves alpha_ij(w) = <0|mu_i
+  (H - E0 - w)^-1 Q mu_j|0> + (w -> -w) by GMRES. The full-space limit
+  equals the full-CI sum over states (static and dynamic, 1e-8 au); on
+  water cc-pVDZ 0.87 million determinants give 3.146, 7.030, 5.267 au
+  (CCSDT 3.150, 7.037, 5.272). `SelectedCI.field_solver_factory` runs
+  `finite_field_polarizability` in a fixed selected space (the same tensor
+  to 2e-6 au).
+
+- Selected CI keeps the Hamiltonian in chunks of 512 rows with their own
+  arrays: a build no longer copies the rows into one array afterwards, and
+  an extension releases each old chunk once its rows are copied, so a stage
+  peaks at about the size of its Hamiltonian instead of two to three times
+  it (CuF stages of 16 million determinants and 7 billion nonzeros had run
+  out of 480 GB growing to the next stage).
+
 - `SelectedCI` (`itercc.selected_ci`): near-full CI by heat-bath selected CI
   with Epstein-Nesbet PT2, for corrections beyond CCSDTQ, on new compiled
   kernels (`core/src/cpu/selected_ci.cpp`, core ABI 43). Determinants are

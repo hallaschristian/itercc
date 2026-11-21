@@ -910,7 +910,9 @@ void itercc_sci_diagonal(void *space, double *out, int threads);
  * keeps a buffer of about 32 n doubles (fixed stripes, thread-independent). */
 void *itercc_sci_hamiltonian(void *space, double drop, int threads);
 /* The same for a space whose first n_old determinants are those of `old`
- * (unchanged): only elements involving the others are evaluated. */
+ * (unchanged): only elements involving the others are evaluated, and old's
+ * rows are released as they are copied (free `old` afterwards; it is no
+ * longer usable). */
 void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old, double drop, int threads);
 int64_t itercc_sci_ham_nnz(const void *ham);
 void itercc_sci_ham_free(void *ham);

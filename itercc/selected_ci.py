@@ -109,6 +109,26 @@ def extrapolate_gap(lower, upper, *, root_lower=0, root_upper=0, points=None, re
     return _extrapolate(gaps, corrections, points)
 
 
+@dataclass
+class SCIPolarizability:
+    """Dipole polarizabilities of the selected-CI ground state in one space.
+
+    `tensors_au[k]` is alpha_ij at `frequencies_au[k]` (au), by linear
+    response in the fixed space: sum over its states n of
+    <0|mu_i|n><n|mu_j|0> (1/(E_n - E_0 - w) + 1/(E_n - E_0 + w)), the exact
+    response of the variational state in that space. `dipole_au` is
+    <0|mu|0> of the dipole matrices as given (electronic -r)."""
+    determinants: int
+    energy: float
+    dipole_au: np.ndarray
+    frequencies_au: tuple
+    tensors_au: np.ndarray
+    residuals: np.ndarray            # relative residuals of the linear solves
+    seconds: float = 0.0
+    pt2: float = 0.0                 # zero-field PT2 of the ground state at the stage (0 without PT2)
+    space: np.ndarray = None         # the determinants of the space
+
+
 class SelectedCI:
     """Selected CI of a real orbital Hamiltonian (h, chemists' eri (pq|rs))
     with `nelec` electrons (an even count with M_S = 0, or (nalpha, nbeta))."""
@@ -131,6 +151,8 @@ class SelectedCI:
             raise ValueError("Electron counts must fit the orbitals")
         if nalpha >= 64:
             raise ValueError("At most 63 alpha electrons")
+        self._h, self._eri, self._cutoff = h, eri, float(cutoff)
+        self._labels_given = orbital_irreps is not None
         self.kernels = _cpu_kernels.library()
         if self.kernels is None:
             raise RuntimeError("SelectedCI needs the compiled core (see itercc._cpu_kernels)")
@@ -506,6 +528,232 @@ class SelectedCI:
             coefficients[idx, col] = vec
             labels[col] = label
         return occupations, coefficients, labels
+
+    # ----- polarizabilities -------------------------------------------------------------
+    def _dipole_irreps(self, dipoles, dipole_irreps):
+        from .finite_field import _irreps
+        return _irreps(dipoles, self.irreps if self._labels_given else None, dipole_irreps)
+
+    def _perturbed(self, h):
+        """A context of the same two-electron Hamiltonian with another h (no labels)."""
+        return SelectedCI(h, self._eri, (self.nalpha, self.nbeta), self.constant, cutoff=self._cutoff,
+                          cpu_threads=self.cpu_threads)
+
+    def _one_body(self, d):
+        """A context of the one-electron operator sum_pq d_pq E_pq alone (its matrix in a space)."""
+        return SelectedCI(d, np.zeros_like(self._eri), (self.nalpha, self.nbeta), 0.0, cutoff=self._cutoff,
+                          cpu_threads=self.cpu_threads)
+
+    def _select_from(self, context, dets, cmax, eps, partners):
+        """Determinants outside `dets` with |X_ai| cmax_i >= eps for the
+        operator X of `context` (its Hamiltonian: H, or a one-body operator)."""
+        space = context._space(dets)
+        try:
+            buffer = context.kernels.sci_select(space, np.ascontiguousarray(cmax).ctypes.data, float(eps),
+                                                int(partners), self._threads())
+        finally:
+            context.kernels.sci_space_free(space)
+        return context._take(buffer)
+
+    def _response(self, dets, operators, frequencies, spin_parity, tol, guess, irreps):
+        """Ground state and linear response in the fixed space `dets`:
+        (SCIPolarizability, ground vector, solutions of the first frequency
+        per component (None for a zero component))."""
+        start = time.perf_counter()
+        threads = self._threads()
+        dets = np.ascontiguousarray(dets, dtype=np.uint64)
+        n = len(dets)
+        space = self._space(dets)
+        handles = []
+        try:
+            ham = self.kernels.sci_hamiltonian(space, 1e-15, threads)
+            handles.append((self.kernels, ham))
+            if guess is not None and len(guess) <= n:
+                guess = np.concatenate([guess, np.zeros(n - len(guess))])[None]
+            else:
+                guess = None
+            energies, vectors = self._diagonalize(ham, space, n, 1, guess, spin_parity, min(tol, 1e-9), None)
+            e0 = energies[0] - self.constant
+            c0 = vectors[0]
+            diagonal = np.empty(n)
+            self.kernels.sci_ham_diagonal(ham, diagonal.ctypes.data)
+            partner = None
+            if spin_parity is not None:
+                partner = np.empty(n, dtype=np.int64)
+                self.kernels.sci_partners(space, partner.ctypes.data, threads)
+            sources = []
+            for op in operators:
+                op_space = op._space(dets)
+                try:
+                    op_ham = op.kernels.sci_hamiltonian(op_space, 0.0, threads)
+                finally:
+                    op.kernels.sci_space_free(op_space)
+                handles.append((op.kernels, op_ham))
+                y = np.empty(n)
+                op.kernels.sci_matvec(op_ham, np.ascontiguousarray(c0).ctypes.data, y.ctypes.data, threads)
+                sources.append(y)
+            moments = np.array([c0 @ y for y in sources])
+            sources = [y - m * c0 for y, m in zip(sources, moments)]
+
+            def project(v):
+                v = v - (c0 @ v) * c0
+                if partner is not None:
+                    v = 0.5 * (v + spin_parity * v[partner])
+                return v
+
+            tensors = np.zeros((len(frequencies), 3, 3))
+            residuals = np.zeros((len(frequencies), 3, 2))
+            first = [None, None, None]
+            for f, w in enumerate(frequencies):
+                for j in range(3):
+                    if np.linalg.norm(sources[j]) == 0:
+                        continue
+                    solutions = []
+                    for side, shift in enumerate((e0 + w, e0 - w) if w else (e0,)):
+                        def action(v, shift=shift):
+                            v = project(np.ascontiguousarray(v))
+                            out = np.empty(n)
+                            self.kernels.sci_matvec(ham, v.ctypes.data, out.ctypes.data, threads)
+                            return project(out - shift * v)
+                        precondition = diagonal - shift
+                        precondition = np.where(np.abs(precondition) < 1e-3, np.copysign(1e-3, precondition),
+                                                precondition)
+                        x, residual, _ = krylov.gmres(action, sources[j], precondition, np, tol=tol, restart=40,
+                                                      maxiter=2000)
+                        residuals[f, j, side] = residual
+                        solutions.append(project(x))
+                    if f == 0:
+                        first[j] = solutions[0]
+                    for i in range(3):
+                        if irreps is not None and irreps[i] != irreps[j]:
+                            continue
+                        value = sum(sources[i] @ x for x in solutions)
+                        tensors[f, i, j] = 2 * value if not w else value
+                tensors[f] = 0.5 * (tensors[f] + tensors[f].T)
+            pol = SCIPolarizability(n, energies[0], moments, tuple(frequencies), tensors, residuals,
+                                    time.perf_counter() - start)
+            return pol, c0, first
+        finally:
+            for kernels, handle in handles:
+                kernels.sci_ham_free(handle)
+            self.kernels.sci_space_free(space)
+
+    @_runtime.threaded
+    def polarizability(self, dipoles, *, frequencies=(0.0,), references=None, spin_parity=1,
+                       epsilons=(1e-3, 3e-4, 1e-4), dipole_irreps=None, pt2_epsilon=None, max_determinants=None,
+                       max_cycles=8, new_fraction=0.01, tol=1e-9, spaces=None, callback=None):
+        """Dipole polarizabilities alpha_ij(w) of the selected-CI ground state.
+
+        Each stage's space holds the ground state's selected determinants at
+        that epsilon and the response determinants: the ground state and the
+        static response vectors x_j (normalized) are solved in the space, and
+        every determinant a with |<a|mu_j|i> c_i| >= eps or
+        |<a|H|i> x_ji| >= eps for some i of the space is added, until fewer
+        than `new_fraction` are new (at most `max_cycles` rounds). In the
+        final space alpha comes from linear response: alpha_ij(w) =
+        <0|mu_i (H - E_0 - w)^-1 Q mu_j|0> + (w -> -w), Q projecting out
+        |0> (GMRES to relative residual `tol`): the exact polarizability of
+        the space's variational state (the zero-field limit of its
+        finite-field energies), equal to full CI in the full space.
+        `frequencies` (au) below the first excitation give dynamic
+        polarizabilities. `dipoles` are three symmetric one-electron
+        matrices in the orbitals of h (for example the electronic -r of
+        `pyscf_interface.dipole_integrals`). With `spaces` (a list of
+        determinant arrays, for example `[r.determinants for r in ...]`),
+        only the linear response runs, in each given space. Returns a list
+        of `SCIPolarizability`, one per stage or space (`.space` holds its
+        determinants)."""
+        dipoles = _symmetric(dipoles)
+        frequencies = tuple(float(w) for w in frequencies)
+        if not frequencies or any(not np.isfinite(w) or w < 0 for w in frequencies):
+            raise ValueError("Frequencies must be finite and nonnegative")
+        irreps = self._dipole_irreps(dipoles, dipole_irreps)
+        operators = [self._one_body(d) for d in dipoles]
+        partners = spin_parity is not None
+        results = []
+        guess = None
+        if spaces is not None:
+            for dets in spaces:
+                pol, guess, _ = self._response(dets, operators, frequencies, spin_parity, tol, guess, irreps)
+                pol.space = np.asarray(dets)
+                results.append(pol)
+                if callback is not None:
+                    callback(pol)
+            return results
+        ground = self.solve(1, references=references, spin_parity=spin_parity, epsilons=epsilons,
+                            pt2_epsilon=pt2_epsilon, max_determinants=max_determinants)
+        union = None
+        static = (0.0,) + tuple(w for w in frequencies if w)
+        for stage in ground.stages:
+            base = ground.determinants[:stage.determinants]
+            union = base if union is None else self._unique(np.concatenate([union, base]))
+            for cycle in range(max_cycles):
+                pol, guess, first = self._response(union, operators, static, spin_parity, tol, guess, irreps)
+                # Every component: the dipole couplings bring in its irrep's determinants.
+                fresh = [self._select_from(op, union, np.abs(guess), stage.epsilon, partners) for op in operators]
+                xs = [np.abs(x) / np.linalg.norm(x) for x in first if x is not None and np.linalg.norm(x) > 0]
+                if xs:
+                    fresh.append(self._select_from(self, union, np.max(xs, axis=0), stage.epsilon, partners))
+                fresh = [f for f in fresh if len(f)]
+                new = self._unique(np.concatenate(fresh)) if fresh else np.empty((0, 2 * self.words), np.uint64)
+                done = len(new) <= new_fraction * len(union) or cycle == max_cycles - 1 or (
+                    max_determinants is not None and len(union) + len(new) > max_determinants)
+                if done:
+                    break
+                union = np.concatenate([union, new])
+            keep = [0] + [k for k, w in enumerate(static) if w in frequencies and w]
+            if 0.0 not in frequencies:
+                keep = keep[1:]
+            pol.frequencies_au = tuple(static[k] for k in keep)
+            pol.tensors_au = pol.tensors_au[keep]
+            pol.residuals = pol.residuals[keep]
+            pol.pt2 = float(stage.pt2[0])
+            pol.space = union.copy()
+            results.append(pol)
+            if callback is not None:
+                callback(pol)
+        return results
+
+    def field_solver_factory(self, determinants, *, spin_parity=1, residual_tol=1e-9):
+        """`solver_factory(h, orbital_irreps)` for `finite_field_polarizability`:
+        each field point diagonalizes its Hamiltonian in the fixed space
+        `determinants` (for example a `polarizability` result's `.space`), so the field
+        energies vary smoothly and their second differences give that
+        space's polarizability (equal to `polarizability`'s static tensor in
+        the same space, up to the field extrapolation)."""
+        dets = np.ascontiguousarray(determinants, dtype=np.uint64)
+        parent = self
+
+        class _Iteration:
+            def __init__(self, delta):
+                self.delta_energy = delta
+
+        class _Result:
+            def __init__(self, energy, vector):
+                self.energy, self.converged = energy, True
+                self.iterations = [_Iteration(0.0)]
+                self.amplitudes = (vector,)
+
+        class _FixedSpace:
+            def __init__(self, h):
+                self.sci = parent._perturbed(h)
+
+            def solve(self, initial=None, **options):
+                guess = None if initial is None else np.asarray(initial[0], dtype=np.float64)[None]
+                res = self.sci.solve(1, references=dets[:1], spin_parity=spin_parity, epsilons=(1e3,),
+                                     new_fraction=1.0, initial=(dets, guess), residual_tol=residual_tol)
+                if len(res.determinants) != len(dets):
+                    raise RuntimeError("The fixed space grew")
+                return _Result(float(res.energies[0]), res.vectors[0].copy())
+
+        return lambda h, orbital_irreps=None: _FixedSpace(h)
+
+
+def _symmetric(matrices):
+    m = np.asarray(matrices, dtype=np.float64)
+    if m.ndim != 3 or m.shape[0] != 3 or not np.allclose(m, m.transpose(0, 2, 1), atol=1e-10):
+        raise ValueError("Expected three symmetric dipole matrices")
+    return np.ascontiguousarray(m)
 
 
 def rotate_integrals(h, eri, coefficients):
