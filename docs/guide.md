@@ -592,7 +592,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_DIRECT_OPENED` | call | `0`: triplet rank-four direct packed T4 terms by contexts per output slot (`ITERCC_DIRECT_DENSE`) instead of one GEMM per hole tuple and class |
 | `ITERCC_SLOT_SHARE_WORK` | call | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
 | `ITERCC_SLOT_PROFILE` | core | `1`: slot-program phase timers (`itercc_triplet_profile`) |
-| `ITERCC_SCI_PROFILE` | core | `1`: selected-CI PT2 phase timers on stderr; `2`: excitation generation alone (diagnostic, no PT2); `3`: Hamiltonian-build search counters; `4`: the search alone (diagnostic, no matrix) |
+| `ITERCC_SCI_PROFILE` | core | `1`: selected-CI PT2 phase timers (deterministic and semistochastic) on stderr; `2`: excitation generation alone (diagnostic, no PT2); `3`: Hamiltonian-build search counters; `4`: the search alone (diagnostic, no matrix) |
 | `ITERCC_SLOT_SORT` | core | `0`: with `ITERCC_SLOT_WAVES=1`, a wave's tiles in slot order (diagnostic) |
 | `ITERCC_MERGE_TILES` | call | `0`: with fused slot-program products, every tile is cleared and gathered on its own, not merged with the tiles of its kind whose gathers agree up to a sign |
 | `ITERCC_SLOT_WAVES` | core | `1`: slot-program tiles run in waves of slots whose partial sums (`partial_sums_gib`) are added at the end of each wave, not slot by slot |

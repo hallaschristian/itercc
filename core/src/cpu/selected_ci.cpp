@@ -1490,6 +1490,9 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
     const double nd = static_cast<double>(samples);
     std::vector<double> values(nbatches * nroots, 0.0), norms(nbatches * nroots, 0.0);
     int64_t externals = 0;
+    const bool profile = std::getenv("ITERCC_SCI_PROFILE") != nullptr;
+    double generate_s = 0.0, pass_s = 0.0, largest_task = 0.0;
+    int64_t terms = 0, distinct_total = 0;
     for (int64_t batch = 0; batch < nbatches; ++batch) {
         u64 state = mix(seed ^ (0x9e3779b97f4a7c15ULL * static_cast<u64>(batch + 1)));
         std::vector<int64_t> drawn(samples);
@@ -1509,11 +1512,14 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
         }
         const int nv = static_cast<int>(4 * nroots);
         ShardedMap<W> map(nv);
-#pragma omp parallel num_threads(threads)
+        const double t0 = omp_get_wtime();
+        distinct_total += distinct.size();
+#pragma omp parallel num_threads(threads) reduction(+ : terms) reduction(max : largest_task)
         {
         typename ShardedMap<W>::Stage stage(map);
 #pragma omp for schedule(dynamic, 1)
         for (int64_t t = 0; t < static_cast<int64_t>(distinct.size()); ++t) {
+            const double task_start = profile ? omp_get_wtime() : 0.0;
             const int64_t i = distinct[t].first;
             const double w = distinct[t].second, p = cmax[i] / total_weight;
             if (cmax[i] <= 0.0) continue;
@@ -1532,10 +1538,14 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
                     add[4 * k + 3] = kept ? b : 0;
                 }
                 stage.add(y, h, add);
+                ++terms;
             });
+            if (profile) largest_task = std::max(largest_task, omp_get_wtime() - task_start);
         }
         stage.flush_all();
         }
+        const double t1 = omp_get_wtime();
+        generate_s += t1 - t0;
         externals += map.size();
         const int64_t nshards = map.shards.size();
         std::vector<i128> part(nshards * nroots, 0), part_norm(nshards * nroots, 0);
@@ -1566,7 +1576,13 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
             values[batch * nroots + r] = from_fixed(sum);
             norms[batch * nroots + r] = from_fixed(sum_norm);
         }
+        pass_s += omp_get_wtime() - t1;
     }
+    if (profile)
+        std::fprintf(stderr, "itercc_sci_pt2_stochastic: %lld batches, %lld distinct samples, %lld terms, %lld externals; "
+                     "generate %.2f s (largest task %.3f s), final pass %.2f s\n", static_cast<long long>(nbatches),
+                     static_cast<long long>(distinct_total), static_cast<long long>(terms),
+                     static_cast<long long>(externals), generate_s, largest_task, pass_s);
     for (int64_t r = 0; r < nroots; ++r) {
         double m = 0.0, v = 0.0;
         for (int64_t b = 0; b < nbatches; ++b) m += values[b * nroots + r];
