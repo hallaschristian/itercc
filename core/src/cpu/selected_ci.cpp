@@ -601,6 +601,10 @@ template <int W> struct Space : SpaceBase {
     std::vector<int32_t> aid, bid;
     std::vector<int64_t> amajor_start, bmajor_start, asingle_start, bsingle_start;
     std::vector<int32_t> amajor, bmajor, asingle, bsingle;
+    // Each alpha string's determinants again, sorted by beta string id
+    // (ab_bid) with their indices (ab_det): a determinant with a given alpha
+    // and beta string is found by binary search.
+    std::vector<int32_t> ab_bid, ab_det;
 
     Space(const Ctx *c, const u64 *data, int64_t count, int threads) : ctx(c), dets(count)
     {
@@ -698,6 +702,21 @@ template <int W> struct Space : SpaceBase {
         group(bid, bstr.size() / W, bmajor_start, bmajor);
         singles_graph(astr, asingle_start, asingle, threads);
         singles_graph(bstr, bsingle_start, bsingle, threads);
+        const int64_t nastr = astr.size() / W;
+        ab_bid.resize(amajor.size());
+        ab_det.resize(amajor.size());
+#pragma omp parallel for schedule(dynamic, 256) num_threads(threads)
+        for (int64_t a = 0; a < nastr; ++a) {
+            const int64_t lo = amajor_start[a], hi = amajor_start[a + 1];
+            std::vector<std::pair<int32_t, int32_t>> pairs;
+            pairs.reserve(hi - lo);
+            for (int64_t t = lo; t < hi; ++t) pairs.emplace_back(bid[amajor[t]], amajor[t]);
+            std::sort(pairs.begin(), pairs.end());
+            for (int64_t t = lo; t < hi; ++t) {
+                ab_bid[t] = pairs[t - lo].first;
+                ab_det[t] = pairs[t - lo].second;
+            }
+        }
         strings = true;
     }
 
@@ -767,14 +786,46 @@ template <int W, class F> void for_each_upper(const Space<W> &sp, int64_t i, int
         for (int k = 0; k < W; ++k) d += popc(x.a()[k] ^ sp.dets[j].a()[k]);
         if (d <= 4) f(j, d, 0);
     }
+    // Opposite-spin doubles: alpha strings one excitation away, and in each
+    // of their groups the determinants whose beta string is one excitation
+    // from b. A group is scanned (from `from` on) when that is shorter than
+    // looking up the beta singles of b by binary search in its beta-sorted copy.
+    const int64_t s_lo = sp.bsingle_start[b], s_hi = sp.bsingle_start[b + 1];
+    const int64_t singles = s_hi - s_lo;
     for (int64_t u = sp.asingle_start[a]; u < sp.asingle_start[a + 1]; ++u) {
         const int32_t a2 = sp.asingle[u];
-        for (int64_t t = after(sp.amajor, sp.amajor_start[a2], sp.amajor_start[a2 + 1]); t < sp.amajor_start[a2 + 1];
-             ++t) {
-            const int32_t j = sp.amajor[t];
-            int d = 0;
-            for (int k = 0; k < W; ++k) d += popc(x.b()[k] ^ sp.dets[j].b()[k]);
-            if (d == 2) f(j, 2, 2);
+        const int64_t g_lo = sp.amajor_start[a2], g_hi = sp.amajor_start[a2 + 1];
+        const int64_t first = after(sp.amajor, g_lo, g_hi);
+        const int64_t scan = g_hi - first;
+        if (scan <= 0) continue;
+        int64_t log_g = 1;
+        while ((int64_t(1) << log_g) < g_hi - g_lo) ++log_g;
+        if (scan <= singles * (log_g + 2)) {
+            for (int64_t t = first; t < g_hi; ++t) {
+                const int32_t j = sp.amajor[t];
+                int d = 0;
+                for (int k = 0; k < W; ++k) d += popc(x.b()[k] ^ sp.dets[j].b()[k]);
+                if (d == 2) f(j, 2, 2);
+            }
+        } else {
+            const int32_t *gb = sp.ab_bid.data() + g_lo;
+            const int32_t *gd = sp.ab_det.data() + g_lo;
+            const int64_t g = g_hi - g_lo;
+            int64_t pos = 0;
+            for (int64_t v = s_lo; v < s_hi && pos < g; ++v) {     // both sorted: galloping merge
+                const int32_t target = sp.bsingle[v];
+                if (gb[pos] < target) {
+                    int64_t step = 1, hi = pos + 1;
+                    while (hi < g && gb[hi] < target) {
+                        pos = hi;
+                        step <<= 1;
+                        hi = pos + step;
+                    }
+                    pos = std::lower_bound(gb + pos, gb + std::min(hi + 1, g), target) - gb;
+                    if (pos >= g) break;
+                }
+                if (gb[pos] == target && gd[pos] >= from) f(gd[pos], 2, 2);
+            }
         }
     }
 }
@@ -782,17 +833,34 @@ template <int W, class F> void for_each_upper(const Space<W> &sp, int64_t i, int
 // Rows are kept in chunks of CHUNK rows, each with its own arrays (no copy
 // into one array after the build, so a build peaks at the matrix's size), and
 // an extension releases each old chunk once its rows are copied.
+//
+// With `single` the off-diagonal values are stored as float (products still
+// accumulate in double): a third less memory and memory traffic per product,
+// with relative errors of 6e-8 in each element (about 1e-8 Eh in energies).
 struct Hamiltonian {
     static constexpr int64_t STRIPES = 64;
     static constexpr int64_t CHUNK = 512;
     int64_t n = 0, nnz = 0;
+    bool single = false;
     std::vector<double> diag;
     std::vector<std::vector<int64_t>> start;   // per chunk: CHUNK + 1 (or fewer) local row offsets
     std::vector<std::vector<int32_t>> col;
-    std::vector<std::vector<double>> val;
+    std::vector<std::vector<double>> val;      // values (single == false)
+    std::vector<std::vector<float>> val32;     // values (single == true)
     std::vector<int64_t> stripe;               // STRIPES + 1 row boundaries
-    std::vector<int64_t> offset;               // each stripe's buffer offset
-    std::vector<double> buffer;
+    std::vector<int64_t> offset;               // each stripe's buffer offset (rows)
+    std::vector<double> buffer;                // allocated by the first product, width vectors per row
+    int64_t buffer_width = 0;
+
+    int64_t bytes() const
+    {
+        int64_t b = static_cast<int64_t>(diag.size() + buffer.size()) * 8;
+        for (const auto &v : start) b += static_cast<int64_t>(v.capacity()) * 8;
+        for (const auto &v : col) b += static_cast<int64_t>(v.capacity()) * 4;
+        for (const auto &v : val) b += static_cast<int64_t>(v.capacity()) * 8;
+        for (const auto &v : val32) b += static_cast<int64_t>(v.capacity()) * 4;
+        return b;
+    }
 
     int64_t row_length(int64_t i) const
     {
@@ -822,7 +890,61 @@ void finish_stripes(Hamiltonian &H)
     }
     H.offset.assign(Hamiltonian::STRIPES + 1, 0);
     for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s) H.offset[s + 1] = H.offset[s] + (count - H.stripe[s]);
-    H.buffer.assign(H.offset[Hamiltonian::STRIPES], 0.0);
+    std::vector<double>().swap(H.buffer);
+    H.buffer_width = 0;
+}
+
+// y = H x for K vectors at once (x, y: count x K, row-major), reading H once.
+// Each of the fixed STRIPES row ranges is one task: its rows' own entries go
+// to y, the transposed (lower-triangle) ones to the stripe's buffer, and the
+// buffers are added in stripe order (results independent of the thread count).
+template <class V, int K>
+void spmm(Hamiltonian &H, const std::vector<std::vector<V>> &vals, const double *x, double *y, int threads)
+{
+    const int64_t count = H.n;
+    if (H.buffer_width != K) {
+        H.buffer.assign(H.offset[Hamiltonian::STRIPES] * K, 0.0);
+        H.buffer_width = K;
+    }
+#pragma omp parallel num_threads(threads)
+    {
+#pragma omp for schedule(dynamic, 1)
+        for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s) {
+            const int64_t lo = H.stripe[s], hi = H.stripe[s + 1];
+            double *buf = H.buffer.data() + (H.offset[s] - lo) * K;      // buf[j * K + r] for j >= lo
+            std::fill(buf + lo * K, buf + count * K, 0.0);
+            for (int64_t i = lo; i < hi; ++i) {
+                const int64_t ch = i / Hamiltonian::CHUNK, local = i % Hamiltonian::CHUNK;
+                const int64_t *st = H.start[ch].data();
+                const int32_t *col = H.col[ch].data();
+                const V *val = vals[ch].data();
+                double xi[K], v[K];
+                for (int r = 0; r < K; ++r) {
+                    xi[r] = x[i * K + r];
+                    v[r] = H.diag[i] * xi[r];
+                }
+                for (int64_t t = st[local]; t < st[local + 1]; ++t) {
+                    const int64_t j = col[t];
+                    const double h = val[t];
+                    for (int r = 0; r < K; ++r) {
+                        v[r] += h * x[j * K + r];
+                        buf[j * K + r] += h * xi[r];
+                    }
+                }
+                for (int r = 0; r < K; ++r) y[i * K + r] = v[r];
+            }
+        }
+#pragma omp for schedule(static)
+        for (int64_t j = 0; j < count; ++j) {
+            double v[K];
+            for (int r = 0; r < K; ++r) v[r] = y[j * K + r];
+            for (int64_t s = 0; s < Hamiltonian::STRIPES && H.stripe[s] <= j; ++s) {
+                const double *b = H.buffer.data() + (H.offset[s] + (j - H.stripe[s])) * K;
+                for (int r = 0; r < K; ++r) v[r] += b[r];
+            }
+            for (int r = 0; r < K; ++r) y[j * K + r] = v[r];
+        }
+    }
 }
 
 template <int W> void diagonal_impl(Space<W> &sp, double *out, int threads)
@@ -843,7 +965,7 @@ template <int W> void diagonal_impl(Space<W> &sp, double *out, int threads)
 // new determinant are evaluated.
 template <int W>
 Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hamiltonian *old = nullptr,
-                              int64_t n_old = 0)
+                              int64_t n_old = 0, bool single = false)
 {
     sp.build_strings(threads);
     const Ctx &c = *sp.ctx;
@@ -851,6 +973,7 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
     if (!old) n_old = 0;
     auto *H = new Hamiltonian;
     H->n = count;
+    H->single = single;
     H->diag.resize(count);
     if (old) {
         std::copy(old->diag.begin(), old->diag.begin() + n_old, H->diag.begin());
@@ -868,8 +991,10 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
     H->start.resize(nchunks);
     H->col.resize(nchunks);
     H->val.resize(nchunks);
+    H->val32.resize(nchunks);
     // The extension reads old chunks and releases each one after its rows are
-    // copied (old rows are a prefix, chunked the same way).
+    // copied (old rows are a prefix, chunked the same way; their values are
+    // converted when the precisions differ).
     auto *old_mut = const_cast<Hamiltonian *>(old);
 #pragma omp parallel num_threads(threads)
     {
@@ -880,6 +1005,7 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
             auto &st = H->start[ch];
             auto &cc = H->col[ch];
             auto &cv = H->val[ch];
+            auto &cf = H->val32[ch];
             st.assign(hi - lo + 1, 0);
             for (int64_t i = lo; i < hi; ++i) {
                 row.clear();
@@ -899,20 +1025,35 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
                     const auto &os = old->start[ch];
                     const int64_t a = os[i - lo], b = os[i - lo + 1];
                     cc.insert(cc.end(), old->col[ch].begin() + a, old->col[ch].begin() + b);
-                    cv.insert(cv.end(), old->val[ch].begin() + a, old->val[ch].begin() + b);
+                    if (old->single) {
+                        const float *ov = old->val32[ch].data();
+                        for (int64_t t = a; t < b; ++t) {
+                            if (single) cf.push_back(ov[t]);
+                            else cv.push_back(ov[t]);
+                        }
+                    } else {
+                        const double *ov = old->val[ch].data();
+                        for (int64_t t = a; t < b; ++t) {
+                            if (single) cf.push_back(static_cast<float>(ov[t]));
+                            else cv.push_back(ov[t]);
+                        }
+                    }
                 }
                 for (auto &e : row) {
                     cc.push_back(e.first);
-                    cv.push_back(e.second);
+                    if (single) cf.push_back(static_cast<float>(e.second));
+                    else cv.push_back(e.second);
                 }
                 st[i - lo + 1] = static_cast<int64_t>(cc.size());
             }
             cc.shrink_to_fit();
             cv.shrink_to_fit();
+            cf.shrink_to_fit();
             if (old_mut && ch < static_cast<int64_t>(old_mut->col.size())) {
                 std::vector<int64_t>().swap(old_mut->start[ch]);
                 std::vector<int32_t>().swap(old_mut->col[ch]);
                 std::vector<double>().swap(old_mut->val[ch]);
+                if (ch < static_cast<int64_t>(old_mut->val32.size())) std::vector<float>().swap(old_mut->val32[ch]);
             }
         }
     }
@@ -926,15 +1067,19 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
 // The matrix of the one-electron operator sum_pq d_pq E_pq (d symmetric, n x n)
 // in the space: diagonal sum_p d_pp n_p, and the single excitations, found
 // among the determinants sharing the other spin's string.
-template <int W> Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double drop, int threads)
+template <int W>
+Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double drop, int threads, Hamiltonian *old = nullptr,
+                          int64_t n_old = 0)
 {
     sp.build_strings(threads);
     const int64_t n = sp.ctx->n, count = sp.dets.size();
+    if (!old) n_old = 0;
     auto *H = new Hamiltonian;
     H->n = count;
     H->diag.resize(count);
+    if (old) std::copy(old->diag.begin(), old->diag.begin() + n_old, H->diag.begin());
 #pragma omp parallel for schedule(static) num_threads(threads)
-    for (int64_t i = 0; i < count; ++i) {
+    for (int64_t i = n_old; i < count; ++i) {
         double v = 0.0;
         for (int spin = 0; spin < 2; ++spin)
             for (int k = 0; k < W; ++k)
@@ -961,6 +1106,8 @@ template <int W> Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double
             for (int64_t i = lo; i < hi; ++i) {
                 row.clear();
                 const Det<W> &x = sp.dets[i];
+                const bool kept = i < n_old;
+                const int32_t from = static_cast<int32_t>(kept ? n_old : i + 1);
                 auto visit = [&](int32_t j, int spin) {
                     const u64 *xs = x.w + spin * W, *ys = sp.dets[j].w + spin * W;
                     u64 hole[W], part[W];
@@ -975,7 +1122,7 @@ template <int W> Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double
                     if (std::fabs(v) > drop) row.emplace_back(j, v);
                 };
                 auto after = [&](const std::vector<int32_t> &list, int64_t a, int64_t b) {
-                    return std::upper_bound(list.begin() + a, list.begin() + b, static_cast<int32_t>(i)) - list.begin();
+                    return std::lower_bound(list.begin() + a, list.begin() + b, from) - list.begin();
                 };
                 const int32_t a = sp.aid[i], b = sp.bid[i];
                 for (int64_t t = after(sp.amajor, sp.amajor_start[a], sp.amajor_start[a + 1]);
@@ -996,6 +1143,12 @@ template <int W> Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double
                           [](const std::pair<int32_t, double> &u, const std::pair<int32_t, double> &v) {
                               return u.first < v.first;
                           });
+                if (kept) {         // the old row's columns all precede the new ones
+                    const auto &os = old->start[ch];
+                    const int64_t a = os[i - lo], b = os[i - lo + 1];
+                    cc.insert(cc.end(), old->col[ch].begin() + a, old->col[ch].begin() + b);
+                    cv.insert(cv.end(), old->val[ch].begin() + a, old->val[ch].begin() + b);
+                }
                 for (auto &e : row) {
                     cc.push_back(e.first);
                     cv.push_back(e.second);
@@ -1004,6 +1157,11 @@ template <int W> Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double
             }
             cc.shrink_to_fit();
             cv.shrink_to_fit();
+            if (old && ch < static_cast<int64_t>(old->col.size())) {
+                std::vector<int64_t>().swap(old->start[ch]);
+                std::vector<int32_t>().swap(old->col[ch]);
+                std::vector<double>().swap(old->val[ch]);
+            }
         }
     }
     int64_t nnz = 0;
@@ -1640,15 +1798,15 @@ void itercc_sci_diagonal(void *space, double *out, int threads)
     });
 }
 
-void *itercc_sci_hamiltonian(void *space, double drop, int threads)
+void *itercc_sci_hamiltonian(void *space, double drop, int single, int threads)
 {
     auto *s = static_cast<SpaceHandle *>(space);
     return dispatch(s->ctx->words, [&](auto w) -> void * {
-        return hamiltonian_impl(*as_space<decltype(w)::value>(s->space), drop, threads);
+        return hamiltonian_impl(*as_space<decltype(w)::value>(s->space), drop, threads, nullptr, 0, single != 0);
     });
 }
 
-void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old, double drop, int threads)
+void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old, double drop, int single, int threads)
 {
     auto *s = static_cast<SpaceHandle *>(space);
     const auto *H = static_cast<const Hamiltonian *>(old);
@@ -1656,7 +1814,7 @@ void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old,
     return dispatch(s->ctx->words, [&](auto w) -> void * {
         auto &sp = *as_space<decltype(w)::value>(s->space);
         if (n_old > static_cast<int64_t>(sp.dets.size())) return nullptr;
-        return hamiltonian_impl(sp, drop, threads, H, n_old);
+        return hamiltonian_impl(sp, drop, threads, H, n_old, single != 0);
     });
 }
 
@@ -1670,37 +1828,48 @@ void itercc_sci_ham_diagonal(const void *ham, double *out)
     std::copy(H->diag.begin(), H->diag.end(), out);
 }
 
-void itercc_sci_matvec(void *ham, const double *x, double *y, int threads)
+void itercc_sci_matmat(void *ham, int64_t k, const double *x, double *y, int threads)
 {
     auto *H = static_cast<Hamiltonian *>(ham);
-    const int64_t count = H->n;
-#pragma omp parallel num_threads(threads)
-    {
-#pragma omp for schedule(dynamic, 1)
-        for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s) {
-            const int64_t lo = H->stripe[s], hi = H->stripe[s + 1];
-            double *buf = H->buffer.data() + H->offset[s] - lo;      // buf[j] for j >= lo
-            std::fill(buf + lo, buf + count, 0.0);
-            for (int64_t i = lo; i < hi; ++i) {
-                const int64_t ch = i / Hamiltonian::CHUNK, local = i % Hamiltonian::CHUNK;
-                const int64_t *st = H->start[ch].data();
-                const int32_t *col = H->col[ch].data();
-                const double *val = H->val[ch].data();
-                const double xi = x[i];
-                double v = H->diag[i] * xi;
-                for (int64_t t = st[local]; t < st[local + 1]; ++t) {
-                    v += val[t] * x[col[t]];
-                    buf[col[t]] += val[t] * xi;
-                }
-                y[i] = v;
-            }
+    switch (k) {
+    case 1: return H->single ? spmm<float, 1>(*H, H->val32, x, y, threads) : spmm<double, 1>(*H, H->val, x, y, threads);
+    case 2: return H->single ? spmm<float, 2>(*H, H->val32, x, y, threads) : spmm<double, 2>(*H, H->val, x, y, threads);
+    case 3: return H->single ? spmm<float, 3>(*H, H->val32, x, y, threads) : spmm<double, 3>(*H, H->val, x, y, threads);
+    case 4: return H->single ? spmm<float, 4>(*H, H->val32, x, y, threads) : spmm<double, 4>(*H, H->val, x, y, threads);
+    default: {
+        // Larger blocks in groups of up to four columns.
+        const int64_t count = H->n;
+        std::vector<double> xs(count * 4), ys(count * 4);
+        for (int64_t c0 = 0; c0 < k; c0 += 4) {
+            const int64_t m = std::min<int64_t>(4, k - c0);
+            for (int64_t i = 0; i < count; ++i)
+                for (int64_t r = 0; r < m; ++r) xs[i * m + r] = x[i * k + c0 + r];
+            itercc_sci_matmat(ham, m, xs.data(), ys.data(), threads);
+            for (int64_t i = 0; i < count; ++i)
+                for (int64_t r = 0; r < m; ++r) y[i * k + c0 + r] = ys[i * m + r];
         }
-#pragma omp for schedule(static)
-        for (int64_t j = 0; j < count; ++j) {
-            double v = y[j];
-            for (int64_t s = 0; s < Hamiltonian::STRIPES && H->stripe[s] <= j; ++s)
-                v += H->buffer[H->offset[s] + (j - H->stripe[s])];
-            y[j] = v;
+    }
+    }
+}
+
+void itercc_sci_matvec(void *ham, const double *x, double *y, int threads) { itercc_sci_matmat(ham, 1, x, y, threads); }
+
+int64_t itercc_sci_ham_bytes(const void *ham) { return static_cast<const Hamiltonian *>(ham)->bytes(); }
+
+void itercc_sci_ham_dense(const void *ham, double *out)
+{
+    const auto *H = static_cast<const Hamiltonian *>(ham);
+    const int64_t n = H->n;
+    std::fill(out, out + n * n, 0.0);
+    for (int64_t i = 0; i < n; ++i) {
+        out[i * n + i] = H->diag[i];
+        const int64_t ch = i / Hamiltonian::CHUNK, local = i % Hamiltonian::CHUNK;
+        const int64_t *st = H->start[ch].data();
+        const int32_t *col = H->col[ch].data();
+        for (int64_t t = st[local]; t < st[local + 1]; ++t) {
+            const double v = H->single ? static_cast<double>(H->val32[ch][t]) : H->val[ch][t];
+            out[i * n + col[t]] = v;
+            out[col[t] * n + i] = v;
         }
     }
 }
@@ -1788,6 +1957,18 @@ void *itercc_sci_onebody(void *space, const double *d, double drop, int threads)
     });
 }
 
+void *itercc_sci_onebody_extend(void *space, const double *d, void *old, int64_t n_old, double drop, int threads)
+{
+    auto *s = static_cast<SpaceHandle *>(space);
+    auto *H = static_cast<Hamiltonian *>(old);
+    if (!H || H->n != n_old || H->single) return nullptr;
+    return dispatch(s->ctx->words, [&](auto w) -> void * {
+        auto &sp = *as_space<decltype(w)::value>(s->space);
+        if (n_old > static_cast<int64_t>(sp.dets.size())) return nullptr;
+        return onebody_impl(sp, d, drop, threads, H, n_old);
+    });
+}
+
 void *itercc_sci_select_onebody(void *space, const double *d, const double *cmax, double eps, int partners,
                                 int threads)
 {
@@ -1810,6 +1991,69 @@ void itercc_sci_parity(int64_t count, const int64_t *partner, double sign, const
 {
 #pragma omp parallel for schedule(static) num_threads(threads)
     for (int64_t i = 0; i < count; ++i) out[i] = 0.5 * (x[i] + sign * x[partner[i]]);
+}
+
+// Block vectors (n x k, row-major: column r of row i at i * k + r) for the
+// response solver. Column sums use fixed chunks added in order, so they do not
+// depend on the thread count.
+static constexpr int64_t BLOCK_CHUNK = 1 << 14;
+
+void itercc_sci_block_dot(int64_t n, int64_t k, const double *a, const double *b, double *out, int threads)
+{
+    const int64_t chunks = (n + BLOCK_CHUNK - 1) / BLOCK_CHUNK;
+    std::vector<double> part(chunks * k, 0.0);
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t c = 0; c < chunks; ++c) {
+        const int64_t lo = c * BLOCK_CHUNK, hi = std::min(n, lo + BLOCK_CHUNK);
+        double acc[16] = {0.0};
+        for (int64_t i = lo; i < hi; ++i)
+            for (int64_t r = 0; r < k; ++r) acc[r] += a[i * k + r] * b[i * k + r];
+        for (int64_t r = 0; r < k; ++r) part[c * k + r] = acc[r];
+    }
+    for (int64_t r = 0; r < k; ++r) out[r] = 0.0;
+    for (int64_t c = 0; c < chunks; ++c)
+        for (int64_t r = 0; r < k; ++r) out[r] += part[c * k + r];
+}
+
+void itercc_sci_block_axpby(int64_t n, int64_t k, const double *alpha, const double *x, const double *beta, double *y,
+                            int threads)
+{
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t i = 0; i < n; ++i)
+        for (int64_t r = 0; r < k; ++r) y[i * k + r] = alpha[r] * x[i * k + r] + beta[r] * y[i * k + r];
+}
+
+void itercc_sci_block_divide(int64_t n, int64_t k, const double *d, double shift, double floor, const double *x,
+                             double *z, int threads)
+{
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t i = 0; i < n; ++i) {
+        double q = d[i] - shift;
+        if (std::fabs(q) < floor) q = q < 0 ? -floor : floor;
+        const double inv = 1.0 / q;
+        for (int64_t r = 0; r < k; ++r) z[i * k + r] = x[i * k + r] * inv;
+    }
+}
+
+void itercc_sci_block_deflate(int64_t n, int64_t k, const double *c, double *v, int threads)
+{
+    // v[:, r] -= c (c . v[:, r])
+    const int64_t chunks = (n + BLOCK_CHUNK - 1) / BLOCK_CHUNK;
+    std::vector<double> part(chunks * k, 0.0);
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t ch = 0; ch < chunks; ++ch) {
+        const int64_t lo = ch * BLOCK_CHUNK, hi = std::min(n, lo + BLOCK_CHUNK);
+        double acc[16] = {0.0};
+        for (int64_t i = lo; i < hi; ++i)
+            for (int64_t r = 0; r < k; ++r) acc[r] += c[i] * v[i * k + r];
+        for (int64_t r = 0; r < k; ++r) part[ch * k + r] = acc[r];
+    }
+    double dots[16] = {0.0};
+    for (int64_t ch = 0; ch < chunks; ++ch)
+        for (int64_t r = 0; r < k; ++r) dots[r] += part[ch * k + r];
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t i = 0; i < n; ++i)
+        for (int64_t r = 0; r < k; ++r) v[i * k + r] -= c[i] * dots[r];
 }
 
 void itercc_sci_partners(void *space, int64_t *out, int threads)

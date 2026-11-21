@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 43
+#define ITERCC_CORE_ABI 44
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -908,16 +908,23 @@ void itercc_sci_diagonal(void *space, double *out, int threads);
 /* The variational Hamiltonian: diagonal plus the upper triangle (columns
  * increasing) with |H_ij| > drop; nnz counts the upper triangle. The product
  * keeps a buffer of about 32 n doubles (fixed stripes, thread-independent). */
-void *itercc_sci_hamiltonian(void *space, double drop, int threads);
+void *itercc_sci_hamiltonian(void *space, double drop, int single, int threads);
 /* The same for a space whose first n_old determinants are those of `old`
  * (unchanged): only elements involving the others are evaluated, and old's
  * rows are released as they are copied (free `old` afterwards; it is no
  * longer usable). */
-void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old, double drop, int threads);
+void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old, double drop,
+                                    int single, int threads);
 int64_t itercc_sci_ham_nnz(const void *ham);
 void itercc_sci_ham_free(void *ham);
 void itercc_sci_ham_diagonal(const void *ham, double *out);
 void itercc_sci_matvec(void *ham, const double *x, double *y, int threads);
+/* y = H x for k vectors at once (x, y: n x k, row-major), reading H once. */
+void itercc_sci_matmat(void *ham, int64_t k, const double *x, double *y, int threads);
+/* Bytes held by a Hamiltonian handle (rows, values, diagonal, product buffer). */
+int64_t itercc_sci_ham_bytes(const void *ham);
+/* The full symmetric matrix of a (small) Hamiltonian handle, n x n row-major. */
+void itercc_sci_ham_dense(const void *ham, double *out);
 /* Determinants outside the space with |H_ai| cmax_i >= eps for some i of
  * the space (sorted, unique); with partners, also their alpha-beta swaps. */
 void *itercc_sci_select(void *space, const double *cmax, double eps, int partners, int threads);
@@ -955,6 +962,10 @@ void itercc_sci_s2(void *space, const double *coeffs, int64_t nroots, double *ou
 /* The matrix of the one-electron operator sum_pq d_pq E_pq (d: symmetric
  * n x n) in the space, as a Hamiltonian handle (itercc_sci_matvec, _ham_*). */
 void *itercc_sci_onebody(void *space, const double *d, double drop, int threads);
+/* The same for a space whose first n_old determinants are those of `old` (a
+ * one-body handle of that prefix, released as its rows are copied; free it
+ * afterwards). */
+void *itercc_sci_onebody_extend(void *space, const double *d, void *old, int64_t n_old, double drop, int threads);
 /* Determinants outside the space reached from i by one excitation of that
  * operator with |d_pr| cmax_i >= eps (sorted; with partners their swaps). */
 void *itercc_sci_select_onebody(void *space, const double *d, const double *cmax, double eps, int partners,
@@ -962,6 +973,16 @@ void *itercc_sci_select_onebody(void *space, const double *d, const double *cmax
 /* The distinct rows of `candidates` (count rows) that are not in the space (sorted). */
 void *itercc_sci_difference(void *space, const uint64_t *candidates, int64_t count, int threads);
 /* out = (x + sign x[partner]) / 2 (out and x distinct). */
+/* Block vectors n x k (row-major, k <= 16) for the response solver: column
+ * dots (thread-count independent), y = alpha_r x + beta_r y per column,
+ * z = x / (d - shift) per row (denominators floored at +-floor), and
+ * v_r -= c (c . v_r). */
+void itercc_sci_block_dot(int64_t n, int64_t k, const double *a, const double *b, double *out, int threads);
+void itercc_sci_block_axpby(int64_t n, int64_t k, const double *alpha, const double *x, const double *beta, double *y,
+                            int threads);
+void itercc_sci_block_divide(int64_t n, int64_t k, const double *d, double shift, double floor, const double *x,
+                             double *z, int threads);
+void itercc_sci_block_deflate(int64_t n, int64_t k, const double *c, double *v, int threads);
 void itercc_sci_parity(int64_t count, const int64_t *partner, double sign, const double *x, double *out,
                        int threads);
 /* Index of each determinant's alpha-beta swap in the space, or -1. */

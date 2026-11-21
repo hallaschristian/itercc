@@ -79,7 +79,7 @@ def test_pt2_equals_brute_force_and_batches(model):
     index = {bytes(row): i for i, row in enumerate(full)}
     position = np.array([index[bytes(row)] for row in small.determinants])
     space = sci._space(full)
-    ham = sci.kernels.sci_hamiltonian(space, 0.0, 2)
+    ham = sci.kernels.sci_hamiltonian(space, 0.0, 0, 2)
     try:
         diagonal = np.empty(len(full))
         sci.kernels.sci_ham_diagonal(ham, diagonal.ctypes.data)
@@ -123,11 +123,11 @@ def test_extended_hamiltonian_equals_a_fresh_build(model):
     x = rng.normal(size=len(dets))
     products = []
     small = sci._space(dets[:part])
-    first = sci.kernels.sci_hamiltonian(small, 1e-15, 2)
+    first = sci.kernels.sci_hamiltonian(small, 1e-15, 0, 2)
     space = sci._space(dets)
     try:
-        for ham in (sci.kernels.sci_hamiltonian_extend(space, first, part, 1e-15, 2),
-                    sci.kernels.sci_hamiltonian(space, 1e-15, 2)):
+        for ham in (sci.kernels.sci_hamiltonian_extend(space, first, part, 1e-15, 0, 2),
+                    sci.kernels.sci_hamiltonian(space, 1e-15, 0, 2)):
             y = np.empty(len(dets))
             sci.kernels.sci_matvec(ham, x.ctypes.data, y.ctypes.data, 2)
             products.append((y, int(sci.kernels.sci_ham_nnz(ham))))
@@ -138,6 +138,39 @@ def test_extended_hamiltonian_equals_a_fresh_build(model):
         sci.kernels.sci_space_free(space)
     assert products[0][1] == products[1][1]
     np.testing.assert_array_equal(products[0][0], products[1][0])
+
+
+def test_single_precision_and_block_products(model):
+    sci = solver(model)
+    dets = sci.solve(1, spin_parity=1, **LOOSE).determinants
+    n = len(dets)
+    rng = np.random.default_rng(7)
+    block = np.ascontiguousarray(rng.normal(size=(n, 5)))
+    space = sci._space(dets)
+    double = sci.kernels.sci_hamiltonian(space, 1e-15, 0, 3)
+    small = sci._space(dets[:n // 2])
+    half = sci.kernels.sci_hamiltonian(small, 1e-15, 0, 3)
+    single = sci.kernels.sci_hamiltonian_extend(space, half, n // 2, 1e-15, 1, 3)   # double rows -> float
+    try:
+        def product(ham, x):
+            x = np.ascontiguousarray(x)
+            y = np.empty_like(x)
+            k = 1 if x.ndim == 1 else x.shape[1]
+            sci.kernels.sci_matmat(ham, k, x.ctypes.data, y.ctypes.data, 3)
+            return y
+        reference = np.stack([product(double, block[:, r]) for r in range(5)], axis=1)
+        for k in (1, 2, 3, 4, 5):     # one pass for k vectors equals k single products
+            np.testing.assert_array_equal(product(double, block[:, :k]), reference[:, :k])
+        np.testing.assert_allclose(product(single, block), reference, rtol=0, atol=1e-6 * np.abs(reference).max())
+        assert sci.kernels.sci_ham_bytes(single) < sci.kernels.sci_ham_bytes(double)
+    finally:
+        for ham in (double, half, single):
+            sci.kernels.sci_ham_free(ham)
+        sci.kernels.sci_space_free(space)
+        sci.kernels.sci_space_free(small)
+    exact = sci.solve(1, spin_parity=1, **LOOSE).energies[0]
+    fast = solver(model, hamiltonian_precision="single").solve(1, spin_parity=1, **LOOSE).energies[0]
+    assert abs(fast - exact) < 1e-7
 
 
 def test_resume_from_a_checkpoint_reproduces_the_series(model):
@@ -219,6 +252,19 @@ def test_polarizability_full_space_equals_full_ci(model):
         np.testing.assert_allclose(final.dipole_au, moment, atol=1e-9)
     # components of different irreps couple through no state
     assert final.tensors_au[0][0, 1] == 0 and final.tensors_au[0][0, 2] == 0
+
+
+def test_polarizability_series_continues_from_a_space(model):
+    from test_finite_field import symmetric_dipoles
+
+    h, eri, no, constant, labels = model
+    dipoles = symmetric_dipoles(labels, (3, 2, 0))
+    sci = solver(model)
+    first = sci.polarizability(dipoles, epsilons=(3e-2,))[-1]
+    more = sci.polarizability(dipoles, epsilons=(1e-14,), initial=first.space)[-1]
+    np.testing.assert_array_equal(more.space[:first.determinants], first.space)
+    exact, _ = sum_over_states(model, dipoles, 0.0)
+    np.testing.assert_allclose(more.tensors_au[0], exact, atol=1e-7)
 
 
 def test_damped_response_in_a_fixed_space_equals_full_ci(model):

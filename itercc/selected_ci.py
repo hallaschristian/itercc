@@ -36,6 +36,72 @@ from . import _cpu_kernels, _runtime, krylov
 from .response import HC_EH_NM, Polarizability, _shifted_guesses
 
 
+# Spaces from this size store the Hamiltonian's values in single precision
+# (hamiltonian_precision="auto"): a third less memory and memory traffic.
+SINGLE_FROM = 1_000_000
+# Intermediate rounds of the polarizability selection only steer the
+# selection: their ground states and static responses are solved loosely.
+# (Looser steering selects worse response spaces: at 5e-2 the polarizability
+# of a CuF space of 0.9 million determinants fell by 0.05 au.)
+_SELECT_GROUND_TOL = 1e-4
+_SELECT_RESPONSE_TOL = 1e-2
+
+
+# Determinants in the exactly inverted block of the preconditioner.
+BLOCK_PRECONDITIONER = 1500
+
+
+class _BlockPreconditioner:
+    """(H - e)^-1 approximated by the exact inverse on a block of leading
+    determinants (`rows`, by weight in the vectors being solved for) and by
+    the diagonal elsewhere: the leading determinants carry the strong
+    couplings that slow diagonal-preconditioned solvers."""
+
+    def __init__(self, sci, determinants, diagonal, rows):
+        self.diagonal, self.rows = diagonal, np.ascontiguousarray(rows, dtype=np.int64)
+        m = len(self.rows)
+        space = sci._space(np.ascontiguousarray(determinants[self.rows]))
+        try:
+            ham = sci.kernels.sci_hamiltonian(space, 0.0, 0, sci._threads())
+            try:
+                dense = np.empty((m, m))
+                sci.kernels.sci_ham_dense(ham, dense.ctypes.data)
+            finally:
+                sci.kernels.sci_ham_free(ham)
+        finally:
+            sci.kernels.sci_space_free(space)
+        self.values, self.vectors = np.linalg.eigh(dense)
+
+    @classmethod
+    def leading(cls, sci, determinants, diagonal, weights, size=None):
+        """The block of the `size` determinants with the largest weight (max |v| over the given vectors)."""
+        size = BLOCK_PRECONDITIONER if size is None else size
+        n = len(diagonal)
+        if size <= 0 or n == 0:
+            return None
+        if n <= size:
+            rows = np.arange(n)
+        else:
+            rows = np.sort(np.argpartition(-np.asarray(weights), size - 1)[:size])
+        return cls(sci, determinants, diagonal, rows)
+
+    def denominators(self, values, e, positive):
+        d = values - e
+        if positive:
+            return np.maximum(np.abs(d), 1e-3)
+        return np.where(np.abs(d) < 1e-3, np.copysign(1e-3, d), d)
+
+    def apply(self, r, e, positive):
+        """M^-1 r with M = H - e (positive: |H - e|, a positive definite
+        preconditioner) for r of shape (n,) or (n, k)."""
+        d = self.denominators(self.diagonal, e, positive)
+        z = r / (d if r.ndim == 1 else d[:, None])
+        block = self.vectors.T @ r[self.rows]
+        dv = self.denominators(self.values, e, positive)
+        z[self.rows] = self.vectors @ (block / (dv if r.ndim == 1 else dv[:, None]))
+        return z
+
+
 def _address(array):
     return array.ctypes.data if array is not None else None
 
@@ -131,6 +197,7 @@ class SCIPolarizability:
     seconds: float = 0.0
     pt2: float = 0.0                 # zero-field PT2 of the ground state at the stage (0 without PT2)
     space: np.ndarray = None         # the determinants of the space
+    hamiltonian_bytes: int = 0       # compiled Hamiltonian and dipole matrices of the space
 
     @property
     def tensors_au(self):
@@ -143,7 +210,8 @@ class SelectedCI:
     """Selected CI of a real orbital Hamiltonian (h, chemists' eri (pq|rs))
     with `nelec` electrons (an even count with M_S = 0, or (nalpha, nbeta))."""
 
-    def __init__(self, h, eri, nelec, constant=0.0, *, orbital_irreps=None, cutoff=1e-12, cpu_threads=None):
+    def __init__(self, h, eri, nelec, constant=0.0, *, orbital_irreps=None, cutoff=1e-12, cpu_threads=None,
+                 hamiltonian_precision="auto"):
         h = np.ascontiguousarray(h, dtype=np.float64)
         n = h.shape[0]
         if h.shape != (n, n) or not np.allclose(h, h.T, atol=1e-10):
@@ -161,6 +229,9 @@ class SelectedCI:
             raise ValueError("Electron counts must fit the orbitals")
         if nalpha >= 64:
             raise ValueError("At most 63 alpha electrons")
+        if hamiltonian_precision not in ("auto", "single", "double"):
+            raise ValueError('hamiltonian_precision must be "auto", "single" or "double"')
+        self.hamiltonian_precision = hamiltonian_precision
         self._h, self._eri, self._cutoff = h, eri, float(cutoff)
         self._labels_given = orbital_irreps is not None
         self.kernels = _cpu_kernels.library()
@@ -190,6 +261,11 @@ class SelectedCI:
 
     def _threads(self):
         return self.cpu_threads if self.cpu_threads is not None else _runtime.cpu_threads()
+
+    def _single(self, size):
+        """1 when a Hamiltonian of `size` determinants stores single-precision values."""
+        return int(self.hamiltonian_precision == "single"
+                   or (self.hamiltonian_precision == "auto" and size >= SINGLE_FROM))
 
     # ----- determinants -------------------------------------------------------------------
     def determinant(self, alpha, beta):
@@ -342,9 +418,10 @@ class SelectedCI:
     def _hamiltonian(self, space, size):
         threads = self._threads()
         if self._kept is not None and self._kept_n <= size:
-            ham = self.kernels.sci_hamiltonian_extend(space, self._kept, self._kept_n, 1e-15, threads)
+            ham = self.kernels.sci_hamiltonian_extend(space, self._kept, self._kept_n, 1e-15, self._single(size),
+                                                      threads)
         else:
-            ham = self.kernels.sci_hamiltonian(space, 1e-15, threads)
+            ham = self.kernels.sci_hamiltonian(space, 1e-15, self._single(size), threads)
         if self._kept is not None:
             self.kernels.sci_ham_free(self._kept)
             self._kept = None
@@ -358,6 +435,7 @@ class SelectedCI:
         threads = self._threads()
         stages = []
         capped = False
+        fill_from = None
         for eps in epsilons:
             cycles = 0
             seconds = dict(hamiltonian=0.0, davidson=0.0, select=0.0, pt2=0.0)
@@ -372,7 +450,8 @@ class SelectedCI:
                     self._kept, self._kept_n = ham, len(dets)
                     start = time.perf_counter()
                     energies, vectors = self._diagonalize(ham, space, len(dets), nroots, vectors, spin_parity,
-                                                          residual_tol, max_space)
+                                                          residual_tol, max_space, fill_from, dets)
+                    fill_from = None
                     seconds["davidson"] += time.perf_counter() - start
                     start = time.perf_counter()
                     cmax = np.ascontiguousarray(np.max(np.abs(vectors), axis=0))
@@ -425,6 +504,7 @@ class SelectedCI:
                 if done:
                     break
                 dets = np.concatenate([dets, new])
+                fill_from = len(dets) - len(new)
                 vectors = np.concatenate([vectors, np.zeros((nroots, len(new)))], axis=1)
             if capped:
                 break
@@ -440,10 +520,30 @@ class SelectedCI:
         finally:
             self.kernels.sci_buffer_free(buffer)
 
-    def _diagonalize(self, ham, space, size, nroots, previous, spin_parity, residual_tol, max_space):
+    def _first_order(self, ham, vectors, start, diagonal):
+        """`vectors` (roots x size) whose entries from `start` on are new: those
+        get first-order amplitudes (H c)_a / (E - H_aa), E the Rayleigh
+        quotient of the old part, from one pass over H for all roots."""
+        k = len(vectors)
+        block = np.ascontiguousarray(np.asarray(vectors, dtype=np.float64).T)
+        image = np.empty_like(block)
+        self.kernels.sci_matmat(ham, k, block.ctypes.data, image.ctypes.data, self._threads())
+        out = np.array(vectors, dtype=np.float64)
+        for r in range(k):
+            energy = _dot(block[:, r].copy(), image[:, r].copy()) / max(_dot(block[:, r].copy(), block[:, r].copy()),
+                                                                      1e-300)
+            denominator = energy - diagonal[start:]
+            denominator = np.where(np.abs(denominator) < 1e-3, np.copysign(1e-3, denominator), denominator)
+            out[r, start:] = image[start:, r] / denominator
+        return out
+
+    def _diagonalize(self, ham, space, size, nroots, previous, spin_parity, residual_tol, max_space, fill_from=None,
+                     dets=None):
         threads = self._threads()
         diagonal = np.empty(size)
         self.kernels.sci_ham_diagonal(ham, diagonal.ctypes.data)
+        if previous is not None and fill_from is not None and 0 < fill_from < size:
+            previous = self._first_order(ham, previous, fill_from, diagonal)
         if spin_parity is not None:
             partner = np.empty(size, dtype=np.int64)
             self.kernels.sci_partners(space, partner.ctypes.data, threads)
@@ -498,9 +598,21 @@ class SelectedCI:
                 if len(guesses) >= 2 * nroots:
                     break
         space_size = max_space or max(4 * nroots + 4, 24)
+        weights = np.max(np.abs(np.asarray(guesses)), axis=0) if guesses else -diagonal
+        block = (_BlockPreconditioner.leading(self, dets, diagonal, weights) if dets is not None else None)
+
+        def precondition(residual, energy, vector):
+            # Olsen's correction t = M^-1 r - e M^-1 x with x . t = 0, M the block
+            # approximation of H - energy (an exact block alone would return x).
+            u = block.apply(residual, energy, positive=False)
+            w = block.apply(vector, energy, positive=False)
+            ratio = _dot(vector, u) / _dot(vector, w)
+            return -(u - ratio * w)
+
         outcome = krylov.davidson(sigma, diagonal, project, size=size, nroots=nroots, xp=np,
                                   residual_tol=residual_tol, max_iter=200, max_space=space_size,
-                                  guesses=guesses, minimum=-np.inf)
+                                  guesses=guesses, minimum=-np.inf,
+                                  precondition=precondition if block is not None else None)
         if not outcome.converged:
             raise RuntimeError("Davidson did not converge")
         roots = np.array([np.asarray(v).real for v in outcome.vectors])
@@ -554,7 +666,7 @@ class SelectedCI:
     def _perturbed(self, h):
         """A context of the same two-electron Hamiltonian with another h (no labels)."""
         return SelectedCI(h, self._eri, (self.nalpha, self.nbeta), self.constant, cutoff=self._cutoff,
-                          cpu_threads=self.cpu_threads)
+                          cpu_threads=self.cpu_threads, hamiltonian_precision=self.hamiltonian_precision)
 
     def _difference(self, space, candidates):
         """The distinct rows of `candidates` outside the indexed space (compiled)."""
@@ -567,18 +679,21 @@ class SelectedCI:
     @_runtime.threaded
     def polarizability(self, dipoles, wavelengths_nm=(np.inf,), *, damping_Eh=0.0, references=None, spin_parity=1,
                        epsilons=(1e-3, 3e-4, 1e-4), dipole_irreps=None, pt2_epsilon=None, max_determinants=None,
-                       max_cycles=8, new_fraction=0.01, tol=1e-8, spaces=None, callback=None, solve_options=None):
+                       max_cycles=8, new_fraction=0.01, tol=1e-5, ground_tol=1e-6, spaces=None, callback=None,
+                       solve_options=None, initial=None):
         """Dipole polarizabilities of the selected-CI ground state, one
         `SCIPolarizability` per stage (or per given space).
 
         Each stage's space holds the ground state's selected determinants at
         that epsilon and the response determinants: the ground state and the
-        static response vectors x_j (normalized) are solved in the space, and
+        static response vectors x_j (normalized) are solved loosely in the
+        space (they only steer the selection), and
         every determinant a with |<a|mu_j|i> c_i| >= eps or
         |<a|H|i> x_ji| >= eps for some i of the space is added (compiled
         selections), until fewer than `new_fraction` are new (at most
         `max_cycles` rounds); each round extends the previous round's
-        Hamiltonian. In the final space `SelectedCIResponse` gives the
+        Hamiltonian and dipole matrices. In the final space the ground state
+        is solved to Davidson residual `ground_tol` and `SelectedCIResponse` gives the
         tensors at `wavelengths_nm` (inf: static) with `damping_Eh`, as
         `DipoleResponse` does: the exact response of the space's variational
         state, equal to full CI in the full space. `dipoles` are three
@@ -588,7 +703,10 @@ class SelectedCI:
         `solve_options` go to the ground state's `solve` (for example
         `pt2_batches` or `pt2_deterministic` with `pt2_epsilon`: each
         record's `pt2` is then its stage's correction, for extrapolating the
-        tensors against it)."""
+        tensors against it). `initial` (determinants, for example a
+        record's `.space`, or (determinants, ground vector)) continues a
+        series: the ground state's selection starts from that space, which
+        stays the prefix of every later space, with the given `epsilons`."""
         dipoles = _symmetric(dipoles)
         wavelengths = tuple(float(w) for w in np.atleast_1d(wavelengths_nm))
         irreps = self._dipole_irreps(dipoles, dipole_irreps)
@@ -597,9 +715,11 @@ class SelectedCI:
         results = []
 
         def finish(response, start, pt2=0.0):
+            response.refine(ground_tol)
             pols = tuple(response.polarizability(w, damping_Eh=damping_Eh, tol=tol) for w in wavelengths)
             record = SCIPolarizability(response.size, response.energy, response.dipole_au, pols,
-                                       time.perf_counter() - start, float(pt2), response.determinants)
+                                       time.perf_counter() - start, float(pt2), response.determinants,
+                                       response.hamiltonian_bytes)
             results.append(record)
             if callback is not None:
                 callback(record)
@@ -609,13 +729,16 @@ class SelectedCI:
             for dets in spaces:
                 start = time.perf_counter()
                 response = SelectedCIResponse(self, dipoles, dets, spin_parity=spin_parity, dipole_irreps=irreps,
-                                              previous=response)
+                                              previous=response, residual_tol=ground_tol)
                 finish(response, start)
             if response is not None:
                 response.close()
             return results
+        if initial is not None and not isinstance(initial, tuple):
+            initial = (initial, None)
         ground = self.solve(1, references=references, spin_parity=spin_parity, epsilons=epsilons,
-                            pt2_epsilon=pt2_epsilon, max_determinants=max_determinants, **(solve_options or {}))
+                            pt2_epsilon=pt2_epsilon, max_determinants=max_determinants, initial=initial,
+                            **(solve_options or {}))
         union, response = None, None
         try:
             for stage in ground.stages:
@@ -629,8 +752,12 @@ class SelectedCI:
                         break       # the cap ends the series; earlier stages stand
                     union = grown
                 for cycle in range(max_cycles):
+                    guess = None
+                    if response is None:        # the series' final ground vector, on this prefix
+                        guess = ground.vectors[0][:len(union)].copy()
                     response = SelectedCIResponse(self, dipoles, union, spin_parity=spin_parity,
-                                                  dipole_irreps=irreps, previous=response)
+                                                  dipole_irreps=irreps, previous=response, guess=guess,
+                                                  residual_tol=_SELECT_GROUND_TOL)
                     c0 = np.ascontiguousarray(np.abs(response.ground))
                     fresh = []
                     for d in dipoles:
@@ -640,7 +767,7 @@ class SelectedCI:
                         buffer = self.kernels.sci_select_onebody(response._space, d.ctypes.data, c0.ctypes.data,
                                                                  float(stage.epsilon), int(partners), threads)
                         fresh.append(self._take(buffer))
-                    statics = [response.static(j, tol) for j in range(3)]
+                    statics = response.statics(_SELECT_RESPONSE_TOL)
                     xs = [np.abs(x) / np.linalg.norm(x) for x in statics if x is not None and np.linalg.norm(x) > 0]
                     if xs:
                         cmax = np.ascontiguousarray(np.max(xs, axis=0))
@@ -753,11 +880,16 @@ class SelectedCIResponse:
     `polarizability(wavelength_nm, damping_Eh=..., tol=...)` returns a
     `response.Polarizability`: alpha_ij = sum over the space's states n of
     <0|mu_i|n><n|mu_j|0> (1/(E_n - E_0 - w - i g) + 1/(E_n - E_0 + w + i g)),
-    from GMRES solves of (H - E_0 -+ (w + i g)) x = Q mu_j|0> (Q projects out
-    |0>). Solves start from the earlier solutions of the same component
+    from solves of (H - E_0 -+ (w + i g)) x = Q mu_j|0> (Q projects out |0>).
+    Real shifts use block preconditioned conjugate gradients on all
+    components at once (one pass over H per step for all of them; the
+    operator is positive definite below the first excitation); complex
+    shifts, or a real shift above an excitation, use GMRES per component.
+    Solves start from the earlier solutions of the same component
     (`response._shifted_guesses`), so wavelength scans get cheap. With
     `previous` (a response whose space is a prefix of this one) its
-    Hamiltonian is extended instead of rebuilt, and `previous` is closed.
+    Hamiltonian and dipole matrices are extended instead of rebuilt, its
+    solutions start the new solves, and `previous` is closed.
     """
 
     def __init__(self, sci, dipoles, determinants, *, spin_parity=1, dipole_irreps=None, guess=None,
@@ -766,56 +898,52 @@ class SelectedCIResponse:
         threads = sci._threads()
         self.determinants = np.ascontiguousarray(determinants, dtype=np.uint64).reshape(-1, 2 * sci.words)
         self.size = n = len(self.determinants)
-        dipoles = _symmetric(dipoles)
-        self.irreps = sci._dipole_irreps(dipoles, dipole_irreps)
-        self._ham, self._space, self._guesses = None, None, {}
+        self._dipoles = _symmetric(dipoles)
+        self.irreps = sci._dipole_irreps(self._dipoles, dipole_irreps)
+        self._ham, self._space, self._ops, self._guesses = None, None, [None, None, None], {}
         extend = (previous is not None and previous._ham is not None and previous.size <= n
                   and np.array_equal(previous.determinants, self.determinants[:previous.size]))
         carried = {}
         try:
             self._space = sci._space(self.determinants)
+            single = sci._single(n)
             if extend:
                 if guess is None:
                     guess = previous.ground
                 carried = previous._guesses
-                ham = self.kernels.sci_hamiltonian_extend(self._space, previous._ham, previous.size, 1e-15, threads)
+                self._ham = self.kernels.sci_hamiltonian_extend(self._space, previous._ham, previous.size, 1e-15,
+                                                                single, threads)
             else:
-                ham = self.kernels.sci_hamiltonian(self._space, 1e-15, threads)
+                self._ham = self.kernels.sci_hamiltonian(self._space, 1e-15, single, threads)
+            if not self._ham:
+                raise MemoryError("Could not build the Hamiltonian")
+            for j, d in enumerate(self._dipoles):
+                if not np.any(d):
+                    continue
+                d = np.ascontiguousarray(d)
+                old = previous._ops[j] if extend else None
+                if old is not None:
+                    op = self.kernels.sci_onebody_extend(self._space, d.ctypes.data, old, previous.size, 0.0, threads)
+                else:
+                    op = self.kernels.sci_onebody(self._space, d.ctypes.data, 0.0, threads)
+                if not op:
+                    raise MemoryError("Could not build a dipole matrix")
+                self._ops[j] = op
             if previous is not None:
                 previous.close()
-            if not ham:
-                raise MemoryError("Could not build the Hamiltonian")
-            self._ham = ham
-            guess = (np.concatenate([guess, np.zeros(n - len(guess))])[None]
-                     if guess is not None and len(guess) <= n else None)
-            energies, vectors = sci._diagonalize(ham, self._space, n, 1, guess, spin_parity, residual_tol, None)
-            self.energy = float(energies[0])
-            self._e0 = self.energy - sci.constant
-            self.ground = np.ascontiguousarray(vectors[0])
             self._diagonal = np.empty(n)
-            self.kernels.sci_ham_diagonal(ham, self._diagonal.ctypes.data)
+            self.kernels.sci_ham_diagonal(self._ham, self._diagonal.ctypes.data)
             self._partner = None
             if spin_parity is not None:
                 self._partner = np.empty(n, dtype=np.int64)
                 self.kernels.sci_partners(self._space, self._partner.ctypes.data, threads)
-            # Q mu_j |0> from the compiled one-body matrices (released at once).
-            self.sources, moments = [], np.zeros(3)
-            for j, d in enumerate(dipoles):
-                if not np.any(d):
-                    self.sources.append(None)
-                    continue
-                d = np.ascontiguousarray(d)
-                op = self.kernels.sci_onebody(self._space, d.ctypes.data, 0.0, threads)
-                if not op:
-                    raise MemoryError("Could not build a dipole matrix")
-                try:
-                    y = np.empty(n)
-                    self.kernels.sci_matvec(op, self.ground.ctypes.data, y.ctypes.data, threads)
-                finally:
-                    self.kernels.sci_ham_free(op)
-                moments[j] = _dot(self.ground, y)
-                self.sources.append(self._project(y))
-            self.dipole_au = moments
+            fill_from = None
+            if guess is not None and len(guess) <= n:
+                fill_from = len(guess)
+                guess = np.concatenate([guess, np.zeros(n - len(guess))])[None]
+            else:
+                guess = None
+            self._ground_state(guess, residual_tol, fill_from)
         except BaseException:
             self.close()
             raise
@@ -823,13 +951,51 @@ class SelectedCIResponse:
         for key, stored in carried.items():
             self._guesses[key] = [(np.concatenate([x, np.zeros(n - len(x), dtype=x.dtype)]), s) for x, s in stored]
 
+    def _ground_state(self, guess, residual_tol, fill_from=None):
+        sci, threads = self.sci, self.sci._threads()
+        energies, vectors = sci._diagonalize(self._ham, self._space, self.size, 1, guess, self.spin_parity,
+                                             residual_tol, None, fill_from, self.determinants)
+        self.residual_tol = residual_tol
+        self.energy = float(energies[0])
+        self._e0 = self.energy - sci.constant
+        self.ground = np.ascontiguousarray(vectors[0])
+        # Q mu_j |0> from the compiled one-body matrices.
+        self.sources, moments = [], np.zeros(3)
+        for j, op in enumerate(self._ops):
+            if op is None:
+                self.sources.append(None)
+                continue
+            y = np.empty(self.size)
+            self.kernels.sci_matvec(op, self.ground.ctypes.data, y.ctypes.data, threads)
+            moments[j] = _dot(self.ground, y)
+            self.sources.append(self._project(y))
+        self.dipole_au = moments
+
+    def refine(self, residual_tol):
+        """Solve the ground state again to `residual_tol`, from the current
+        one (when tighter than its current tolerance), and update the
+        dipole sources; earlier response solutions stay as starting points."""
+        if residual_tol < self.residual_tol:
+            self._ground_state(self.ground[None], residual_tol)
+
+    @property
+    def hamiltonian_bytes(self):
+        """Bytes held by the compiled Hamiltonian and dipole matrices."""
+        handles = [h for h in (self._ham, *self._ops) if h is not None]
+        return int(sum(self.kernels.sci_ham_bytes(h) for h in handles))
+
     def close(self):
-        """Release the compiled Hamiltonian and space."""
+        """Release the compiled Hamiltonian, dipole matrices and space."""
+        kernels = getattr(self, "kernels", None)
         if getattr(self, "_ham", None) is not None:
-            self.kernels.sci_ham_free(self._ham)
+            kernels.sci_ham_free(self._ham)
             self._ham = None
+        for j, op in enumerate(getattr(self, "_ops", ())):
+            if op is not None:
+                kernels.sci_ham_free(op)
+                self._ops[j] = None
         if getattr(self, "_space", None) is not None:
-            self.kernels.sci_space_free(self._space)
+            kernels.sci_space_free(self._space)
             self._space = None
 
     def __del__(self):
@@ -857,15 +1023,23 @@ class SelectedCIResponse:
         self.kernels.sci_matvec(self._ham, v.ctypes.data, out.ctypes.data, self.sci._threads())
         return out
 
-    def _solve(self, j, shift, tol, restart, maxiter):
+    def _initial(self, j, rhs, shift):
+        stored = self._guesses.get((j, np.iscomplexobj(np.asarray(shift))), [])
+        if not stored:
+            return None
+        initial, _ = _shifted_guesses(rhs, shift, stored, np)
+        return initial
+
+    def _store(self, j, x, shift):
+        stored = self._guesses.setdefault((j, np.iscomplexobj(np.asarray(shift))), [])
+        stored.append((x, shift))
+        del stored[:-4]
+
+    def _gmres(self, j, shift, tol, restart, maxiter):
         rhs = self.sources[j]
         if np.iscomplexobj(np.asarray(shift)):
             rhs = rhs.astype(np.complex128)
-        key = (j, np.iscomplexobj(np.asarray(shift)))
-        stored = self._guesses.setdefault(key, [])
-        initial = None
-        if stored:
-            initial, _ = _shifted_guesses(rhs, shift, stored, np)
+        initial = self._initial(j, rhs, shift)
 
         def action(v):
             v = self._project(v)
@@ -881,33 +1055,144 @@ class SelectedCIResponse:
         x, residual, steps = krylov.gmres(action, rhs, precondition, np, tol=tol, restart=restart, maxiter=maxiter,
                                           initial=initial)
         x = self._project(x)
-        stored.append((x, shift))
-        del stored[:-4]
-        return x, dict(component=j, shift=complex(shift), relative_residual=float(residual), steps=int(steps))
+        self._store(j, x, shift)
+        r = rhs - action(x)
+        return x, dict(component=j, shift=complex(shift), relative_residual=float(residual), steps=int(steps),
+                       method="gmres"), r
+
+    def _pcg(self, js, shift, tol, maxiter):
+        """Block preconditioned conjugate gradients for the components `js`
+        at a real shift: {j: (x, report)}, or None when the operator is not
+        positive definite there (an excitation below the shift)."""
+        K, threads = self.kernels, self.sci._threads()
+        n, k = self.size, len(js)
+        e = self._e0 + float(shift)
+        ones, minus_ones = np.ones(k), -np.ones(k)
+        B = np.ascontiguousarray(np.stack([self.sources[j] for j in js], axis=1))
+        X = np.zeros((n, k))
+        for c, j in enumerate(js):
+            guess = self._initial(j, self.sources[j], float(shift))
+            if guess is not None:
+                X[:, c] = guess
+        # |d - e| floored: a positive diagonal preconditioner, with the exact
+        # (absolute) inverse on the leading determinants of the sources and
+        # of the starting vectors.
+        precondition = np.maximum(np.abs(self._diagonal - e), 1e-3)
+        weights = np.zeros(n)
+        for c in range(k):
+            for v in (B[:, c], X[:, c]):
+                top = np.max(np.abs(v))
+                if top > 0:
+                    weights = np.maximum(weights, np.abs(v) / top)
+        block = _BlockPreconditioner.leading(self.sci, self.determinants, self._diagonal, weights)
+
+        def dot(a, b):
+            out = np.empty(k)
+            K.sci_block_dot(n, k, a.ctypes.data, b.ctypes.data, out.ctypes.data, threads)
+            return out
+
+        def axpby(alpha, x, beta, y):
+            K.sci_block_axpby(n, k, np.ascontiguousarray(alpha, dtype=np.float64).ctypes.data, x.ctypes.data,
+                              np.ascontiguousarray(beta, dtype=np.float64).ctypes.data, y.ctypes.data, threads)
+
+        def apply(v, out):              # out = Q (H - e) v
+            K.sci_matmat(self._ham, k, v.ctypes.data, out.ctypes.data, threads)
+            axpby(np.full(k, -e), v, ones, out)
+            K.sci_block_deflate(n, k, self.ground.ctypes.data, out.ctypes.data, threads)
+
+        def precondition_into(r, z):    # z = Q M^-1 r
+            K.sci_block_divide(n, k, precondition.ctypes.data, 0.0, 1e-3, r.ctypes.data, z.ctypes.data, threads)
+            if block is not None:
+                dv = block.denominators(block.values, e, True)
+                z[block.rows] = block.vectors @ ((block.vectors.T @ r[block.rows]) / dv[:, None])
+            K.sci_block_deflate(n, k, self.ground.ctypes.data, z.ctypes.data, threads)
+
+        K.sci_block_deflate(n, k, self.ground.ctypes.data, X.ctypes.data, threads)
+        b_norm = np.sqrt(dot(B, B))
+        b_norm[b_norm == 0] = 1.0
+        Q = np.empty_like(X)
+        apply(X, Q)
+        R = B.copy()
+        axpby(minus_ones, Q, ones, R)
+        if np.any(np.sqrt(dot(R, R)) > b_norm):     # a poor guess: start from zero
+            X[:] = 0.0
+            R = B.copy()
+        Z = np.empty_like(X)
+        precondition_into(R, Z)
+        P = Z.copy()
+        rz = dot(R, Z)
+        steps = 0
+        while True:
+            relative = np.sqrt(np.maximum(dot(R, R), 0.0)) / b_norm
+            active = relative > 0.8 * tol
+            if not active.any() or steps >= maxiter:
+                break
+            apply(P, Q)
+            steps += 1
+            pq = dot(P, Q)
+            if np.any(pq[active] <= 0):
+                return None
+            alpha = np.where(active, rz / np.where(pq != 0, pq, 1.0), 0.0)
+            axpby(alpha, P, ones, X)
+            axpby(-alpha, Q, ones, R)
+            precondition_into(R, Z)
+            rz_new = dot(R, Z)
+            beta = np.where(active, rz_new / np.where(rz != 0, rz, 1.0), 0.0)
+            rz = np.where(active, rz_new, rz)
+            axpby(ones, Z, beta, P)
+        # True residuals of the final block.
+        apply(X, Q)
+        R = B.copy()
+        axpby(minus_ones, Q, ones, R)
+        relative = np.sqrt(np.maximum(dot(R, R), 0.0)) / b_norm
+        out = {}
+        for c, j in enumerate(js):
+            x = self._project(np.ascontiguousarray(X[:, c]))
+            self._store(j, x, float(shift))
+            out[j] = (x, dict(component=j, shift=complex(shift), relative_residual=float(relative[c]),
+                              steps=int(steps), method="pcg"), np.ascontiguousarray(R[:, c]))
+        return out
+
+    def _solve_many(self, shift, tol, restart, maxiter, components=None):
+        """{j: (x, report, residual)} for every nonzero component (or `components`)."""
+        js = [j for j in (range(3) if components is None else components) if self.sources[j] is not None]
+        if not js:
+            return {}
+        if not np.iscomplexobj(np.asarray(shift)):
+            found = self._pcg(js, shift, tol, maxiter)
+            if found is not None:
+                return found
+        return {j: self._gmres(j, shift, tol, restart, maxiter) for j in js}
+
+    def statics(self, tol=1e-8, maxiter=1000):
+        """The static response vectors (H - E_0)^-1 Q mu_j|0>, j = 0..2 (None for a zero component)."""
+        found = self._solve_many(0.0, tol, 40, maxiter)
+        return [found[j][0] if j in found else None for j in range(3)]
 
     def static(self, j, tol=1e-8, restart=40, maxiter=1000):
-        """The static response vector (H - E_0)^-1 Q mu_j|0> (None for a zero component)."""
+        """The static response vector of component j (None for a zero component)."""
         if self.sources[j] is None:
             return None
-        return self._solve(j, 0.0, tol, restart, maxiter)[0]
+        return self._solve_many(0.0, tol, restart, maxiter, components=[j])[j][0]
 
     def field_screen(self, field_au, tol=1e-6):
         """|c_0| + F max_j |x_j|: a bound on the magnitudes of the states in
         uniform fields up to F (first order: c(F) = c_0 - F x_j), the fixed
         PT2 screening for `SelectedCI.field_solver_factory(pt2_screen=)`."""
         screen = np.abs(self.ground)
-        for j in range(3):
-            x = self.static(j, tol)
+        for x in self.statics(tol):
             if x is not None:
                 screen = np.maximum(screen, np.abs(self.ground) + float(field_au) * np.abs(x))
         return screen
 
-    def polarizability(self, wavelength_nm, *, damping_Eh=0.0, tol=1e-8, restart=40, maxiter=1000, callback=None,
+    def polarizability(self, wavelength_nm, *, damping_Eh=0.0, tol=1e-5, restart=40, maxiter=1000, callback=None,
                        reuse_guesses=True):
         """The Cartesian electronic tensor in au (complex), as
         `DipoleResponse.polarizability`; use +inf for static. Solves stop at
         relative residual `tol` (their reports are the result's `solves`);
-        `reuse_guesses=False` starts them cold."""
+        the tensor is the stationary (Hylleraas) form b_i.x_j + x_i.r_j per
+        sign of the shift, r_j the residual of x_j, so its error is second
+        order in the solve error. `reuse_guesses=False` starts them cold."""
         wavelength_nm, damping_Eh = float(wavelength_nm), float(damping_Eh)
         if not wavelength_nm > 0 or not np.isfinite(damping_Eh) or damping_Eh < 0 or not 0 < tol < 1:
             raise ValueError("Invalid wavelength, damping or tolerance")
@@ -915,28 +1200,21 @@ class SelectedCIResponse:
             self._guesses.clear()
         frequency = HC_EH_NM / wavelength_nm
         shift = frequency if damping_Eh == 0 else complex(frequency, damping_Eh)
-        reports = []
-        plus, minus = [None] * 3, [None] * 3
-        for j in range(3):
-            if self.sources[j] is None:
-                continue
-            for sign, store in ((1, plus), (-1, minus)):
-                if sign == -1 and shift == 0:
-                    minus[j] = plus[j]
-                    continue
-                x, report = self._solve(j, sign * shift, tol, restart, maxiter)
-                store[j] = x
-                reports.append(report)
-                if callback is not None:
-                    callback(report)
+        plus = self._solve_many(shift, tol, restart, maxiter)
+        minus = plus if shift == 0 else self._solve_many(-shift, tol, restart, maxiter)
+        reports = [r for j in sorted(plus) for r in ((plus[j][1],) if shift == 0 else (plus[j][1], minus[j][1]))]
+        if callback is not None:
+            for report in reports:
+                callback(report)
         tensor = np.zeros((3, 3), dtype=np.complex128)
         for i in range(3):
             for j in range(3):
-                if self.sources[i] is None or self.sources[j] is None:
+                if i not in plus or j not in plus:
                     continue
                 if self.irreps is not None and self.irreps[i] != self.irreps[j]:
                     continue
-                tensor[i, j] = np.dot(self.sources[i], plus[j]) + np.dot(self.sources[i], minus[j])
+                tensor[i, j] = sum(np.dot(self.sources[i], side[j][0]) + np.dot(side[i][0], side[j][2])
+                                   for side in (plus, minus))
         tensor = 0.5 * (tensor + tensor.T)
         return Polarizability(wavelength_nm, frequency, damping_Eh, tensor, tuple(reports))
 

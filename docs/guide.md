@@ -413,6 +413,12 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   5.272 in 50 s on 12 cores. `sci.field_solver_factory(space)` runs the
   finite-field route (`finite_field_polarizability`) in a fixed space; it
   matches the linear response there to 2e-6 au.
+- Large spaces: from a million determinants the Hamiltonian stores
+  single-precision values (`hamiltonian_precision="auto"`; "double" or
+  "single" force one), a third less memory at about 1e-8 Eh. The response
+  solves x and z together by block conjugate gradients and returns the
+  stationary tensor, so the default `tol=1e-5` is accurate to about 1e-5
+  au; `SelectedCIResponse.hamiltonian_bytes` reports the matrix memory.
 - The variational polarizability of a truncated space is a lower bound
   that converges slowly in diffuse bases (CuF aug-cc-pVDZ-DK: 15.7, 17.1,
   18.3 au at 0.35, 0.69, 1.68 million determinants, CCSDT 23.1).

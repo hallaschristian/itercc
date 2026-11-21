@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 43
+CORE_ABI = 44
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -123,12 +123,15 @@ CPU_FUNCTIONS = {
     "sci_space": ([_P, _P, _I, _T], _P),
     "sci_space_free": ([_P], None),
     "sci_diagonal": ([_P, _P, _T], None),
-    "sci_hamiltonian": ([_P, _D, _T], _P),
-    "sci_hamiltonian_extend": ([_P, _P, _I, _D, _T], _P),
+    "sci_hamiltonian": ([_P, _D, _T, _T], _P),
+    "sci_hamiltonian_extend": ([_P, _P, _I, _D, _T, _T], _P),
     "sci_ham_nnz": ([_P], _I),
     "sci_ham_free": ([_P], None),
     "sci_ham_diagonal": ([_P, _P], None),
     "sci_matvec": ([_P, _P, _P, _T], None),
+    "sci_matmat": ([_P, _I, _P, _P, _T], None),
+    "sci_ham_bytes": ([_P], _I),
+    "sci_ham_dense": ([_P, _P], None),
     "sci_select": ([_P, _P, _D, _T, _T], _P),
     "sci_buffer_rows": ([_P], _I),
     "sci_buffer_copy": ([_P, _P], None),
@@ -140,9 +143,14 @@ CPU_FUNCTIONS = {
     "sci_s2": ([_P, _P, _I, _P, _T], None),
     "sci_partners": ([_P, _P, _T], None),
     "sci_onebody": ([_P, _P, _D, _T], _P),
+    "sci_onebody_extend": ([_P, _P, _P, _I, _D, _T], _P),
     "sci_select_onebody": ([_P, _P, _P, _D, _T, _T], _P),
     "sci_difference": ([_P, _P, _I, _T], _P),
     "sci_parity": ([_I, _P, _D, _P, _P, _T], None),
+    "sci_block_dot": ([_I, _I, _P, _P, _P, _T], None),
+    "sci_block_axpby": ([_I, _I, _P, _P, _P, _P, _T], None),
+    "sci_block_divide": ([_I, _I, _P, _D, _D, _P, _P, _T], None),
+    "sci_block_deflate": ([_I, _I, _P, _P, _T], None),
 }
 
 

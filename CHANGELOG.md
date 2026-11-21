@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Faster selected CI (core ABI 44). Spaces from a million determinants keep
+  the Hamiltonian's values in single precision (`hamiltonian_precision=
+  "auto"`; products accumulate in double, about 1e-8 Eh in energies): a
+  third less memory and 1.3x faster products. `itercc_sci_matmat` applies
+  H to several vectors in one pass. The response solves all components
+  together by block preconditioned conjugate gradients (GMRES only for
+  complex shifts or above an excitation) and returns the stationary
+  (Hylleraas) tensor, so `tol` defaults to 1e-5 with errors of 1e-5 au;
+  intermediate selection rounds solve loosely (they only steer), dipole
+  matrices are extended with the space (`itercc_sci_onebody_extend`), new
+  determinants start Davidson from first-order amplitudes, and Davidson and
+  the response solves invert a block of the 1500 leading determinants
+  exactly (Olsen's correction in Davidson). Opposite-spin doubles in the
+  Hamiltonian build are found by a galloping merge of each alpha group's
+  beta-sorted copy with the beta singles (build 17% faster, identical
+  matrices). A CuF aug-cc-pVDZ-DK polarizability series to 1.8 million
+  determinants: 386 -> 161 s on 12 cores, the same tensors to 0.002 au.
+  `SelectedCI.polarizability(initial=)` continues a series from a space;
+  `SelectedCIResponse.statics`, `.refine`, `.hamiltonian_bytes`.
+
 - `SelectedCI.polarizability`: static and dynamic dipole polarizabilities
   of the selected-CI ground state by linear response in a selected space.
   Each stage grows the space with the determinants coupled to the ground
