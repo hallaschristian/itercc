@@ -28,7 +28,8 @@ def _ao_pair_matrix(ao_eri, nao, library, threads):
         if ao_eri.size != npair * (npair + 1) // 2:
             raise ValueError("8-fold packed AO integrals of the wrong size")
         s4 = np.empty((npair, npair))
-        library.unpack_s8_s4(np.ascontiguousarray(ao_eri).ctypes.data, npair, s4.ctypes.data, threads)
+        ao_eri = np.ascontiguousarray(ao_eri)          # held while the kernel reads it
+        library.unpack_s8_s4(ao_eri.ctypes.data, npair, s4.ctypes.data, threads)
         return s4
     if ao_eri.shape == (npair, npair):
         return np.ascontiguousarray(ao_eri)

@@ -6,7 +6,8 @@ import pytest
 
 from itercc import Hamiltonian
 from itercc._cpu_kernels import library
-from itercc.selected_ci import SelectedCI, extrapolate_gap, rotate_integrals
+from itercc.response import HC_EH_NM
+from itercc.selected_ci import SelectedCI, SelectedCIResponse, extrapolate_gap, rotate_integrals
 from test_quadruples import LABELS, symmetric_model
 from test_tensor_oracle import determinant_problem
 
@@ -191,7 +192,7 @@ def test_extrapolation_approaches_full_ci(model):
 
 
 def sum_over_states(model, dipoles, frequency):
-    """Full-CI alpha_ij(w) and <0|mu|0> from the oracle's eigenstates."""
+    """Full-CI alpha_ij(z) and <0|mu|0> from the oracle's eigenstates (z = w + i gamma)."""
     h, eri, no, constant, labels = model
     matrix, _ = determinant_problem(Hamiltonian.restricted(h, eri, no, constant), no, no)
     energies, states = np.linalg.eigh(matrix)
@@ -208,15 +209,46 @@ def test_polarizability_full_space_equals_full_ci(model):
     h, eri, no, constant, labels = model
     dipoles = symmetric_dipoles(labels, (3, 2, 0))
     sci = solver(model)
-    results = sci.polarizability(dipoles, frequencies=(0.0, 0.05), epsilons=(1e-2, 1e-14), tol=1e-11)
+    results = sci.polarizability(dipoles, (np.inf, HC_EH_NM / 0.05), epsilons=(1e-2, 1e-14), tol=1e-11)
     final = results[-1]
     assert results[0].determinants < final.determinants
     for k, w in enumerate((0.0, 0.05)):
         exact, moment = sum_over_states(model, dipoles, w)
+        assert final.polarizabilities[k].frequency_Eh == pytest.approx(w)
         np.testing.assert_allclose(final.tensors_au[k], exact, atol=1e-8)
         np.testing.assert_allclose(final.dipole_au, moment, atol=1e-9)
     # components of different irreps couple through no state
     assert final.tensors_au[0][0, 1] == 0 and final.tensors_au[0][0, 2] == 0
+
+
+def test_damped_response_in_a_fixed_space_equals_full_ci(model):
+    from test_finite_field import symmetric_dipoles
+
+    h, eri, no, constant, labels = model
+    dipoles = symmetric_dipoles(labels, (3, 2, 0))
+    sci = solver(model)
+    # the full space of the irreps the dipoles reach from the ground state
+    full = sci.polarizability(dipoles, epsilons=(1e-14,))[-1].space
+    response = SelectedCIResponse(sci, dipoles, full, spin_parity=1, residual_tol=1e-11)
+    try:
+        for w, gamma in ((0.3, 0.02), (0.0, 0.01)):
+            exact, _ = sum_over_states(model, dipoles, complex(w, gamma))
+            found = response.polarizability(HC_EH_NM / w if w else np.inf, damping_Eh=gamma, tol=1e-11)
+            np.testing.assert_allclose(found.tensor_au, exact, atol=1e-8)
+            assert all(r["relative_residual"] <= 1e-11 for r in found.solves)
+        # a second space with the first as its prefix extends its Hamiltonian
+        small = sci.polarizability(dipoles, epsilons=(3e-2,))[0].space
+        first = SelectedCIResponse(sci, dipoles, small, spin_parity=1)
+        rest = full[~np.isin(full.view([("w", np.uint64, (full.shape[1],))]).ravel(),
+                             small.view([("w", np.uint64, (small.shape[1],))]).ravel())]
+        grown = SelectedCIResponse(sci, dipoles, np.concatenate([small, rest]), spin_parity=1, previous=first,
+                                   residual_tol=1e-11)
+        assert first._ham is None
+        exact, _ = sum_over_states(model, dipoles, 0.0)
+        np.testing.assert_allclose(grown.polarizability(np.inf, tol=1e-11).tensor_au.real, exact, atol=1e-8)
+        grown.close()
+    finally:
+        response.close()
 
 
 def test_fixed_space_finite_field_matches_linear_response(model):
@@ -231,6 +263,24 @@ def test_fixed_space_finite_field_matches_linear_response(model):
     found = finite_field_polarizability(sci.field_solver_factory(space, residual_tol=1e-11), h, dipoles,
                                         orbital_irreps=labels, fields=(1e-3, 2e-3))
     np.testing.assert_allclose(found.tensor_au, response.tensors_au[0], atol=2e-6)
+    # E_var + E_PT2 at each field: the space's PT2-corrected tensor, several times closer to full CI
+    corrected = finite_field_polarizability(sci.field_solver_factory(space, residual_tol=1e-11, pt2_epsilon=0.0),
+                                            h, dipoles, orbital_irreps=labels, fields=(1e-3, 2e-3),
+                                            components=("xx", "zz"))
+    exact, _ = sum_over_states(model, dipoles, 0.0)
+    for k in (0, 2):
+        assert abs(corrected.tensor_au[k, k] - exact[k, k]) < 0.25 * abs(response.tensors_au[0][k, k] - exact[k, k])
+    # screened PT2 (pt2_epsilon > 0): a fixed screen keeps the same terms at every field, so
+    # the centered second differences at two strengths agree (the field-following screen jumps)
+    from itercc.selected_ci import SelectedCIResponse
+    fixed = SelectedCIResponse(sci, dipoles, space, spin_parity=1)
+    screen = fixed.field_screen(4e-3)
+    fixed.close()
+    smooth = finite_field_polarizability(
+        sci.field_solver_factory(space, residual_tol=1e-11, pt2_epsilon=2e-3, pt2_screen=screen), h, dipoles,
+        orbital_irreps=labels, fields=(2e-3, 4e-3), components=("xx", "zz"))
+    for k in (0, 2):
+        assert abs(smooth.centered_au[0][k, k] - smooth.centered_au[1][k, k]) < 1e-4
 
 
 def test_water_against_pyscf_full_ci():

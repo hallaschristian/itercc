@@ -933,6 +933,13 @@ void itercc_sci_buffer_free(void *buffer);
  * each state, for the renormalized correction E2 / (1 + norm). */
 void itercc_sci_pt2(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
                     int64_t batches, double *out, double *norm, int64_t *stats, int threads);
+/* The same with the terms H_ai c_i kept by |H_ai| screen_i >= eps for a
+ * given screen (count entries) instead of max_k |c_ik|: the doubles kept do
+ * not depend on the coefficients, so E2 varies smoothly with them (finite
+ * fields). */
+void itercc_sci_pt2_screened(void *space, const double *coeffs, int64_t nroots, const double *energies,
+                             const double *screen, double eps, int64_t batches, double *out, double *norm,
+                             int64_t *stats, int threads);
 /* Semistochastic remainder E2[eps] - E2[eps_det] (eps < eps_det): nbatches
  * batches of `samples` determinants drawn with p_i ~ max_k |c_ik| (seeded,
  * reproducible); mean and standard error per state; stats[0]: external
@@ -945,6 +952,18 @@ void itercc_sci_rdm1(void *space, const double *coeffs, int64_t nroots, const do
                      int threads);
 /* <S^2> of each state (M_S = 0 spaces). */
 void itercc_sci_s2(void *space, const double *coeffs, int64_t nroots, double *out, int threads);
+/* The matrix of the one-electron operator sum_pq d_pq E_pq (d: symmetric
+ * n x n) in the space, as a Hamiltonian handle (itercc_sci_matvec, _ham_*). */
+void *itercc_sci_onebody(void *space, const double *d, double drop, int threads);
+/* Determinants outside the space reached from i by one excitation of that
+ * operator with |d_pr| cmax_i >= eps (sorted; with partners their swaps). */
+void *itercc_sci_select_onebody(void *space, const double *d, const double *cmax, double eps, int partners,
+                                int threads);
+/* The distinct rows of `candidates` (count rows) that are not in the space (sorted). */
+void *itercc_sci_difference(void *space, const uint64_t *candidates, int64_t count, int threads);
+/* out = (x + sign x[partner]) / 2 (out and x distinct). */
+void itercc_sci_parity(int64_t count, const int64_t *partner, double sign, const double *x, double *out,
+                       int threads);
 /* Index of each determinant's alpha-beta swap in the space, or -1. */
 void itercc_sci_partners(void *space, int64_t *out, int threads);
 

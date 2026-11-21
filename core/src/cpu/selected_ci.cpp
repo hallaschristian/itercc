@@ -808,6 +808,23 @@ struct Buffer {
 
 template <int W> Space<W> *as_space(void *p) { return static_cast<Space<W> *>(static_cast<SpaceBase *>(p)); }
 
+// Stripes of about equal rows plus nonzeros for the product, and their buffers.
+void finish_stripes(Hamiltonian &H)
+{
+    const int64_t count = H.n;
+    H.stripe.assign(Hamiltonian::STRIPES + 1, count);
+    H.stripe[0] = 0;
+    int64_t i = 0, cumulative = 0;          // nonzeros of rows before i
+    for (int64_t s = 1; s < Hamiltonian::STRIPES; ++s) {
+        const int64_t goal = (H.nnz + count) * s / Hamiltonian::STRIPES;
+        while (i < count && cumulative + i < goal) cumulative += H.row_length(i++);
+        H.stripe[s] = i;
+    }
+    H.offset.assign(Hamiltonian::STRIPES + 1, 0);
+    for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s) H.offset[s + 1] = H.offset[s] + (count - H.stripe[s]);
+    H.buffer.assign(H.offset[Hamiltonian::STRIPES], 0.0);
+}
+
 template <int W> void diagonal_impl(Space<W> &sp, double *out, int threads)
 {
     const Ctx &c = *sp.ctx;
@@ -902,21 +919,192 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
     int64_t nnz = 0;
     for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->col[ch].size();
     H->nnz = nnz;
-    H->stripe.assign(Hamiltonian::STRIPES + 1, count);
-    H->stripe[0] = 0;
+    finish_stripes(*H);
+    return H;
+}
+
+// The matrix of the one-electron operator sum_pq d_pq E_pq (d symmetric, n x n)
+// in the space: diagonal sum_p d_pp n_p, and the single excitations, found
+// among the determinants sharing the other spin's string.
+template <int W> Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double drop, int threads)
+{
+    sp.build_strings(threads);
+    const int64_t n = sp.ctx->n, count = sp.dets.size();
+    auto *H = new Hamiltonian;
+    H->n = count;
+    H->diag.resize(count);
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t i = 0; i < count; ++i) {
+        double v = 0.0;
+        for (int spin = 0; spin < 2; ++spin)
+            for (int k = 0; k < W; ++k)
+                for (u64 bits = sp.dets[i].w[spin * W + k]; bits; bits &= bits - 1) {
+                    const int p = (k << 6) + lowest(bits);
+                    v += d[p * n + p];
+                }
+        H->diag[i] = v;
+    }
+    const int64_t chunk = Hamiltonian::CHUNK, nchunks = (count + chunk - 1) / chunk;
+    H->start.resize(nchunks);
+    H->col.resize(nchunks);
+    H->val.resize(nchunks);
+#pragma omp parallel num_threads(threads)
     {
-        int64_t i = 0, cumulative = 0;          // nonzeros of rows before i
-        for (int64_t s = 1; s < Hamiltonian::STRIPES; ++s) {
-            const int64_t goal = (nnz + count) * s / Hamiltonian::STRIPES;
-            while (i < count && cumulative + i < goal) cumulative += H->row_length(i++);
-            H->stripe[s] = i;
+        std::vector<std::pair<int32_t, double>> row;
+#pragma omp for schedule(dynamic, 1)
+        for (int64_t ch = 0; ch < nchunks; ++ch) {
+            const int64_t lo = ch * chunk, hi = std::min(count, lo + chunk);
+            auto &st = H->start[ch];
+            auto &cc = H->col[ch];
+            auto &cv = H->val[ch];
+            st.assign(hi - lo + 1, 0);
+            for (int64_t i = lo; i < hi; ++i) {
+                row.clear();
+                const Det<W> &x = sp.dets[i];
+                auto visit = [&](int32_t j, int spin) {
+                    const u64 *xs = x.w + spin * W, *ys = sp.dets[j].w + spin * W;
+                    u64 hole[W], part[W];
+                    for (int k = 0; k < W; ++k) {
+                        hole[k] = xs[k] & ~ys[k];
+                        part[k] = ys[k] & ~xs[k];
+                    }
+                    int pp = 0, rr = 0;
+                    set_bits<W>(hole, &pp, 1);
+                    set_bits<W>(part, &rr, 1);
+                    const double v = phase<W>(xs, pp, rr) * d[pp * n + rr];
+                    if (std::fabs(v) > drop) row.emplace_back(j, v);
+                };
+                auto after = [&](const std::vector<int32_t> &list, int64_t a, int64_t b) {
+                    return std::upper_bound(list.begin() + a, list.begin() + b, static_cast<int32_t>(i)) - list.begin();
+                };
+                const int32_t a = sp.aid[i], b = sp.bid[i];
+                for (int64_t t = after(sp.amajor, sp.amajor_start[a], sp.amajor_start[a + 1]);
+                     t < sp.amajor_start[a + 1]; ++t) {
+                    const int32_t j = sp.amajor[t];
+                    int dd = 0;
+                    for (int k = 0; k < W; ++k) dd += popc(x.b()[k] ^ sp.dets[j].b()[k]);
+                    if (dd == 2) visit(j, 1);
+                }
+                for (int64_t t = after(sp.bmajor, sp.bmajor_start[b], sp.bmajor_start[b + 1]);
+                     t < sp.bmajor_start[b + 1]; ++t) {
+                    const int32_t j = sp.bmajor[t];
+                    int dd = 0;
+                    for (int k = 0; k < W; ++k) dd += popc(x.a()[k] ^ sp.dets[j].a()[k]);
+                    if (dd == 2) visit(j, 0);
+                }
+                std::sort(row.begin(), row.end(),
+                          [](const std::pair<int32_t, double> &u, const std::pair<int32_t, double> &v) {
+                              return u.first < v.first;
+                          });
+                for (auto &e : row) {
+                    cc.push_back(e.first);
+                    cv.push_back(e.second);
+                }
+                st[i - lo + 1] = static_cast<int64_t>(cc.size());
+            }
+            cc.shrink_to_fit();
+            cv.shrink_to_fit();
         }
     }
-    H->offset.assign(Hamiltonian::STRIPES + 1, 0);
-    for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s)
-        H->offset[s + 1] = H->offset[s] + (count - H->stripe[s]);
-    H->buffer.assign(H->offset[Hamiltonian::STRIPES], 0.0);
+    int64_t nnz = 0;
+    for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->col[ch].size();
+    H->nnz = nnz;
+    finish_stripes(*H);
     return H;
+}
+
+// Determinants outside the space a = E_rp x (single excitations) with
+// |d_pr| cmax_i >= eps (and their alpha-beta swaps with `partners`).
+template <int W>
+Buffer *select_onebody_impl(Space<W> &sp, const double *d, const double *cmax, double eps, int partners, int threads)
+{
+    const int64_t n = sp.ctx->n, count = sp.dets.size();
+    std::vector<std::vector<std::pair<double, int>>> lists(n);
+    for (int64_t q = 0; q < n; ++q) {
+        for (int64_t r = 0; r < n; ++r)
+            if (r != q && d[q * n + r] != 0.0) lists[q].emplace_back(std::fabs(d[q * n + r]), static_cast<int>(r));
+        std::sort(lists[q].begin(), lists[q].end(),
+                  [](const std::pair<double, int> &u, const std::pair<double, int> &v) {
+                      return u.first != v.first ? u.first > v.first : u.second < v.second;
+                  });
+    }
+    const Zobrist &z = zobrist();
+    ShardedMap<W, int64_t> found(0);
+#pragma omp parallel num_threads(threads)
+    {
+        typename ShardedMap<W, int64_t>::Stage stage(found);
+#pragma omp for schedule(dynamic, 16)
+        for (int64_t i = 0; i < count; ++i) {
+            if (cmax[i] <= 0.0) continue;
+            const double t = eps / cmax[i];
+            const Det<W> &x = sp.dets[i];
+            const u64 hx = hash_det<W>(x);
+            for (int spin = 0; spin < 2; ++spin) {
+                const u64 *xs = x.w + spin * W;
+                for (int k = 0; k < W; ++k)
+                    for (u64 bits = xs[k]; bits; bits &= bits - 1) {
+                        const int q = (k << 6) + lowest(bits);
+                        for (const auto &e : lists[q]) {
+                            if (e.first < t) break;
+                            if (test(xs, e.second)) continue;
+                            Det<W> y = x;
+                            flip(y.w + spin * W, q);
+                            flip(y.w + spin * W, e.second);
+                            const u64 hy = hx ^ z.key[spin][q] ^ z.key[spin][e.second];
+                            if (sp.index.find(y, hy) >= 0) continue;
+                            stage.add(y, hy, nullptr);
+                            if (partners) {
+                                Det<W> w;
+                                std::memcpy(w.a(), y.b(), sizeof(u64) * W);
+                                std::memcpy(w.b(), y.a(), sizeof(u64) * W);
+                                const u64 hw = hash_det<W>(w);
+                                if (sp.index.find(w, hw) < 0) stage.add(w, hw, nullptr);
+                            }
+                        }
+                    }
+            }
+        }
+        stage.flush_all();
+    }
+    auto *out = new Buffer;
+    out->width = 2 * W;
+    std::vector<Det<W>> all;
+    all.reserve(found.size());
+    for (size_t sh = 0; sh < found.shards.size(); ++sh)
+        found.for_each(sh, [&](const Det<W> &key, const int64_t *) { all.push_back(key); });
+    std::sort(all.begin(), all.end(), [](const Det<W> &u, const Det<W> &v) { return before(u, v); });
+    out->rows = all.size();
+    out->data.resize(all.size() * 2 * W);
+    if (!all.empty()) std::memcpy(out->data.data(), all.data(), sizeof(Det<W>) * all.size());
+    return out;
+}
+
+// The distinct rows of `candidates` that are not in the space (sorted).
+template <int W> Buffer *difference_impl(Space<W> &sp, const u64 *candidates, int64_t count, int threads)
+{
+    const Det<W> *rows = reinterpret_cast<const Det<W> *>(candidates);
+    ShardedMap<W, int64_t> found(0);
+#pragma omp parallel num_threads(threads)
+    {
+        typename ShardedMap<W, int64_t>::Stage stage(found);
+#pragma omp for schedule(static)
+        for (int64_t i = 0; i < count; ++i) {
+            const u64 h = hash_det<W>(rows[i]);
+            if (sp.index.find(rows[i], h) < 0) stage.add(rows[i], h, nullptr);
+        }
+        stage.flush_all();
+    }
+    auto *out = new Buffer;
+    out->width = 2 * W;
+    std::vector<Det<W>> all;
+    all.reserve(found.size());
+    for (size_t sh = 0; sh < found.shards.size(); ++sh)
+        found.for_each(sh, [&](const Det<W> &key, const int64_t *) { all.push_back(key); });
+    std::sort(all.begin(), all.end(), [](const Det<W> &u, const Det<W> &v) { return before(u, v); });
+    out->rows = all.size();
+    out->data.resize(all.size() * 2 * W);
+    if (!all.empty()) std::memcpy(out->data.data(), all.data(), sizeof(Det<W>) * all.size());
+    return out;
 }
 
 template <int W> Buffer *select_impl(Space<W> &sp, const double *cmax, double eps, int partners, int threads)
@@ -962,13 +1150,19 @@ template <int W> Buffer *select_impl(Space<W> &sp, const double *cmax, double ep
 
 template <int W>
 void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *energies, double eps,
-              int64_t batches, double *out, double *norm, int64_t *stats, int threads)
+              int64_t batches, double *out, double *norm, int64_t *stats, int threads, const double *screen = nullptr)
 {
     const Ctx &c = *sp.ctx;
     const int64_t count = sp.dets.size();
+    // Each term H_ai c_i is kept when |H_ai| screen_i >= eps, screen_i = max_k
+    // |c_ik| unless the caller fixes it (then the doubles kept do not depend
+    // on the coefficients, and E2 is smooth in them).
     std::vector<double> cmax(count, 0.0);
-    for (int64_t k = 0; k < nroots; ++k)
-        for (int64_t i = 0; i < count; ++i) cmax[i] = std::max(cmax[i], std::fabs(coeffs[k * count + i]));
+    if (screen)
+        for (int64_t i = 0; i < count; ++i) cmax[i] = std::fabs(screen[i]);
+    else
+        for (int64_t k = 0; k < nroots; ++k)
+            for (int64_t i = 0; i < count; ++i) cmax[i] = std::max(cmax[i], std::fabs(coeffs[k * count + i]));
     std::vector<i128> total(nroots, 0), total_norm(nroots, 0);
     int64_t externals = 0, largest = 0;
     const char *profile_mode = std::getenv("ITERCC_SCI_PROFILE");
@@ -1541,6 +1735,19 @@ void itercc_sci_pt2(void *space, const double *coeffs, int64_t nroots, const dou
     });
 }
 
+void itercc_sci_pt2_screened(void *space, const double *coeffs, int64_t nroots, const double *energies,
+                             const double *screen, double eps, int64_t batches, double *out, double *norm,
+                             int64_t *stats, int threads)
+{
+    auto *s = static_cast<SpaceHandle *>(space);
+    if (nroots < 1 || nroots > 16 || batches < 1 || !screen) return;
+    dispatch(s->ctx->words, [&](auto w) {
+        pt2_impl(*as_space<decltype(w)::value>(s->space), coeffs, nroots, energies, eps, batches, out, norm, stats,
+                 threads, screen);
+        return 0;
+    });
+}
+
 void itercc_sci_pt2_stochastic(void *space, const double *coeffs, int64_t nroots, const double *energies,
                                double eps, double eps_det, int64_t samples, int64_t nbatches, int64_t seed,
                                double *mean, double *error, double *norm, int64_t *stats, int threads)
@@ -1571,6 +1778,38 @@ void itercc_sci_s2(void *space, const double *coeffs, int64_t nroots, double *ou
         s2_impl(*as_space<decltype(w)::value>(s->space), coeffs, nroots, out, threads);
         return 0;
     });
+}
+
+void *itercc_sci_onebody(void *space, const double *d, double drop, int threads)
+{
+    auto *s = static_cast<SpaceHandle *>(space);
+    return dispatch(s->ctx->words, [&](auto w) -> void * {
+        return onebody_impl(*as_space<decltype(w)::value>(s->space), d, drop, threads);
+    });
+}
+
+void *itercc_sci_select_onebody(void *space, const double *d, const double *cmax, double eps, int partners,
+                                int threads)
+{
+    auto *s = static_cast<SpaceHandle *>(space);
+    return dispatch(s->ctx->words, [&](auto w) -> void * {
+        return select_onebody_impl(*as_space<decltype(w)::value>(s->space), d, cmax, eps, partners, threads);
+    });
+}
+
+void *itercc_sci_difference(void *space, const uint64_t *candidates, int64_t count, int threads)
+{
+    auto *s = static_cast<SpaceHandle *>(space);
+    return dispatch(s->ctx->words, [&](auto w) -> void * {
+        return difference_impl(*as_space<decltype(w)::value>(s->space), candidates, count, threads);
+    });
+}
+
+void itercc_sci_parity(int64_t count, const int64_t *partner, double sign, const double *x, double *out,
+                       int threads)
+{
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int64_t i = 0; i < count; ++i) out[i] = 0.5 * (x[i] + sign * x[partner[i]]);
 }
 
 void itercc_sci_partners(void *space, int64_t *out, int threads)

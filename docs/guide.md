@@ -293,8 +293,10 @@ damped = response.polarizability(532.0, damping_Eh=0.001).tensor_au      # compl
 - `tol` is the relative residual of each linear solve (default 1e-8). On water,
   `tol=1e-6` reproduced tightly converged tensors to about 2e-8 relative.
 
-Selected CI has its own polarizabilities (static and dynamic, near full CI):
-`SelectedCI.polarizability`, under Near-full CI below.
+Selected CI gives the same `Polarizability` results near full CI (static,
+dynamic and damped): `SelectedCIResponse` in a fixed space has this
+interface, and `SelectedCI.polarizability` grows the space; see Near-full CI
+below.
 
 ### Finite fields (CCSDTQ and any other ground state)
 
@@ -393,19 +395,34 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
 - Long runs: `checkpoint(stage, determinants, vectors)` after each stage and
   `initial=(determinants, vectors)` to resume with the remaining epsilons
   (the same results as an uninterrupted run).
-- Polarizabilities: `sci.polarizability(dipoles, frequencies=(0.0, w))`
-  returns one `SCIPolarizability` per epsilon (`tensors_au[k]` at
-  `frequencies_au[k]`, `dipole_au`, `determinants`, `space`). Each stage
+- Polarizabilities: `sci.polarizability(dipoles, wavelengths_nm=(np.inf, 1064.0), damping_Eh=0.0)`
+  returns one `SCIPolarizability` per epsilon (`polarizabilities[k]`, the
+  `response.Polarizability` at the k-th wavelength as from `DipoleResponse`;
+  `tensors_au`, `dipole_au`, `determinants`, `space`). Each stage
   adds to the ground state's selected determinants those coupled to it by
-  a dipole component or coupled through H to a static response vector,
-  then solves alpha_ij(w) = <0|mu_i (H - E0 - w)^-1 Q mu_j|0> + (w -> -w) in
-  that space (GMRES): the exact polarizability of the space's variational
-  state, equal to full CI in the full space (tested against the full-CI sum
-  over states, static and dynamic). Water cc-pVDZ: 0.87 million
+  a dipole component or coupled through H to a static response vector
+  (compiled selections), then solves alpha_ij(w) = <0|mu_i (H - E0 - w)^-1
+  Q mu_j|0> + (w -> -w) in that space (GMRES; complex shifts with damping):
+  the exact polarizability of the space's variational state, equal to full
+  CI in the full space (tested against the full-CI sum over states, static,
+  dynamic and damped). In a space you already have,
+  `SelectedCIResponse(sci, dipoles, determinants)` is the drop-in for
+  `DipoleResponse`: `.polarizability(wavelength_nm, damping_Eh=...)`, with
+  each wavelength's solves started from the earlier ones. Water cc-pVDZ: 0.87 million
   determinants give 3.146, 7.030, 5.267 au against CCSDT's 3.150, 7.037,
   5.272 in 50 s on 12 cores. `sci.field_solver_factory(space)` runs the
   finite-field route (`finite_field_polarizability`) in a fixed space; it
   matches the linear response there to 2e-6 au.
+- The variational polarizability of a truncated space is a lower bound
+  that converges slowly in diffuse bases (CuF aug-cc-pVDZ-DK: 15.7, 17.1,
+  18.3 au at 0.35, 0.69, 1.68 million determinants, CCSDT 23.1).
+  `field_solver_factory(space, pt2_epsilon=eps2, pt2_screen=screen)` adds
+  each field's Epstein-Nesbet correction, so the second differences give
+  the PT2-corrected tensor of the space. Pass
+  `screen = SelectedCIResponse(sci, dipoles, space).field_screen(F_max)`:
+  without it, the screening follows each field's state and E2 jumps
+  between fields. The correction needs a small eps2 (CuF, 0.35 million
+  determinants: 16.5 au at 1e-5, 17.6 at 3e-6).
 - Natural orbitals converge selected CI faster (essential for excited
   states: canonical single excitations do not couple to the aufbau
   determinant, so give `references` that contain them): `sci.natural_orbitals(result)`

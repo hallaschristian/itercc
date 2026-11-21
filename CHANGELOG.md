@@ -14,6 +14,34 @@
   `finite_field_polarizability` in a fixed selected space (the same tensor
   to 2e-6 au).
 
+- Selected-CI response on the compiled core, with the `DipoleResponse`
+  interface: `SelectedCIResponse(sci, dipoles, determinants)` solves the
+  ground state of a fixed space and `.polarizability(wavelength_nm,
+  damping_Eh=..., tol=...)` returns a `response.Polarizability` (static,
+  dynamic and damped, warm-started with `_shifted_guesses` across
+  wavelengths). `SelectedCI.polarizability(dipoles, wavelengths_nm,
+  damping_Eh=...)` now takes wavelengths like `DipoleResponse` (was
+  `frequencies=`) and returns `SCIPolarizability` records holding
+  `Polarizability` objects. New C kernels: dipole matrices
+  (`itercc_sci_onebody`, no zero-ERI contexts), dipole-coupled selection
+  (`itercc_sci_select_onebody`), set difference against an indexed space
+  (`itercc_sci_difference`, replacing NumPy `unique` over the union) and
+  the spin-parity projection (`itercc_sci_parity`, also in the Davidson
+  projector); each response round extends the previous round's
+  Hamiltonian. `rotate_integrals` uses the native transformation
+  (`integrals.mo_eri`). Fixed: a temporary array passed by address to the
+  kernels could be freed before they read it (complex response vectors,
+  the reference-space growth in `solve` and 8-fold packed AO integrals).
+  `SelectedCI.field_solver_factory(..., pt2_epsilon=, pt2_screen=)` gives
+  finite-field energies E_var + E_PT2 in a fixed space, so second
+  differences give the space's PT2-corrected polarizability (far closer to
+  full CI than the variational one: 4e-4 against 2.4e-2 au on the test
+  model with 61 determinants). The usual screening (|H_ai c_i| >= eps)
+  follows the field's state and makes E2 jump between fields (CuF: 1 au
+  between strengths); `pt2_screen` (`SelectedCIResponse.field_screen(F)` =
+  |c0| + F max_j |x_j|) fixes the kept terms instead, through the new
+  kernel `itercc_sci_pt2_screened` (CuF strengths then agree to 1e-3 au).
+
 - Selected CI keeps the Hamiltonian in chunks of 512 rows with their own
   arrays: a build no longer copies the rows into one array afterwards, and
   an extension releases each old chunk once its rows are copied, so a stage

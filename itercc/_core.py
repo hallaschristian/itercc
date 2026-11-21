@@ -134,10 +134,15 @@ CPU_FUNCTIONS = {
     "sci_buffer_copy": ([_P, _P], None),
     "sci_buffer_free": ([_P], None),
     "sci_pt2": ([_P, _P, _I, _P, _D, _I, _P, _P, _P, _T], None),
+    "sci_pt2_screened": ([_P, _P, _I, _P, _P, _D, _I, _P, _P, _P, _T], None),
     "sci_pt2_stochastic": ([_P, _P, _I, _P, _D, _D, _I, _I, _I, _P, _P, _P, _P, _T], None),
     "sci_rdm1": ([_P, _P, _I, _P, _P, _T], None),
     "sci_s2": ([_P, _P, _I, _P, _T], None),
     "sci_partners": ([_P, _P, _T], None),
+    "sci_onebody": ([_P, _P, _D, _T], _P),
+    "sci_select_onebody": ([_P, _P, _P, _D, _T, _T], _P),
+    "sci_difference": ([_P, _P, _I, _T], _P),
+    "sci_parity": ([_I, _P, _D, _P, _P, _T], None),
 }
 
 
