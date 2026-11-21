@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 42
+#define ITERCC_CORE_ABI 43
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -886,6 +886,65 @@ int itercc_triplet_slots(const itercc_slot_program *p, int64_t nslots, int64_t p
 void itercc_triplet_profile(double *seconds, int reset);
 /* ... and by contraction (the contraction number of each instruction). */
 void itercc_triplet_contraction_profile(int64_t count, double *seconds, int64_t *calls, int reset);
+
+/* Heat-bath selected CI (selected_ci.cpp). A context holds the integrals
+ * (h: n x n, eri: chemists' (pq|rs), n^4) and the magnitude-sorted double
+ * excitation lists; integrals below `cutoff` are dropped from the lists.
+ * Determinants are rows of 2 * words uint64: the alpha string, then the beta
+ * string (orbital p = bit p % 64 of word p / 64). A space indexes a fixed,
+ * duplicate-free determinant array. Energies exclude any constant. Results
+ * do not depend on the thread count (sums in 128-bit fixed point). Up to 256
+ * orbitals and fewer than 64 alpha electrons (create returns NULL otherwise). */
+void *itercc_sci_create(int64_t norb, int64_t nalpha, int64_t nbeta, const double *h, const double *eri,
+                        const int64_t *irrep, double cutoff, int threads);
+void itercc_sci_free(void *ctx);
+int64_t itercc_sci_words(const void *ctx);
+/* out (three entries): opposite-spin, same-spin and singles list lengths;
+ * returns the context's bytes. */
+int64_t itercc_sci_list_sizes(const void *ctx, int64_t *out);
+void *itercc_sci_space(const void *ctx, const uint64_t *dets, int64_t count, int threads);
+void itercc_sci_space_free(void *space);
+void itercc_sci_diagonal(void *space, double *out, int threads);
+/* The variational Hamiltonian: diagonal plus the upper triangle (columns
+ * increasing) with |H_ij| > drop; nnz counts the upper triangle. The product
+ * keeps a buffer of about 32 n doubles (fixed stripes, thread-independent). */
+void *itercc_sci_hamiltonian(void *space, double drop, int threads);
+/* The same for a space whose first n_old determinants are those of `old`
+ * (unchanged): only elements involving the others are evaluated. */
+void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old, double drop, int threads);
+int64_t itercc_sci_ham_nnz(const void *ham);
+void itercc_sci_ham_free(void *ham);
+void itercc_sci_ham_diagonal(const void *ham, double *out);
+void itercc_sci_matvec(void *ham, const double *x, double *y, int threads);
+/* Determinants outside the space with |H_ai| cmax_i >= eps for some i of
+ * the space (sorted, unique); with partners, also their alpha-beta swaps. */
+void *itercc_sci_select(void *space, const double *cmax, double eps, int partners, int threads);
+int64_t itercc_sci_buffer_rows(const void *buffer);
+void itercc_sci_buffer_copy(const void *buffer, uint64_t *out);
+void itercc_sci_buffer_free(void *buffer);
+/* Epstein-Nesbet second-order energies of nroots (<= 16) states (coeffs:
+ * nroots x count, energies: variational, without the constant) over the
+ * determinants outside the space reached with |H_ai c_i| >= eps, in
+ * `batches` passes over hash-partitioned external determinants; stats (may
+ * be NULL, two entries): external determinants, the largest batch; norm
+ * (may be NULL) gets the first-order norm sum_a (num_a / (E - H_aa))^2 of
+ * each state, for the renormalized correction E2 / (1 + norm). */
+void itercc_sci_pt2(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
+                    int64_t batches, double *out, double *norm, int64_t *stats, int threads);
+/* Semistochastic remainder E2[eps] - E2[eps_det] (eps < eps_det): nbatches
+ * batches of `samples` determinants drawn with p_i ~ max_k |c_ik| (seeded,
+ * reproducible); mean and standard error per state; stats[0]: external
+ * determinants visited. */
+void itercc_sci_pt2_stochastic(void *space, const double *coeffs, int64_t nroots, const double *energies,
+                               double eps, double eps_det, int64_t samples, int64_t nbatches, int64_t seed,
+                               double *mean, double *error, double *norm, int64_t *stats, int threads);
+/* Spin-summed one-particle density matrix sum_k weights_k gamma_k (n x n). */
+void itercc_sci_rdm1(void *space, const double *coeffs, int64_t nroots, const double *weights, double *out,
+                     int threads);
+/* <S^2> of each state (M_S = 0 spaces). */
+void itercc_sci_s2(void *space, const double *coeffs, int64_t nroots, double *out, int threads);
+/* Index of each determinant's alpha-beta swap in the space, or -1. */
+void itercc_sci_partners(void *space, int64_t *out, int threads);
 
 #ifdef __cplusplus
 }

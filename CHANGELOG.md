@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- `SelectedCI` (`itercc.selected_ci`): near-full CI by heat-bath selected CI
+  with Epstein-Nesbet PT2, for corrections beyond CCSDTQ, on new compiled
+  kernels (`core/src/cpu/selected_ci.cpp`, core ABI 43). Determinants are
+  alpha and beta bit strings (up to 256 orbitals); each epsilon grows the
+  space from magnitude-sorted double-excitation lists and bounded singles;
+  the space's Hamiltonian is kept as its upper triangle and applied in 64
+  fixed row stripes; PT2 runs in hash-partitioned passes over sharded hash
+  maps (`pt2_batches`), or semistochastically (`pt2_deterministic`: exact
+  above a threshold plus a seeded sampled remainder with its standard error).
+  `spin_parity` keeps singlets or triplets of M_S = 0 spaces, orbital irreps
+  keep one irrep; `extrapolate` and `extrapolate_gap` fit the variational
+  energies (gaps) linearly in PT2; density matrices give natural orbitals
+  (`natural_orbitals`, `rotate_integrals`). PT2 numerators, density matrices
+  and <S^2> accumulate in 128-bit fixed point, so results do not depend on
+  the thread count. The full-space limit equals full CI (determinant oracle;
+  PySCF on water/6-31G to 1e-13 Eh for singlets and triplets) and PT2 equals
+  brute force to 1e-16. Cu+ (scalar X2C, cc-pVDZ-DK, 18 electrons in 38
+  orbitals, 12 desktop cores): 1.9 million determinants per stage with PT2 in
+  under three minutes; the 3d -> 4s 1D excitation extrapolates to about
+  23,600 cm-1, 1,300 cm-1 above EOM-CCSDT. CuF in the QUEST model
+  (aug-cc-pVDZ, 18 electrons in 72 orbitals) in state-averaged natural
+  orbitals: up to 1.1 million determinants on the desktop give
+  variational-plus-PT2 B and C excitation energies of 2.574 and 2.767 eV,
+  descending toward the published full-CI 2.561 and 2.751 eV and already
+  0.07 and 0.11 eV above CCSDTQ (2.508, 2.660). Each selection cycle extends
+  the previous cycle's Hamiltonian (only elements with a new determinant are
+  evaluated), Zobrist hashes let a PT2 batch skip other batches' determinants
+  before forming them, and a 1-million-determinant CuF stage with two roots
+  takes 47 s on 12 cores (Hamiltonian 14 s, Davidson 16 s, PT2 18 s; 67 s
+  before these changes). PT2 inserts are staged per thread and shard (64 at a
+  time under one lock, prefetched), each shard is one array of entries on
+  huge pages at most half full, and the space test runs once per external
+  determinant: PT2 over 107 million external determinants of a
+  420,000-determinant CuF space in 10.2 s instead of 16.5 s. Stages report the
+  first-order norm for renormalized PT2 (`renormalized_pt2`, `renormalized=`
+  in the extrapolations), and `checkpoint=` / `initial=` resume a series
+  with the same results.
+
 - `SpinEOMCCSDT` (`itercc.eom_spin_ccsdt`): closed-shell EOM-CCSDT for
   singlets and triplets (M_S = 0 vectors of one irrep and spin parity), with
   left eigenvectors: `solve(left=True)` and `sigma_left` act with the exact

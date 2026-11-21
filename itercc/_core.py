@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 42
+CORE_ABI = 43
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -116,6 +116,28 @@ CPU_FUNCTIONS = {
     "bt3_seeds": ([_P, _P, _T, _P, _P, _P, _P, _P, _T], None),
     "bt3_scatter": ([_P, _P, _I, _P, _P, _P, _P, _P, _T], None),
     "bt3_feedback_plane": ([_P, _I, _P, _P, _P, _P, _P, _T], None),
+    "sci_create": ([_I, _I, _I, _P, _P, _P, _D, _T], _P),
+    "sci_free": ([_P], None),
+    "sci_words": ([_P], _I),
+    "sci_list_sizes": ([_P, _P], _I),
+    "sci_space": ([_P, _P, _I, _T], _P),
+    "sci_space_free": ([_P], None),
+    "sci_diagonal": ([_P, _P, _T], None),
+    "sci_hamiltonian": ([_P, _D, _T], _P),
+    "sci_hamiltonian_extend": ([_P, _P, _I, _D, _T], _P),
+    "sci_ham_nnz": ([_P], _I),
+    "sci_ham_free": ([_P], None),
+    "sci_ham_diagonal": ([_P, _P], None),
+    "sci_matvec": ([_P, _P, _P, _T], None),
+    "sci_select": ([_P, _P, _D, _T, _T], _P),
+    "sci_buffer_rows": ([_P], _I),
+    "sci_buffer_copy": ([_P, _P], None),
+    "sci_buffer_free": ([_P], None),
+    "sci_pt2": ([_P, _P, _I, _P, _D, _I, _P, _P, _P, _T], None),
+    "sci_pt2_stochastic": ([_P, _P, _I, _P, _D, _D, _I, _I, _I, _P, _P, _P, _P, _T], None),
+    "sci_rdm1": ([_P, _P, _I, _P, _P, _T], None),
+    "sci_s2": ([_P, _P, _I, _P, _T], None),
+    "sci_partners": ([_P, _P, _T], None),
 }
 
 

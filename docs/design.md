@@ -13,6 +13,7 @@ How IterCC gets its speed and how it keeps results exact. For usage see the
 | EOM and response | `eom.py`, `response.py`, `_directional.py`, `_cpu_tangent.py`, `krylov.py` | Exact Jacobian actions, Davidson, shifted GMRES, CC Lagrangian response |
 | Spin-integrated EOM | `eom_spin_ccsdt.py`, `_spin_ccsdt_terms.py` | Singlet and triplet EOM-CCSDT, right and left: spin-integrated derivative terms, cached contraction trees, exact transpose |
 | Finite fields | `finite_field.py`, `continuation.py` | Static polarizabilities of any ground state from field energies, warm starts from neighbouring fields |
+| Selected CI | `selected_ci.py`, `core/src/cpu/selected_ci.cpp` | Heat-bath selection, sparse Hamiltonian, Epstein-Nesbet PT2 in hash-partitioned passes, fixed-point sums |
 | Compiled core | `core/` (C++17/OpenMP, CUDA), `_core.py`, `_cpu_kernels.py` | GEMM executor, element-wise kernels, CUDA kernels, behind a versioned C ABI |
 | Runtime | `_runtime.py` | Threads, host memory and the registry of ITERCC_* switches, shared by every method |
 | GPU | `_cuda_*.py`, `gemm_contract.py` | CuPy/cuBLAS contractions, fused layout kernels, autotuned GEMM routes |

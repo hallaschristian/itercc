@@ -33,7 +33,7 @@ SOURCES = ("src/version.cpp", "src/cpu/triples.cpp",
            "src/cpu/symmetry_blocks.cpp", "src/cpu/quadruples.cpp", "src/cpu/gemm_kernel.cpp",
            "src/cpu/tile_program.cpp", "src/cpu/triplet_program.cpp", "src/cpu/array_ops.cpp",
            "src/cpu/tensor_scatter.cpp", "src/cpu/spin_quadruples.cpp",
-           "src/cpu/integrals.cpp", "src/cpu/gto_integrals.cpp")
+           "src/cpu/integrals.cpp", "src/cpu/gto_integrals.cpp", "src/cpu/selected_ci.cpp")
 HEADERS = ("include/itercc/core.h", "src/cpu/scratch.h", "src/cpu/gemm_kernel.h", "src/cpu/contract.h")
 FLAGS = ("-std=c++17", "-O3", "-march=native", "-ffp-contract=off", "-fno-math-errno",
          "-fopenmp", "-fPIC", "-shared", '-DITERCC_BUILD_TARGET="runtime-native"')

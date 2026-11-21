@@ -147,6 +147,23 @@ Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
 - `share=other_engine` (same ground state and labels) reuses its ground blocks and cached intermediates
   (38 GiB for CuF aug-cc-pVDZ-DK, 13 occupied/63 virtual: about 24 s per action on one 56-core socket).
 
+### SelectedCI(h, eri, nelec, constant=0.0, *, orbital_irreps=None, cutoff=1e-12, cpu_threads=None)
+`from itercc.selected_ci import SelectedCI, extrapolate_gap, rotate_integrals`. Heat-bath selected CI with
+Epstein-Nesbet PT2 (near-full CI) of any real orbital Hamiltonian, compiled CPU kernels, up to 256 orbitals.
+- `.solve(nroots=1, *, references=None, spin_parity=None, epsilons=(1e-3, 3e-4, 1e-4, 5e-5), pt2_epsilon=None,
+  pt2_batches=1, pt2_deterministic=None, pt2_samples=200, pt2_sample_batches=20, seed=0, residual_tol=1e-5,
+  max_space=None, max_cycles=12, new_fraction=0.01, max_determinants=None, callback=None) -> SCIResult` (`stages`: epsilon, determinants, nonzeros, energies, pt2, s2, seconds).
+- `spin_parity` +1 even spin (singlets), -1 odd (triplets); `references` (rows from `.determinant(alpha, beta)`,
+  `.aufbau()`, `.single_excitations(row, irrep=)`) fix the irrep.
+- `result.extrapolate(root, renormalized=False)` and `extrapolate_gap(lower, upper, renormalized=False)`: (full-CI
+  estimate, spread), linear in PT2 (or E2/(1+norm)); `stage.pt2_norm`, `stage.renormalized_pt2`.
+- `solve(..., checkpoint=f(stage, dets, vectors), initial=(dets, vectors))` resumes a series exactly.
+- `.density_matrix(result, weights)`, `.natural_orbitals(result)` -> (occupations, coefficients, irreps);
+  `rotate_integrals(h, eri, coefficients)`.
+- PT2 memory: about 96 bytes per external determinant (two roots, <= 128 orbitals); `pt2_batches=k` divides it by k
+  (each extra pass costs little: generating excitations is about a fifth of PT2's time). At most 63 alpha electrons.
+- Semistochastic PT2: `pt2_deterministic=` (exact above it) + seeded samples below; `stage.pt2_error`.
+
 ### DipoleResponse(solver, amplitudes, dipoles, *, orbital_irreps=None, dipole_irreps=None, backend="cpu", method="ccsdt", cpu_threads=None)
 - `.polarizability(wavelength_nm, *, damping_Eh=0.0, tol=1e-8) -> Polarizability`
 - `float("inf")` = static. `damping_Eh > 0` gives the complex damped tensor (absorption in the imaginary part).

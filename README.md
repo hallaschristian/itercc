@@ -83,6 +83,7 @@ More scripts: [examples](examples/).
 | CCSD | `RestrictedCC(rank=2)` | `EOMSinglet(method="ccsd")` | `DipoleResponse(method="ccsd")` |
 | CCSDT | `RestrictedCC` | `EOMSinglet`; singlets and triplets, right and left: `SpinEOMCCSDT` | `DipoleResponse` |
 | CCSDTQ | `RestrictedCCSDTQ` | triplet spin-flip EOM (experimental) | static, by finite fields |
+| Near-full CI | `SelectedCI` (heat-bath selected CI + PT2, extrapolated) | any irrep and spin parity | density matrix, natural orbitals |
 
 Plus first-order spin-orbit state interaction (`spin_orbit_state_interaction`),
 X2C SOC operators from PySCF (one-electron, and two-electron mean-field

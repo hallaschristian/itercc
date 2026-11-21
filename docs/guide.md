@@ -339,6 +339,66 @@ alpha.tensor_au, alpha.dipole_au, alpha.points
 - Water cc-pVDZ (4 occupied, 19 virtual, 12 cores): CCSDT 1.6 s, CCSDTQ 23 s
   for the whole tensor; the quadruples lower the diagonal by 0.0006 to 0.0012 au.
 
+## Near-full CI (selected CI)
+
+Coupled cluster converges slowly for some states (CuF's copper 3d -> 4s
+states: CCSDTQ lies 0.05-0.09 eV below full CI in aug-cc-pVDZ). `SelectedCI`
+approaches full CI by heat-bath selection with Epstein-Nesbet PT2 and
+extrapolates to it, for corrections beyond CCSDTQ:
+
+```python
+from itercc.selected_ci import SelectedCI, extrapolate_gap
+
+sci = SelectedCI(model.h, model.eri, 2 * model.nocc, model.constant,
+                 orbital_irreps=model.orbital_irreps)
+eps = (1e-3, 3e-4, 1e-4, 5e-5)
+ground = sci.solve(1, spin_parity=1, epsilons=eps, pt2_epsilon=1e-6)
+refs = sci.single_excitations(sci.aufbau(), irrep=2)[:4]        # an excited irrep
+excited = sci.solve(1, references=refs, spin_parity=1, epsilons=eps, pt2_epsilon=1e-6)
+ground.extrapolate(0)                 # (full-CI estimate, spread) in Eh
+extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
+```
+
+- Each epsilon grows the space (every determinant `a` with
+  |H_ai c_i| >= eps for a determinant `i` of the space, from magnitude-sorted
+  integral lists) until fewer than `new_fraction` (1%) are new; the stage's
+  `energies`, `pt2` (screened at `pt2_epsilon`), `s2` and timings are in
+  `result.stages`. `extrapolate` fits the variational energies linearly in
+  the PT2 correction; `extrapolate_gap` fits the gap in the PT2 gap.
+- `spin_parity=+1` keeps even total spin (singlets; quintets are possible),
+  `-1` odd (triplets): spaces contain each determinant's alpha-beta swap.
+  `references` fix the irrep (default the aufbau determinant); `s2` checks
+  the spin of each root.
+- PT2 holds one hash-map entry per external determinant (about 96 bytes
+  for two roots and up to 128 orbitals, at most half-full tables); `pt2_batches=k` makes k passes over 1/k of them.
+  The Hamiltonian keeps its upper triangle (12 bytes per nonzero, plus
+  about 32 doubles per determinant for the product).
+- Semistochastic PT2 for large spaces: `pt2_deterministic=2e-6` is exact
+  above that threshold and samples the rest down to `pt2_epsilon`
+  (`pt2_samples` determinants per batch, `pt2_sample_batches` batches,
+  seeded); `stage.pt2_error` is the standard error. On CuF it agrees with
+  deterministic PT2 within its error at a fifth of the time and an eighth of
+  the memory.
+- Each cycle extends the previous cycle's Hamiltonian (new determinants
+  are appended), so only elements involving new determinants are evaluated.
+- `stage.pt2_norm` is the first-order norm and `stage.renormalized_pt2` the
+  renormalized correction E2 / (1 + norm); `extrapolate(...,
+  renormalized=True)` and `extrapolate_gap(..., renormalized=True)` fit
+  against it. Extrapolations need tightly screened PT2: at
+  `pt2_epsilon=1e-5` the CuF gaps overshoot full CI by 0.07-0.2 eV whichever
+  correction is used, while the variational-plus-PT2 gaps approach it from above.
+- Long runs: `checkpoint(stage, determinants, vectors)` after each stage and
+  `initial=(determinants, vectors)` to resume with the remaining epsilons
+  (the same results as an uninterrupted run).
+- Natural orbitals converge selected CI faster (essential for excited
+  states: canonical single excitations do not couple to the aufbau
+  determinant, so give `references` that contain them): `sci.natural_orbitals(result)`
+  gives occupations, coefficients and their irreps, and
+  `rotate_integrals(h, eri, coefficients)` the Hamiltonian to start again in.
+- Results do not depend on the thread count (sums in 128-bit fixed point).
+  Up to 256 orbitals; the full-space limit equals full CI (tests against the
+  determinant oracle and PySCF).
+
 ## Spin-orbit coupling
 
 `spin_orbit_state_interaction` diagonalizes singlet and triplet states coupled
@@ -455,6 +515,7 @@ core loads, or inside the core (read once by C++).
 | `ITERCC_DIRECT_OPENED` | call | `0`: triplet rank-four direct packed T4 terms by contexts per output slot (`ITERCC_DIRECT_DENSE`) instead of one GEMM per hole tuple and class |
 | `ITERCC_SLOT_SHARE_WORK` | call | multiply-adds from which a slot-program intermediate is computed in shared pieces (default 2^22) |
 | `ITERCC_SLOT_PROFILE` | core | `1`: slot-program phase timers (`itercc_triplet_profile`) |
+| `ITERCC_SCI_PROFILE` | core | `1`: selected-CI PT2 phase timers on stderr; `2`: excitation generation alone (diagnostic, no PT2) |
 | `ITERCC_SLOT_SORT` | core | `0`: with `ITERCC_SLOT_WAVES=1`, a wave's tiles in slot order (diagnostic) |
 | `ITERCC_MERGE_TILES` | call | `0`: with fused slot-program products, every tile is cleared and gathered on its own, not merged with the tiles of its kind whose gathers agree up to a sign |
 | `ITERCC_SLOT_WAVES` | core | `1`: slot-program tiles run in waves of slots whose partial sums (`partial_sums_gib`) are added at the end of each wave, not slot by slot |

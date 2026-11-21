@@ -1,0 +1,218 @@
+"""Selected CI against independent full CI: the spin-orbital determinant oracle and PySCF."""
+from itertools import combinations
+
+import numpy as np
+import pytest
+
+from itercc import Hamiltonian
+from itercc._cpu_kernels import library
+from itercc.selected_ci import SelectedCI, extrapolate_gap, rotate_integrals
+from test_quadruples import LABELS, symmetric_model
+from test_tensor_oracle import determinant_problem
+
+pytestmark = pytest.mark.skipif(library() is None, reason="selected CI needs the compiled core")
+
+LOOSE = dict(epsilons=(1e-14,), new_fraction=0.0, residual_tol=1e-10)
+
+
+@pytest.fixture(scope="module")
+def model():
+    labels = LABELS[:7]
+    h, eri, no, constant = symmetric_model(labels=labels, no=2)
+    return h, eri, no, constant, labels
+
+
+def oracle_spectrum(model, irrep):
+    """Eigenvalues of the M_S = 0 determinants of one irrep (oracle convention)."""
+    h, eri, no, constant, labels = model
+    matrix, masks = determinant_problem(Hamiltonian.restricted(h, eri, no, constant), no, no)
+    keep = [i for i, mask in enumerate(masks)
+            if np.bitwise_xor.reduce([labels[p // 2] for p in range(2 * len(h)) if mask >> p & 1]) == irrep]
+    return np.linalg.eigvalsh(matrix[np.ix_(keep, keep)])
+
+
+def solver(model, **options):
+    h, eri, no, constant, labels = model
+    return SelectedCI(h, eri, 2 * no, constant, orbital_irreps=labels, **options)
+
+
+def references(sci, irrep):
+    if irrep == 0:
+        return sci.aufbau()[None]
+    return sci.single_excitations(sci.aufbau(), irrep=irrep)[:2]
+
+
+@pytest.mark.parametrize("irrep", [0, 3])
+def test_full_space_limit_equals_full_ci(model, irrep):
+    sci = solver(model)
+    exact = oracle_spectrum(model, irrep)
+    refs = references(sci, irrep)
+    every = sci.solve(4, references=refs, **LOOSE)
+    np.testing.assert_allclose(every.energies, exact[:4], atol=1e-10)
+    found = []
+    for parity, s2 in ((1, (0.0, 6.0)), (-1, (2.0, 12.0))):
+        res = sci.solve(2, references=refs, spin_parity=parity, **LOOSE)
+        assert all(min(abs(x - s) for s in s2) < 1e-8 for x in res.stages[-1].s2)
+        for e in res.energies:
+            assert np.min(np.abs(exact - e)) < 1e-10
+        found.extend(res.energies)
+    # The lowest state of each parity is among the lowest of the irrep.
+    assert np.min(found) == pytest.approx(exact[0], abs=1e-10)
+
+
+def test_results_do_not_depend_on_threads(model):
+    one = solver(model, cpu_threads=1).solve(2, spin_parity=1, epsilons=(1e-2, 1e-3), pt2_epsilon=1e-6)
+    many = solver(model, cpu_threads=3).solve(2, spin_parity=1, epsilons=(1e-2, 1e-3), pt2_epsilon=1e-6)
+    np.testing.assert_array_equal(one.determinants, many.determinants)
+    for a, b in zip(one.stages, many.stages):
+        np.testing.assert_array_equal(a.energies, b.energies)
+        np.testing.assert_array_equal(a.pt2, b.pt2)
+
+
+def test_pt2_equals_brute_force_and_batches(model):
+    h, eri, no, constant, labels = model
+    sci = solver(model)
+    small = sci.solve(2, spin_parity=1, epsilons=(3e-2,), pt2_epsilon=0.0)
+    stage = small.stages[-1]
+    full = sci.solve(1, spin_parity=1, **LOOSE).determinants
+    index = {bytes(row): i for i, row in enumerate(full)}
+    position = np.array([index[bytes(row)] for row in small.determinants])
+    space = sci._space(full)
+    ham = sci.kernels.sci_hamiltonian(space, 0.0, 2)
+    try:
+        diagonal = np.empty(len(full))
+        sci.kernels.sci_ham_diagonal(ham, diagonal.ctypes.data)
+        outside = np.ones(len(full), bool)
+        outside[position] = False
+        for k in range(2):
+            c = np.zeros(len(full))
+            c[position] = small.vectors[k]
+            y = np.empty(len(full))
+            sci.kernels.sci_matvec(ham, c.ctypes.data, y.ctypes.data, 2)
+            e = stage.energies[k] - constant
+            assert stage.pt2[k] == pytest.approx(np.sum(y[outside] ** 2 / (e - diagonal[outside])), abs=1e-14)
+            norm = np.sum((y[outside] / (e - diagonal[outside])) ** 2)
+            assert stage.pt2_norm[k] == pytest.approx(norm, abs=1e-13)
+            assert stage.renormalized_pt2[k] == pytest.approx(stage.pt2[k] / (1 + norm), abs=1e-14)
+    finally:
+        sci.kernels.sci_ham_free(ham)
+        sci.kernels.sci_space_free(space)
+    batched = sci.solve(2, spin_parity=1, epsilons=(3e-2,), pt2_epsilon=0.0, pt2_batches=3)
+    np.testing.assert_array_equal(batched.stages[-1].pt2, stage.pt2)
+
+
+def test_semistochastic_pt2_is_unbiased_and_seeded(model):
+    sci = solver(model)
+    options = dict(spin_parity=1, epsilons=(3e-2,))
+    exact = sci.solve(2, pt2_epsilon=0.0, **options).stages[-1]
+    runs = [sci.solve(2, pt2_epsilon=0.0, pt2_deterministic=5e-3, pt2_samples=30, pt2_sample_batches=40,
+                      seed=seed, **options).stages[-1] for seed in (1, 1, 2)]
+    np.testing.assert_array_equal(runs[0].pt2, runs[1].pt2)
+    for stage in runs[1:]:
+        assert np.all(stage.pt2_error > 0)
+        assert np.all(np.abs(stage.pt2 - exact.pt2) < 5 * stage.pt2_error + 1e-12)
+        assert np.all(np.abs(stage.pt2_norm - exact.pt2_norm) < 0.2 * exact.pt2_norm)
+
+
+def test_extended_hamiltonian_equals_a_fresh_build(model):
+    sci = solver(model)
+    dets = sci.solve(1, spin_parity=1, **LOOSE).determinants
+    part = len(dets) // 3
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=len(dets))
+    products = []
+    small = sci._space(dets[:part])
+    first = sci.kernels.sci_hamiltonian(small, 1e-15, 2)
+    space = sci._space(dets)
+    try:
+        for ham in (sci.kernels.sci_hamiltonian_extend(space, first, part, 1e-15, 2),
+                    sci.kernels.sci_hamiltonian(space, 1e-15, 2)):
+            y = np.empty(len(dets))
+            sci.kernels.sci_matvec(ham, x.ctypes.data, y.ctypes.data, 2)
+            products.append((y, int(sci.kernels.sci_ham_nnz(ham))))
+            sci.kernels.sci_ham_free(ham)
+    finally:
+        sci.kernels.sci_ham_free(first)
+        sci.kernels.sci_space_free(small)
+        sci.kernels.sci_space_free(space)
+    assert products[0][1] == products[1][1]
+    np.testing.assert_array_equal(products[0][0], products[1][0])
+
+
+def test_resume_from_a_checkpoint_reproduces_the_series(model):
+    sci = solver(model)
+    options = dict(spin_parity=1, pt2_epsilon=1e-6)
+    whole = sci.solve(2, epsilons=(3e-2, 1e-2, 3e-3), **options)
+    saved = {}
+    sci.solve(2, epsilons=(3e-2,), checkpoint=lambda st, d, v: saved.update(dets=d.copy(), vectors=v.copy()),
+              **options)
+    rest = sci.solve(2, epsilons=(1e-2, 3e-3), initial=(saved["dets"], saved["vectors"]), **options)
+    np.testing.assert_array_equal(rest.determinants, whole.determinants)
+    for a, b in zip(rest.stages, whole.stages[1:]):
+        np.testing.assert_array_equal(a.energies, b.energies)
+        np.testing.assert_array_equal(a.pt2, b.pt2)
+
+
+def test_determinant_cap_ends_the_series(model):
+    sci = solver(model)
+    free = sci.solve(1, spin_parity=1, epsilons=(3e-2, 1e-3))
+    cap = free.stages[0].determinants + 1
+    capped = sci.solve(1, spin_parity=1, epsilons=(3e-2, 1e-3, 1e-4), max_determinants=cap)
+    assert len(capped.stages) == 1 and len(capped.determinants) <= cap
+
+
+def test_density_matrix_and_natural_orbitals(model):
+    h, eri, no, constant, labels = model
+    sci = solver(model)
+    res = sci.solve(1, spin_parity=1, **LOOSE)
+    rdm = sci.density_matrix(res)
+    assert np.trace(rdm) == pytest.approx(2 * no, abs=1e-10)
+    np.testing.assert_allclose(rdm, rdm.T, atol=1e-14)
+    assert np.all(np.abs(rdm[labels[:, None] != labels[None]]) < 1e-14)
+    occupations, coefficients, new_labels = sci.natural_orbitals(res)
+    assert np.all(np.diff(occupations) <= 1e-12) and occupations.sum() == pytest.approx(2 * no)
+    h2, eri2 = rotate_integrals(h, eri, coefficients)
+    rotated = SelectedCI(h2, eri2, 2 * no, constant, orbital_irreps=new_labels)
+    again = rotated.solve(1, spin_parity=1, **LOOSE)
+    assert again.energies[0] == pytest.approx(res.energies[0], abs=1e-10)
+
+
+def test_extrapolation_approaches_full_ci(model):
+    sci = solver(model)
+    exact = oracle_spectrum(model, 0)
+    ground = sci.solve(1, spin_parity=1, epsilons=(2e-2, 1e-2, 5e-3), pt2_epsilon=0.0)
+    variational = ground.energies[0] - exact[0]
+    estimate, _ = ground.extrapolate(0)
+    assert abs(estimate - exact[0]) < abs(variational)
+    excited = sci.solve(1, references=references(sci, 3), spin_parity=1, epsilons=(2e-2, 1e-2, 5e-3),
+                        pt2_epsilon=0.0)
+    gap, _ = extrapolate_gap(ground, excited)
+    assert np.isfinite(gap)
+
+
+def test_water_against_pyscf_full_ci():
+    pyscf = pytest.importorskip("pyscf")
+    from pyscf import fci, gto, scf
+    from pyscf.fci import direct_spin1_symm
+    from itercc.pyscf_interface import from_rhf
+
+    mol = gto.M(atom="O 0 0 0.1173; H 0 0.7572 -0.4692; H 0 -0.7572 -0.4692", basis="6-31g",
+                symmetry="c2v", verbose=0)
+    mf = scf.RHF(mol).run()
+    model = from_rhf(mf, frozen=1)
+    n, ne = len(model.h), 2 * model.nocc
+    sci = SelectedCI(model.h, model.eri, ne, model.constant, orbital_irreps=model.orbital_irreps)
+    for irrep, parity, ss in ((0, 1, 0.0), (2, -1, 2.0)):
+        exact = direct_spin1_symm.FCI(mol)
+        exact.orbsym, exact.wfnsym, exact.nroots, exact.conv_tol = model.orbital_irreps, irrep, 2, 1e-12
+        exact.max_cycle = 400
+        fci.addons.fix_spin_(exact, ss=ss, shift=0.5)
+        energies, vectors = exact.kernel(model.h, model.eri, n, ne)
+        refs = None if irrep == 0 else sci.single_excitations(sci.aufbau(), irrep=irrep)[:4]
+        res = sci.solve(1, references=refs, spin_parity=parity, epsilons=(1e-4, 1e-14), new_fraction=0.0,
+                        residual_tol=1e-10)
+        assert res.energies[0] - model.constant == pytest.approx(np.min(energies), abs=1e-9)
+        if irrep == 0:
+            ground = vectors[int(np.argmin(energies))]
+            rdm = sci.density_matrix(res)
+            np.testing.assert_allclose(rdm, fci.direct_spin1.make_rdm1(ground, n, ne), atol=1e-7)
