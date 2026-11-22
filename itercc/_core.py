@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 46
+CORE_ABI = 47
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -144,6 +144,8 @@ CPU_FUNCTIONS = {
     "sci_pt2_screened": ([_P, _P, _I, _P, _P, _D, _I, _P, _P, _P, _T], None),
     "sci_pt2_pairs": ([_P, _P, _I, _P, _D, _I, _D, _P, _P, _P, _T], None),
     "sci_pt2_stochastic_pairs": ([_P, _P, _I, _P, _D, _D, _I, _I, _I, _D, _P, _P, _P, _P, _T], None),
+    "sci_pt2_orbits": ([_P, _P, _I, _P, _D, _I, _D, _D, _P, _P, _P, _T], None),
+    "sci_pt2_stochastic_orbits": ([_P, _P, _I, _P, _D, _D, _I, _I, _I, _D, _D, _P, _P, _P, _P, _T], None),
     "sci_pt2_stochastic": ([_P, _P, _I, _P, _D, _D, _I, _I, _I, _P, _P, _P, _P, _T], None),
     "sci_rdm1": ([_P, _P, _I, _P, _P, _T], None),
     "sci_s2": ([_P, _P, _I, _P, _T], None),

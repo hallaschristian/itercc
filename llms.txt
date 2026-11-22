@@ -178,7 +178,8 @@ Epstein-Nesbet PT2 (near-full CI) of any real orbital Hamiltonian, compiled CPU 
 - Linear molecules: `itercc.axial.axial_orbitals(basis, mo_coeff)` -> `.real`, `.transform`, `.lz`, `.mirror`;
   `axial_integrals(h, eri, ax)` (real, 4-fold symmetric); `SelectedCI(..., orbital_lz=ax.lz, orbital_mirror=ax.mirror)`
   (irrep arguments = M_L); `solve(..., mirror_parity=+1/-1)` for Sigma+/Sigma- (M_L = 0);
-  `axial_natural_orbitals(density, lz, mirror)`; `rotate_integrals(..., axial=True)`. No polarizability in axial orbitals.
+  `axial_natural_orbitals(density, lz, mirror)`; `rotate_integrals(..., axial=True)`. Polarizability in axial orbitals:
+  `polarizability(axial_dipoles(dipoles, ax), mirror_parity=1)` (x, z; alpha_yy = alpha_xx). No finite-field factory there.
 
 ### DipoleResponse(solver, amplitudes, dipoles, *, orbital_irreps=None, dipole_irreps=None, backend="cpu", method="ccsdt", cpu_threads=None)
 - `.polarizability(wavelength_nm, *, damping_Eh=0.0, tol=1e-8) -> Polarizability`

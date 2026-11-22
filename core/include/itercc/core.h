@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 46
+#define ITERCC_CORE_ABI 47
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -992,6 +992,17 @@ void itercc_sci_pt2_stochastic_pairs(void *space, const double *coeffs, int64_t 
                                      double eps, double eps_det, int64_t samples, int64_t nbatches, int64_t seed,
                                      double sigma, double *mean, double *error, double *norm, int64_t *stats,
                                      int threads);
+/* The same over the orbits of the swap (sigma_t, 0: not used) and the
+ * reflection set by itercc_sci_set_mirror (sigma_m, 0: not used): each orbit
+ * of externals is accumulated once, from the orbits' representative
+ * internals (about a quarter of the work for Sigma states with both). */
+void itercc_sci_pt2_orbits(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
+                           int64_t batches, double sigma_t, double sigma_m, double *out, double *norm, int64_t *stats,
+                           int threads);
+void itercc_sci_pt2_stochastic_orbits(void *space, const double *coeffs, int64_t nroots, const double *energies,
+                                      double eps, double eps_det, int64_t samples, int64_t nbatches, int64_t seed,
+                                      double sigma_t, double sigma_m, double *mean, double *error, double *norm,
+                                      int64_t *stats, int threads);
 /* Spin-summed one-particle density matrix sum_k weights_k gamma_k (n x n). */
 void itercc_sci_rdm1(void *space, const double *coeffs, int64_t nroots, const double *weights, double *out,
                      int threads);

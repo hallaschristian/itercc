@@ -4,7 +4,7 @@ import pytest
 
 from itercc import scf
 from itercc._cpu_kernels import library
-from itercc.axial import axial_integrals, axial_natural_orbitals, axial_orbitals
+from itercc.axial import axial_dipoles, axial_integrals, axial_natural_orbitals, axial_orbitals
 from itercc.molecule import Molecule
 from itercc.selected_ci import SelectedCI, _Pairs, rotate_integrals
 
@@ -154,3 +154,56 @@ def test_reflection_orbits_halve_sigma_states(lih):
     # A Sigma- series finds the lowest Sigma- state.
     sigma_minus = mirror.solve(1, spin_parity=1, mirror_parity=-1, **FULL).energies[0]
     assert sigma_minus == pytest.approx(minus[0], abs=1e-9)
+
+
+def test_axial_polarizability_equals_real_orbitals(lih):
+    """Full-space polarizabilities of LiH in axial orbitals (x and z; the
+    response spaces hold M_L = 0 and +-1; alpha_yy = alpha_xx), with and
+    without the reflection, equal those in real orbitals."""
+    h, eri = lih["real"]
+    hc, eric = lih["complex"]
+    model, labels, axial, molecule = lih["model"], lih["labels"], lih["axial"], lih["molecule"]
+    dipoles, _ = scf.dipole_integrals(molecule, model)
+    dipoles = np.array([axial.real.T @ d @ axial.real for d in dipoles])
+    options = dict(epsilons=(1e-14,), tol=1e-9)
+    real = SelectedCI(h, eri, 4, model.constant, orbital_irreps=labels).polarizability(dipoles, **options)[-1]
+    ad = axial_dipoles(dipoles, axial)
+    assert not np.any(ad[1])
+    plain = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz).polarizability(ad, **options)[-1]
+    mirror = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz, orbital_mirror=axial.mirror)
+    reflected = mirror.polarizability(ad, mirror_parity=1, **options)[-1]
+    expected = np.real(real.tensors_au[0])
+    assert expected[0, 0] == pytest.approx(expected[1, 1], abs=1e-7)
+    for result in (plain, reflected):
+        np.testing.assert_allclose(np.real(result.tensors_au[0]), expected, atol=1e-7)
+        assert result.energy == pytest.approx(real.energy, abs=1e-9)
+
+
+def test_reflection_pt2_matches_and_samples_without_bias(lih):
+    """PT2 over swap x reflection orbits equals the determinant sums; its
+    semistochastic remainder (several images of one external reached from
+    one internal added together) is unbiased."""
+    hc, eric = lih["complex"]
+    model, axial = lih["model"], lih["axial"]
+    mirror = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz, orbital_mirror=axial.mirror)
+    options = dict(spin_parity=1, mirror_parity=1, epsilons=(3e-3,), pt2_epsilon=0.0)
+    exact = mirror.solve(2, **options)
+    full = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz, spin_pairs=False)
+    space = full._space(exact.determinants)
+    try:
+        pt2, norm, stats = np.zeros(2), np.zeros(2), np.zeros(2, dtype=np.int64)
+        vectors = np.ascontiguousarray(exact.vectors)
+        electronic = np.ascontiguousarray(exact.energies - full.constant)
+        full.kernels.sci_pt2(space, vectors.ctypes.data, 2, electronic.ctypes.data, 0.0, 1, pt2.ctypes.data,
+                             norm.ctypes.data, stats.ctypes.data, 2)
+    finally:
+        full.kernels.sci_space_free(space)
+    stage = exact.stages[-1]
+    np.testing.assert_allclose(stage.pt2, pt2, atol=1e-13)
+    # Externals whose orbit has no Sigma+ (singlet) part carry no numerator and are not stored.
+    assert 0.9 * stats[0] < stage.pt2_externals <= stats[0]
+    runs = [mirror.solve(2, pt2_deterministic=1e-3, pt2_samples=40, pt2_sample_batches=400, seed=seed,
+                         **options).stages[-1] for seed in (5, 5)]
+    np.testing.assert_array_equal(runs[0].pt2, runs[1].pt2)
+    assert np.all(runs[0].pt2_error > 0)
+    assert np.all(np.abs(runs[0].pt2 - stage.pt2) < 3 * runs[0].pt2_error + 1e-12)

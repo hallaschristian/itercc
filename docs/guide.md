@@ -508,8 +508,12 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   (the cylindrical average of a Pi state's density), and
   `rotate_integrals(hc, eric, rotation, axial=True)` applies them. CuF
   aug-cc-pVDZ-DK (26 electrons): the same variational energies with 1.25-1.35
-  times fewer determinants than C2v labels. Polarizabilities are not yet
-  available in axial orbitals.
+  times fewer determinants than C2v labels. Polarizabilities: give
+  `axial_dipoles(dipoles, ax)` (dipoles in the aligned real orbitals,
+  `ax.real.T @ d @ ax.real`): x and z are real in axial orbitals, the
+  response spaces hold M_L = 0 and +-1, and alpha_yy is set to alpha_xx;
+  with `mirror_parity=1` (a Sigma+ ground state) about a third of the memory
+  and time of real orbitals with spin pairs for the same CuF alpha.
 - Results do not depend on the thread count (sums in 128-bit fixed point).
   Up to 256 orbitals; the full-space limit equals full CI (tests against the
   determinant oracle and PySCF).

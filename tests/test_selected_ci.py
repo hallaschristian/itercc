@@ -337,6 +337,35 @@ def test_polarizability_full_space_equals_full_ci(model):
     assert final.tensors_au[0][0, 1] == 0 and final.tensors_au[0][0, 2] == 0
 
 
+def test_polarizability_in_spin_pairs_equals_determinants(model):
+    """The response in the spin-pair basis (default) gives the projected
+    determinant problem's tensors, static and damped."""
+    from test_finite_field import symmetric_dipoles
+
+    h, eri, no, constant, labels = model
+    dipoles = symmetric_dipoles(labels, (3, 2, 0))
+    options = dict(epsilons=(1e-2, 3e-3), tol=1e-10, damping_Eh=0.01)
+    pairs = solver(model).polarizability(dipoles, (np.inf, HC_EH_NM / 0.05), **options)
+    full = solver(model, spin_pairs=False).polarizability(dipoles, (np.inf, HC_EH_NM / 0.05), **options)
+    for a, b in zip(pairs, full):
+        np.testing.assert_array_equal(a.space, b.space)
+        for x, y in zip(a.tensors_au, b.tensors_au):
+            np.testing.assert_allclose(x, y, atol=1e-8)
+
+
+def test_polarizability_cap_before_any_response_space_gives_no_record(model):
+    """A cap that stops a stage before response determinants join its ground
+    space ends the series without a (meaningless, zero-response) record."""
+    from test_finite_field import symmetric_dipoles
+
+    h, eri, no, constant, labels = model
+    dipoles = symmetric_dipoles(labels, (3, 2, 0))
+    size = len(solver(model).solve(1, spin_parity=1, epsilons=(1e-2,)).determinants)
+    assert solver(model).polarizability(dipoles, epsilons=(1e-2,), max_determinants=size) == []
+    grown = solver(model).polarizability(dipoles, epsilons=(1e-2,))
+    assert grown[0].determinants > size and np.all(np.diag(np.real(grown[0].tensors_au[0])) != 0)
+
+
 def test_polarizability_series_continues_from_a_space(model):
     from test_finite_field import symmetric_dipoles
 

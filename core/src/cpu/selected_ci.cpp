@@ -448,53 +448,64 @@ void excitations(const Ctx &c, const Det<W> &x, u64 hx, double threshold, Accept
     }
 }
 
-// excitations() with the hash of each y's alpha-beta swap as well (hxs: x's
-// swap's): accept(hy, hys) and emit(y, value, hy, hys). An alpha change of y
-// is a beta change of its swap.
+// excitations() with the hashes of each y's images under the group of the
+// alpha-beta swap T and the orbital reflection M (e, T, M, TM; `keys[k]` the
+// Zobrist keys of image k, hx[k] those of x's images): accept(hy) and
+// emit(y, value, hy), hy[4]. Every flip of an orbital updates all four.
 template <int W, class Accept, class Emit>
-void excitations_paired(const Ctx &c, const Det<W> &x, u64 hx, u64 hxs, double threshold, Accept &&accept,
-                        Emit &&emit)
+void excitations_images(const Ctx &c, const Det<W> &x, const u64 *hx, const u64 (*keys)[2][256], double threshold,
+                        Accept &&accept, Emit &&emit)
 {
     const int64_t n = c.n;
-    const u64(&z)[2][256] = zobrist().key;
     int oa[MAX_ORB], ob[MAX_ORB];
     const int na = occupied<W>(x.a(), oa), nb = occupied<W>(x.b(), ob);
     Det<W> y;
+    u64 hy[4], hp[4];
+    auto flip_hash = [&](u64 *h, int spin, int orbital) {
+        for (int k = 0; k < 4; ++k) h[k] ^= keys[k][spin][orbital];
+    };
     for (int i = 0; i < na; ++i)
         for (int j = 0; j < nb; ++j) {
             const int p = oa[i], q = ob[j];
-            const u64 hpq = hx ^ z[0][p] ^ z[1][q], spq = hxs ^ z[1][p] ^ z[0][q];
+            for (int k = 0; k < 4; ++k) hp[k] = hx[k];
+            flip_hash(hp, 0, p);
+            flip_hash(hp, 1, q);
             const int64_t pair = p * n + q;
             for (int64_t e = c.os_start[pair]; e < c.os_start[pair + 1]; ++e) {
                 const Entry &en = c.os[e];
                 if (std::fabs(en.v) < threshold) break;
                 if (test(x.a(), en.r) || test(x.b(), en.s)) continue;
-                const u64 hy = hpq ^ z[0][en.r] ^ z[1][en.s], hys = spq ^ z[1][en.r] ^ z[0][en.s];
-                if (!accept(hy, hys)) continue;
+                for (int k = 0; k < 4; ++k) hy[k] = hp[k];
+                flip_hash(hy, 0, en.r);
+                flip_hash(hy, 1, en.s);
+                if (!accept(hy)) continue;
                 y = x;
                 flip(y.a(), p);
                 flip(y.a(), en.r);
                 flip(y.b(), q);
                 flip(y.b(), en.s);
-                emit(y, phase<W>(x.a(), p, en.r) * phase<W>(x.b(), q, en.s) * en.v, hy, hys);
+                emit(y, phase<W>(x.a(), p, en.r) * phase<W>(x.b(), q, en.s) * en.v, hy);
             }
         }
     for (int spin = 0; spin < 2; ++spin) {
         const int *occ = spin ? ob : oa;
         const int no = spin ? nb : na;
         const u64 *xs = spin ? x.b() : x.a();
-        const u64 *zs = z[spin], *zo = z[1 - spin];
         for (int i = 0; i < no; ++i)
             for (int j = i + 1; j < no; ++j) {
                 const int p = occ[i], q = occ[j];
-                const u64 hpq = hx ^ zs[p] ^ zs[q], spq = hxs ^ zo[p] ^ zo[q];
+                for (int k = 0; k < 4; ++k) hp[k] = hx[k];
+                flip_hash(hp, spin, p);
+                flip_hash(hp, spin, q);
                 const int64_t pair = p * n + q;
                 for (int64_t e = c.ss_start[pair]; e < c.ss_start[pair + 1]; ++e) {
                     const Entry &en = c.ss[e];
                     if (std::fabs(en.v) < threshold) break;
                     if (test(xs, en.r) || test(xs, en.s)) continue;
-                    const u64 hy = hpq ^ zs[en.r] ^ zs[en.s], hys = spq ^ zo[en.r] ^ zo[en.s];
-                    if (!accept(hy, hys)) continue;
+                    for (int k = 0; k < 4; ++k) hy[k] = hp[k];
+                    flip_hash(hy, spin, en.r);
+                    flip_hash(hy, spin, en.s);
+                    if (!accept(hy)) continue;
                     y = x;
                     u64 *ys = spin ? y.b() : y.a();
                     double sign = phase<W>(ys, p, en.r);
@@ -503,7 +514,7 @@ void excitations_paired(const Ctx &c, const Det<W> &x, u64 hx, u64 hxs, double t
                     sign *= phase<W>(ys, q, en.s);
                     flip(ys, q);
                     flip(ys, en.s);
-                    emit(y, sign * en.v, hy, hys);
+                    emit(y, sign * en.v, hy);
                 }
             }
     }
@@ -511,34 +522,26 @@ void excitations_paired(const Ctx &c, const Det<W> &x, u64 hx, u64 hxs, double t
         const int *occ = spin ? ob : oa, *other = spin ? oa : ob;
         const int no = spin ? nb : na, nother = spin ? na : nb;
         const u64 *xs = spin ? x.b() : x.a();
-        const u64 *zs = z[spin], *zo = z[1 - spin];
         for (int i = 0; i < no; ++i) {
             const int p = occ[i];
             for (int64_t e = c.single_start[p]; e < c.single_start[p + 1]; ++e) {
                 const SinglesEntry &en = c.singles[e];
                 if (en.bound < threshold) break;
                 if (test(xs, en.r)) continue;
-                const u64 hy = hx ^ zs[p] ^ zs[en.r], hys = hxs ^ zo[p] ^ zo[en.r];
-                if (!accept(hy, hys)) continue;
+                for (int k = 0; k < 4; ++k) hy[k] = hx[k];
+                flip_hash(hy, spin, p);
+                flip_hash(hy, spin, en.r);
+                if (!accept(hy)) continue;
                 double v = phase<W>(xs, p, en.r) * single_value(c, p, en.r, occ, no, other, nother);
                 if (std::fabs(v) < threshold) continue;
                 y = x;
                 u64 *ys = spin ? y.b() : y.a();
                 flip(ys, p);
                 flip(ys, en.r);
-                emit(y, v, hy, hys);
+                emit(y, v, hy);
             }
         }
     }
-}
-
-// -1, 0 or +1 as y's alpha string orders before, equal to or after its beta
-// string: a determinant with alpha <= beta represents its swap pair in PT2.
-template <int W> inline int string_order(const Det<W> &y)
-{
-    for (int k = W - 1; k >= 0; --k)
-        if (y.a()[k] != y.b()[k]) return y.a()[k] < y.b()[k] ? -1 : 1;
-    return 0;
 }
 
 template <int W> inline Det<W> swapped(const Det<W> &y)
@@ -547,40 +550,6 @@ template <int W> inline Det<W> swapped(const Det<W> &y)
     std::memcpy(z.a(), y.b(), sizeof(u64) * W);
     std::memcpy(z.b(), y.a(), sizeof(u64) * W);
     return z;
-}
-
-// PT2 over swap pairs (states of spin parity sigma in a space closed under
-// swaps): the numerator of an external a and of its swap a' differ by the
-// factor sigma, as do their contributions from an internal pair, so only
-// representatives a (alpha <= beta) are accumulated, from representative
-// internals i (partner >= i): each excitation y of i adds s v c_i to the
-// representative of y, s = 1 for y itself and sigma for a swap (which stands
-// for the swap of i's excitation, an excitation of i's partner); y = y'
-// gains from i and its partner (1 + sigma) v c_i; a closed internal (i = i')
-// generates both members of each pair and adds only to representatives.
-// Open representatives count twice in E2. Half the generation and half the
-// hash-map entries of the determinant sums, the same E2.
-struct PairTerm {
-    bool keep = false;
-    double factor = 1.0;
-    bool swap = false;
-};
-
-template <int W> inline PairTerm pair_term(const Det<W> &y, bool open_i, double sigma)
-{
-    PairTerm t;
-    const int order = string_order<W>(y);
-    if (order < 0) {
-        t.keep = true;
-    } else if (order > 0) {
-        t.keep = open_i;
-        t.swap = true;
-        t.factor = sigma;
-    } else {
-        t.factor = open_i ? 1.0 + sigma : 1.0;
-        t.keep = t.factor != 0.0;
-    }
-    return t;
 }
 
 // Open addressing over the space's determinants: each slot holds a 32-bit
@@ -2039,37 +2008,125 @@ template <int W> Buffer *select_impl(Space<W> &sp, const double *cmax, double ep
 
 template <int W> void partners_impl(Space<W> &sp, int64_t *out, int threads);
 
-// Representatives of the swap pairs (sigma != 0): partner[i] >= i (and, for
-// sigma < 0, partner[i] != i); open[i]: a distinct partner. Empty for sigma 0.
-template <int W>
-void pair_representatives(Space<W> &sp, double sigma, std::vector<uint8_t> &rep, std::vector<uint8_t> &open,
-                          int threads)
-{
-    rep.clear();
-    open.clear();
-    if (sigma == 0.0) return;
-    const int64_t count = sp.dets.size();
-    std::vector<int64_t> partner(count);
-    partners_impl(sp, partner.data(), threads);
-    rep.assign(count, 0);
-    open.assign(count, 0);
-    for (int64_t i = 0; i < count; ++i) {
-        const int64_t j = partner[i];
-        open[i] = j >= 0 && j != i;
-        rep[i] = j > i || (j == i && sigma > 0) || j < 0;
+// PT2 over the orbits of the swap T (spin parity sigma_t) and the reflection
+// M (parity sigma_m) for a state of those parities in a space closed under
+// them. With U_g|K> = phi_g(K)|gK> (phi_T = 1, phi_M the reordering sign of
+// the reflected creators, the same for every member of an orbit), amplitudes
+// obey c(gK) = chi(g) phi_g(K) c(K), and the numerators of all externals do
+// too, so each orbit of externals is accumulated once, on its image of
+// lowest hash a: from each representative internal i (weight 1 / |stabilizer
+// of i|), an excitation y adds sum_{g: gy = a} chi(g) phi_g(y) <y|H|i> c_i,
+// which accounts for the excitations of i's images. E2 counts a once per
+// distinct image. Swap pairs halve the generation, the hash-map entries and
+// the final pass; the reflection halves them again for Sigma states.
+struct ImageGroup {
+    int elements[4] = {0, 0, 0, 0};
+    int count = 0;
+    double chi[4] = {1.0, 0.0, 0.0, 0.0};
+    u64 key[4][2][256];
+
+    ImageGroup(const Ctx &c, double sigma_t, double sigma_m)
+    {
+        const u64(&z)[2][256] = zobrist().key;
+        for (int s = 0; s < 2; ++s)
+            for (int p = 0; p < 256; ++p) {
+                const int q = (!c.mirror.empty() && p < c.n) ? c.mirror[p] : p;
+                key[0][s][p] = z[s][p];
+                key[1][s][p] = z[1 - s][p];
+                key[2][s][p] = z[s][q];
+                key[3][s][p] = z[1 - s][q];
+            }
+        chi[1] = sigma_t;
+        chi[2] = sigma_m;
+        chi[3] = sigma_t * sigma_m;
+        elements[count++] = 0;
+        if (sigma_t != 0.0) elements[count++] = 1;
+        if (sigma_m != 0.0) elements[count++] = 2;
+        if (sigma_t != 0.0 && sigma_m != 0.0) elements[count++] = 3;
     }
+
+    template <int W> void hashes(const Det<W> &x, u64 *out) const
+    {
+        for (int k = 0; k < 4; ++k) out[k] = 0;
+        for (int s = 0; s < 2; ++s)
+            for (int w = 0; w < W; ++w)
+                for (u64 bits = x.w[s * W + w]; bits; bits &= bits - 1) {
+                    const int p = (w << 6) + lowest(bits);
+                    for (int k = 0; k < 4; ++k) out[k] ^= key[k][s][p];
+                }
+    }
+
+    u64 lowest_hash(const u64 *h, int *which) const
+    {
+        u64 m = h[elements[0]];
+        *which = elements[0];
+        for (int t = 1; t < count; ++t)
+            if (h[elements[t]] < m) {
+                m = h[elements[t]];
+                *which = elements[t];
+            }
+        return m;
+    }
+
+    // Number of distinct images (hashes) among the group's elements.
+    int distinct(const u64 *h) const
+    {
+        int n = 0;
+        for (int t = 0; t < count; ++t) {
+            bool seen = false;
+            for (int u = 0; u < t; ++u) seen = seen || h[elements[u]] == h[elements[t]];
+            n += !seen;
+        }
+        return n;
+    }
+
+    // sum over g with hash(g m_j) = hmin of chi(g) phi_g, m_j the image j of
+    // y (hy its images' hashes, phase_m y's reflection phase).
+    double factor(const u64 *hy, int j, u64 hmin, double phase_m) const
+    {
+        double f = 0.0;
+        for (int t = 0; t < count; ++t) {
+            const int g = elements[t];
+            if (hy[g ^ j] == hmin) f += chi[g] * ((g & 2) ? phase_m : 1.0);
+        }
+        return f;
+    }
+
+    bool needs_phase(const u64 *hy, int j, u64 hmin) const
+    {
+        for (int t = 0; t < count; ++t) {
+            const int g = elements[t];
+            if ((g & 2) && hy[g ^ j] == hmin) return true;
+        }
+        return false;
+    }
+};
+
+// Image k of y (no phase); mirror_image: y's reflection, from mirror_det.
+template <int W> inline Det<W> image_of(const Det<W> &y, const Det<W> &mirror_image, int k)
+{
+    if (k == 0) return y;
+    if (k == 1) return swapped<W>(y);
+    return k == 2 ? mirror_image : swapped<W>(mirror_image);
 }
 
 template <int W>
 void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *energies, double eps,
               int64_t batches, double *out, double *norm, int64_t *stats, int threads, const double *screen = nullptr,
-              double sigma = 0.0)
+              double sigma_t = 0.0, double sigma_m = 0.0)
 {
     const Ctx &c = *sp.ctx;
     const int64_t count = sp.dets.size();
-    std::vector<uint8_t> rep, open;
-    pair_representatives(sp, sigma, rep, open, threads);
-    const bool paired = sigma != 0.0;
+    const bool paired = sigma_t != 0.0 || sigma_m != 0.0;
+    std::unique_ptr<ImageGroup> group;
+    std::vector<uint8_t> rep;
+    if (paired) {
+        group.reset(new ImageGroup(c, sigma_t, sigma_m));
+        OrbitMap om;
+        if (!orbit_map(sp, sigma_t, sigma_m, om, threads)) return;
+        rep.assign(count, 0);
+        for (int64_t r : om.reps) rep[r] = 1;
+    }
     // Each term H_ai c_i is kept when |H_ai| screen_i >= eps, screen_i = max_k
     // |c_ik| unless the caller fixes it (then the doubles kept do not depend
     // on the coefficients, and E2 is smooth in them).
@@ -2099,23 +2156,27 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                 int64_t add[16];
                 if (paired) {
                     if (!rep[i]) continue;
-                    const bool open_i = open[i];
-                    auto in_batch2 = [&](u64 h, u64 hs) {
-                        return batches == 1 || batch_of(h, batches) == batch || batch_of(hs, batches) == batch;
+                    const ImageGroup &G = *group;
+                    u64 hx[4];
+                    G.hashes<W>(sp.dets[i], hx);
+                    int stabilizer = 0;
+                    for (int t = 0; t < G.count; ++t) stabilizer += hx[G.elements[t]] == hx[0];
+                    const double weight = 1.0 / stabilizer;
+                    auto in_batch = [&](const u64 *hy) {
+                        int which;
+                        return batches == 1 || batch_of(G.lowest_hash(hy, &which), batches) == batch;
                     };
-                    const Det<W> xs = swapped<W>(sp.dets[i]);
-                    excitations_paired<W>(c, sp.dets[i], hash_det<W>(sp.dets[i]), hash_det<W>(xs), eps / cmax[i],
-                                          in_batch2, [&](const Det<W> &y, double v, u64 h, u64 hs) {
-                        const PairTerm t = pair_term<W>(y, open_i, sigma);
-                        if (!t.keep) return;
-                        const u64 key_hash = t.swap ? hs : h;
-                        if (batches > 1 && batch_of(key_hash, batches) != batch) return;
-                        for (int64_t k = 0; k < nroots; ++k)
-                            add[k] = to_numerator(t.factor * v * coeffs[k * count + i]);
-                        if (!no_map) {
-                            if (t.swap) stage.add(swapped<W>(y), key_hash, add);
-                            else stage.add(y, key_hash, add);
-                        }
+                    excitations_images<W>(c, sp.dets[i], hx, G.key, eps / cmax[i], in_batch,
+                                          [&](const Det<W> &y, double v, const u64 *hy) {
+                        int which;
+                        const u64 hmin = G.lowest_hash(hy, &which);
+                        Det<W> m;
+                        double phase_m = 1.0;
+                        if ((which & 2) || G.needs_phase(hy, 0, hmin)) phase_m = mirror_det<W>(c, y, m);
+                        const double f = G.factor(hy, 0, hmin, phase_m) * weight;
+                        if (f == 0.0) return;
+                        for (int64_t k = 0; k < nroots; ++k) add[k] = to_numerator(f * v * coeffs[k * count + i]);
+                        if (!no_map) stage.add(image_of<W>(y, m, which), hmin, add);
                         ++contributions;
                     });
                     continue;
@@ -2141,17 +2202,21 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
         for (int64_t s = 0; s < nshards; ++s) {
             map.for_each(s, [&](const Det<W> &y, const int64_t *vals) {
                 if (sp.index.find(y, map.hash_of(y)) >= 0) return;   // in the space: not external
-                const bool both = paired && string_order<W>(y) != 0;       // stands for its swap too
-                found[s] += both ? 2 : 1;
+                int images = 1;                                       // the orbit's members it stands for
+                if (paired) {
+                    u64 hy[4];
+                    group->hashes<W>(y, hy);
+                    images = group->distinct(hy);
+                }
+                found[s] += images;
                 int oa[MAX_ORB], ob[MAX_ORB];
                 int na = occupied<W>(y.a(), oa), nb = occupied<W>(y.b(), ob);
                 const double hyy = diagonal_energy(c, oa, na, ob, nb);
                 for (int64_t r = 0; r < nroots; ++r) {
                     const double num = from_numerator(vals[r]);
                     const double amplitude = num / (energies[r] - hyy);
-                    const i128 e2 = to_fixed(num * amplitude), n2 = to_fixed(amplitude * amplitude);
-                    part[s * nroots + r] += both ? 2 * e2 : e2;
-                    part_norm[s * nroots + r] += both ? 2 * n2 : n2;
+                    part[s * nroots + r] += images * to_fixed(num * amplitude);
+                    part_norm[s * nroots + r] += images * to_fixed(amplitude * amplitude);
                 }
             });
         }
@@ -2188,17 +2253,24 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
 template <int W>
 void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *energies, double eps,
                          double eps_det, int64_t samples, int64_t nbatches, u64 seed, double *mean, double *error,
-                         double *norm, int64_t *stats, int threads, double sigma = 0.0)
+                         double *norm, int64_t *stats, int threads, double sigma_t = 0.0, double sigma_m = 0.0)
 {
     const Ctx &c = *sp.ctx;
     const int64_t count = sp.dets.size();
-    std::vector<uint8_t> rep, open;
-    pair_representatives(sp, sigma, rep, open, threads);
-    const bool paired = sigma != 0.0;
+    const bool paired = sigma_t != 0.0 || sigma_m != 0.0;
+    std::unique_ptr<ImageGroup> group;
+    std::vector<uint8_t> rep;
+    if (paired) {
+        group.reset(new ImageGroup(c, sigma_t, sigma_m));
+        OrbitMap om;
+        if (!orbit_map(sp, sigma_t, sigma_m, om, threads)) return;
+        rep.assign(count, 0);
+        for (int64_t r : om.reps) rep[r] = 1;
+    }
     std::vector<double> cmax(count, 0.0), cdf(count + 1, 0.0);
     for (int64_t k = 0; k < nroots; ++k)
         for (int64_t i = 0; i < count; ++i) cmax[i] = std::max(cmax[i], std::fabs(coeffs[k * count + i]));
-    if (paired)             // sample the representatives (each stands for its pair)
+    if (paired)             // sample the representatives (each stands for its orbit)
         for (int64_t i = 0; i < count; ++i)
             if (!rep[i]) cmax[i] = 0.0;
     for (int64_t i = 0; i < count; ++i) cdf[i + 1] = cdf[i] + cmax[i];
@@ -2255,53 +2327,61 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
                 ++terms;
             };
             if (paired) {
-                // An open internal i may reach both members of an external
-                // pair, a and its swap a'; the estimator squares i's whole
-                // contribution to a, so both terms are added together, when a
-                // (the representative) is generated, and a' alone only when a
-                // is not among i's terms. A closed internal adds a's term only.
-                const bool open_i = open[i];
+                // One internal i may reach several images of an external orbit
+                // (members a_j = g_j y); the estimator squares i's whole
+                // contribution to the orbit, so the members that are terms
+                // of i are added together, by the one of lowest hash.
+                const ImageGroup &G = *group;
                 const double threshold = eps / cmax[i];
                 const Det<W> &x = sp.dets[i];
                 int occ[2 * MAX_ORB];
                 const int na = occupied<W>(x.a(), occ), nb = occupied<W>(x.b(), occ + na);
-                auto partner_value = [&](const Det<W> &z) {    // <z|H|x> if a term of i (above threshold), else 0
+                u64 hx[4];
+                G.hashes<W>(x, hx);
+                int stabilizer = 0;
+                for (int u = 0; u < G.count; ++u) stabilizer += hx[G.elements[u]] == hx[0];
+                const double weight = 1.0 / stabilizer;
+                auto value_of = [&](const Det<W> &z) {      // <z|H|x> if a term of i (above threshold), else 0
                     int d = 0;
                     for (int k = 0; k < W; ++k) d += popc(x.a()[k] ^ z.a()[k]) + popc(x.b()[k] ^ z.b()[k]);
                     if (d == 0 || d > 4) return 0.0;
                     const double u = element_strings<W>(c, x.a(), x.b(), z.a(), z.b(), occ, na, nb);
                     return std::fabs(u) >= threshold ? u : 0.0;
                 };
-                auto all2 = [](u64, u64) { return true; };
-                const Det<W> xs = swapped<W>(x);
-                excitations_paired<W>(c, x, hash_det<W>(x), hash_det<W>(xs), threshold, all2,
-                                      [&](const Det<W> &y, double v, u64 h, u64 hs) {
-                    const PairTerm t = pair_term<W>(y, open_i, sigma);
-                    if (!t.keep) return;
-                    // Each term's screening tests the term itself (kept: above eps_det).
-                    double v1 = t.factor * v, v2 = 0.0;
-                    bool kept1 = std::fabs(v) * cmax[i] >= eps_det, kept2 = false;
-                    if (open_i && string_order<W>(y) != 0) {
-                        const Det<W> other = swapped<W>(y);
-                        const double u = partner_value(other);
-                        if (t.swap && u != 0.0) return;          // added with the representative
-                        if (!t.swap && u != 0.0) {
-                            v2 = sigma * u;
-                            kept2 = std::fabs(u) * cmax[i] >= eps_det;
-                        }
+                auto all = [](const u64 *) { return true; };
+                excitations_images<W>(c, x, hx, G.key, threshold, all, [&](const Det<W> &y, double v, const u64 *hy) {
+                    int which;
+                    const u64 hmin = G.lowest_hash(hy, &which);
+                    Det<W> m;
+                    const double phase_m = G.count > 2 || G.elements[1] == 2 ? mirror_det<W>(c, y, m) : 1.0;
+                    double total = G.factor(hy, 0, hmin, phase_m) * v;
+                    double kept_total = std::fabs(v) * cmax[i] >= eps_det ? total : 0.0;
+                    for (int t = 1; t < G.count; ++t) {
+                        const int j = G.elements[t];
+                        if (hy[j] == hy[0]) continue;               // y itself
+                        bool repeat = false;                        // an image already counted
+                        for (int u = 1; u < t; ++u) repeat = repeat || hy[G.elements[u]] == hy[j];
+                        if (repeat) continue;
+                        const double u = value_of(image_of<W>(y, m, j));
+                        if (u == 0.0) continue;
+                        if (hy[j] < hy[0]) return;                  // that image adds this orbit's terms
+                        const double f = G.factor(hy, j, hmin, phase_m) * u;
+                        total += f;
+                        if (std::fabs(u) * cmax[i] >= eps_det) kept_total += f;
                     }
+                    total *= weight;
+                    kept_total *= weight;
+                    if (total == 0.0 && kept_total == 0.0) return;
+                    const double scale = w * (nd - 1.0) / p - w * w / (p * p);
                     for (int64_t k = 0; k < nroots; ++k) {
                         const double ck = coeffs[k * count + i];
-                        const double term = (v1 + v2) * ck;
-                        const double kept_term = ((kept1 ? v1 : 0.0) + (kept2 ? v2 : 0.0)) * ck;
-                        const double scale = w * (nd - 1.0) / p - w * w / (p * p);
+                        const double term = total * ck, kept_term = kept_total * ck;
                         add[4 * k] = to_fixed(w * term / p);
                         add[4 * k + 1] = to_fixed(scale * term * term);
                         add[4 * k + 2] = to_fixed(w * kept_term / p);
                         add[4 * k + 3] = to_fixed(scale * kept_term * kept_term);
                     }
-                    if (t.swap) stage.add(swapped<W>(y), hs, add);
-                    else stage.add(y, h, add);
+                    stage.add(image_of<W>(y, m, which), hmin, add);
                     ++terms;
                 });
                 if (profile) largest_task = std::max(largest_task, omp_get_wtime() - task_start);
@@ -2321,7 +2401,12 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
         for (int64_t s = 0; s < nshards; ++s) {
             map.for_each(s, [&](const Det<W> &y, const i128 *vals) {
                 if (sp.index.find(y, map.hash_of(y)) >= 0) return;   // in the space: not external
-                const double weight = paired && string_order<W>(y) != 0 ? 2.0 : 1.0;
+                double weight = 1.0;                                  // the orbit's members it stands for
+                if (paired) {
+                    u64 hy[4];
+                    group->hashes<W>(y, hy);
+                    weight = group->distinct(hy);
+                }
                 int oa[MAX_ORB], ob[MAX_ORB];
                 int na = occupied<W>(y.a(), oa), nb = occupied<W>(y.b(), ob);
                 const double hyy = diagonal_energy(c, oa, na, ob, nb);
@@ -2835,16 +2920,38 @@ void itercc_sci_pt2(void *space, const double *coeffs, int64_t nroots, const dou
     });
 }
 
-void itercc_sci_pt2_pairs(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
-                          int64_t batches, double sigma, double *out, double *norm, int64_t *stats, int threads)
+void itercc_sci_pt2_orbits(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
+                           int64_t batches, double sigma_t, double sigma_m, double *out, double *norm, int64_t *stats,
+                           int threads)
 {
     auto *s = static_cast<SpaceHandle *>(space);
     if (nroots < 1 || nroots > 16 || batches < 1) return;
     dispatch(s->ctx->words, [&](auto w) {
         pt2_impl(*as_space<decltype(w)::value>(s->space), coeffs, nroots, energies, eps, batches, out, norm, stats,
-                 threads, nullptr, sigma);
+                 threads, nullptr, sigma_t, sigma_m);
         return 0;
     });
+}
+
+void itercc_sci_pt2_stochastic_orbits(void *space, const double *coeffs, int64_t nroots, const double *energies,
+                                      double eps, double eps_det, int64_t samples, int64_t nbatches, int64_t seed,
+                                      double sigma_t, double sigma_m, double *mean, double *error, double *norm,
+                                      int64_t *stats, int threads)
+{
+    auto *s = static_cast<SpaceHandle *>(space);
+    if (nroots < 1 || nroots > 16 || samples < 2 || nbatches < 1) return;
+    dispatch(s->ctx->words, [&](auto w) {
+        pt2_stochastic_impl(*as_space<decltype(w)::value>(s->space), coeffs, nroots, energies, eps, eps_det,
+                            samples, nbatches, static_cast<u64>(seed), mean, error, norm, stats, threads, sigma_t,
+                            sigma_m);
+        return 0;
+    });
+}
+
+void itercc_sci_pt2_pairs(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
+                          int64_t batches, double sigma, double *out, double *norm, int64_t *stats, int threads)
+{
+    itercc_sci_pt2_orbits(space, coeffs, nroots, energies, eps, batches, sigma, 0.0, out, norm, stats, threads);
 }
 
 void itercc_sci_pt2_stochastic_pairs(void *space, const double *coeffs, int64_t nroots, const double *energies,
@@ -2852,13 +2959,8 @@ void itercc_sci_pt2_stochastic_pairs(void *space, const double *coeffs, int64_t 
                                      double sigma, double *mean, double *error, double *norm, int64_t *stats,
                                      int threads)
 {
-    auto *s = static_cast<SpaceHandle *>(space);
-    if (nroots < 1 || nroots > 16 || samples < 2 || nbatches < 1) return;
-    dispatch(s->ctx->words, [&](auto w) {
-        pt2_stochastic_impl(*as_space<decltype(w)::value>(s->space), coeffs, nroots, energies, eps, eps_det,
-                            samples, nbatches, static_cast<u64>(seed), mean, error, norm, stats, threads, sigma);
-        return 0;
-    });
+    itercc_sci_pt2_stochastic_orbits(space, coeffs, nroots, energies, eps, eps_det, samples, nbatches, seed, sigma,
+                                     0.0, mean, error, norm, stats, threads);
 }
 
 void itercc_sci_pt2_screened(void *space, const double *coeffs, int64_t nroots, const double *energies,

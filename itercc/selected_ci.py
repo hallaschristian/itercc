@@ -779,15 +779,15 @@ class SelectedCI:
                             stats = np.zeros(2, dtype=np.int64)
                             electronic = np.ascontiguousarray(energies - self.constant)
                             exact_eps = pt2_epsilon if pt2_deterministic is None else pt2_deterministic
-                            if sign is None:
+                            if group is None:
                                 self.kernels.sci_pt2(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
                                                      float(exact_eps), int(pt2_batches), pt2.ctypes.data,
                                                      pt2_norm.ctypes.data, stats.ctypes.data, threads)
-                            else:       # each swap pair of externals once
-                                self.kernels.sci_pt2_pairs(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
-                                                           float(exact_eps), int(pt2_batches), float(sign),
-                                                           pt2.ctypes.data, pt2_norm.ctypes.data, stats.ctypes.data,
-                                                           threads)
+                            else:       # each orbit of externals once
+                                self.kernels.sci_pt2_orbits(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
+                                                            float(exact_eps), int(pt2_batches), float(group[0]),
+                                                            float(group[1]), pt2.ctypes.data, pt2_norm.ctypes.data,
+                                                            stats.ctypes.data, threads)
                             externals = int(stats[0])
                             if pt2_deterministic is not None and pt2_deterministic > pt2_epsilon:
                                 mean = np.zeros(nroots)
@@ -797,10 +797,11 @@ class SelectedCI:
                                           int(seed))
                                 outputs = (mean.ctypes.data, pt2_error.ctypes.data, norm.ctypes.data,
                                            stats.ctypes.data, threads)
-                                if sign is None:
+                                if group is None:
                                     self.kernels.sci_pt2_stochastic(*common, *outputs)
                                 else:
-                                    self.kernels.sci_pt2_stochastic_pairs(*common, float(sign), *outputs)
+                                    self.kernels.sci_pt2_stochastic_orbits(*common, float(group[0]), float(group[1]),
+                                                                           *outputs)
                                 pt2 = pt2 + mean
                                 pt2_norm = pt2_norm + norm
                             seconds["pt2"] += time.perf_counter() - start
@@ -1028,7 +1029,8 @@ class SelectedCI:
     # ----- polarizabilities -------------------------------------------------------------
     def _dipole_irreps(self, dipoles, dipole_irreps):
         if self.axial:
-            raise NotImplementedError("polarizabilities in axial orbitals are not supported; use real orbitals")
+            # |Delta M_L| of each component (`axial.axial_dipoles`: x and z, y zero).
+            return (1, 1, 0)
         from .finite_field import _irreps
         return _irreps(dipoles, self.irreps if self._labels_given else None, dipole_irreps)
 
@@ -1050,7 +1052,7 @@ class SelectedCI:
     def polarizability(self, dipoles, wavelengths_nm=(np.inf,), *, damping_Eh=0.0, references=None, spin_parity=1,
                        epsilons=(1e-3, 3e-4, 1e-4), dipole_irreps=None, pt2_epsilon=None, max_determinants=None,
                        max_cycles=8, new_fraction=0.01, tol=1e-5, ground_tol=1e-6, spaces=None, callback=None,
-                       solve_options=None, initial=None):
+                       solve_options=None, initial=None, mirror_parity=None):
         """Dipole polarizabilities of the selected-CI ground state, one
         `SCIPolarizability` per stage (or per given space).
 
@@ -1078,11 +1080,15 @@ class SelectedCI:
         series: the ground state's selection starts from that space, with
         the given `epsilons`. Like `max_determinants`, the memory budget
         (`memory_budget_gib`) ends the series before a space that would not
-        fit."""
+        fit. In axial orbitals pass `axial.axial_dipoles` (x and z; the
+        response spaces then hold M_L = 0 and +-1, and alpha_yy = alpha_xx);
+        `mirror_parity=1` adds the reflection (a Sigma+ ground state: its x
+        and z responses are even too)."""
         dipoles = _symmetric(dipoles)
         wavelengths = tuple(float(w) for w in np.atleast_1d(wavelengths_nm))
         irreps = self._dipole_irreps(dipoles, dipole_irreps)
         partners = spin_parity is not None
+        mirror = mirror_parity is not None
         threads = self._threads()
         results = []
 
@@ -1101,7 +1107,8 @@ class SelectedCI:
             for dets in spaces:
                 start = time.perf_counter()
                 response = SelectedCIResponse(self, dipoles, dets, spin_parity=spin_parity, dipole_irreps=irreps,
-                                              previous=response, residual_tol=ground_tol)
+                                              previous=response, residual_tol=ground_tol,
+                                              mirror_parity=mirror_parity)
                 finish(response, start)
             if response is not None:
                 response.close()
@@ -1115,7 +1122,7 @@ class SelectedCI:
 
         ground = self.solve(1, references=references, spin_parity=spin_parity, epsilons=epsilons,
                             pt2_epsilon=pt2_epsilon, max_determinants=max_determinants, initial=initial,
-                            checkpoint=keep, **(solve_options or {}))
+                            checkpoint=keep, mirror_parity=mirror_parity, **(solve_options or {}))
         union, response = None, None
         plan = self._memory_plan()
         # Block PCG on the dipole components (about 8 vectors each) or the
@@ -1144,7 +1151,8 @@ class SelectedCI:
                     response = SelectedCIResponse(self, dipoles, union, spin_parity=spin_parity,
                                                   dipole_irreps=irreps, previous=response, guess=guess,
                                                   residual_tol=_SELECT_GROUND_TOL,
-                                                  order=order if cycle == 0 else None, rebuild=rebuild)
+                                                  order=order if cycle == 0 else None, rebuild=rebuild,
+                                                  mirror_parity=mirror_parity)
                     plan.record(len(union), response.hamiltonian_bytes)
                     c0 = np.ascontiguousarray(np.abs(response.ground))
                     fresh = []
@@ -1154,21 +1162,25 @@ class SelectedCI:
                         d = np.ascontiguousarray(d)
                         buffer = self.kernels.sci_select_onebody(response._space, d.ctypes.data, c0.ctypes.data,
                                                                  float(stage.epsilon), int(partners), threads)
-                        fresh.append(self._take(buffer))
+                        fresh.append(self._close(self._take(buffer), mirror))
                     statics = response.statics(_SELECT_RESPONSE_TOL)
                     xs = [np.abs(x) / np.linalg.norm(x) for x in statics if x is not None and np.linalg.norm(x) > 0]
                     if xs:
                         cmax = np.ascontiguousarray(np.max(xs, axis=0))
                         buffer = self.kernels.sci_select(response._space, cmax.ctypes.data, float(stage.epsilon),
                                                          int(partners), threads)
-                        fresh.append(self._take(buffer))
+                        fresh.append(self._close(self._take(buffer), mirror))
                     fresh = [f for f in fresh if len(f)]
                     new = self._difference(response._space, np.concatenate(fresh)) if fresh else union[:0]
                     fits, extends = plan.check(len(union) + len(new), per_determinant, response.hamiltonian_bytes)
-                    if (len(new) <= new_fraction * len(union) or cycle == max_cycles - 1 or not fits
-                            or (max_determinants is not None and len(union) + len(new) > max_determinants)):
+                    capped = not fits or (max_determinants is not None and len(union) + len(new) > max_determinants)
+                    if len(new) <= new_fraction * len(union) or cycle == max_cycles - 1 or capped:
                         break
                     union = np.concatenate([union, new])
+                if capped and cycle == 0:
+                    # The cap stopped the stage before any response determinants
+                    # joined its ground space: no polarizability of this stage.
+                    break
                 finish(response, start, stage.pt2[0])
         finally:
             if response is not None:
@@ -1283,11 +1295,26 @@ class SelectedCIResponse:
     `rebuild`), its solutions start the new solves, and `previous` is
     closed; matrices that are not extended are freed before the new ones are
     built.
+
+    With `spin_parity` (and `sci.spin_pairs`) the Hamiltonian, ground state
+    and response vectors live on one function per alpha-beta swap pair (the
+    dipole operators are spin-free), with `mirror_parity` per orbit under
+    swap and reflection (axial orbitals; a Sigma+ ground state and the x and
+    z components, which are even); `ground`, `statics` and `static` return
+    determinant vectors. In axial orbitals give `axial.axial_dipoles` (y
+    zero): alpha_yy is set to alpha_xx.
     """
 
     def __init__(self, sci, dipoles, determinants, *, spin_parity=1, dipole_irreps=None, guess=None,
-                 residual_tol=1e-9, previous=None, order=None, rebuild=False):
+                 residual_tol=1e-9, previous=None, order=None, rebuild=False, mirror_parity=None):
         self.sci, self.kernels, self.spin_parity = sci, sci.kernels, spin_parity
+        self.mirror_parity = mirror_parity
+        if mirror_parity is not None and sci.mirror is None:
+            raise ValueError("mirror_parity needs orbital_mirror")
+        self._group = None
+        if mirror_parity is not None or (spin_parity is not None and sci.spin_pairs):
+            self._group = (0 if spin_parity is None else spin_parity, 0 if mirror_parity is None else mirror_parity)
+        self._basis = None
         threads = sci._threads()
         self.determinants = np.ascontiguousarray(determinants, dtype=np.uint64).reshape(-1, 2 * sci.words)
         self.size = n = len(self.determinants)
@@ -1296,7 +1323,7 @@ class SelectedCIResponse:
         self._ham, self._space, self._ops, self._guesses = None, None, [None, None, None], {}
         prefix = (order is None and previous is not None and previous.size <= n
                   and np.array_equal(previous.determinants, self.determinants[:previous.size]))
-        extend = prefix and not rebuild and previous._ham is not None
+        extend = prefix and not rebuild and previous._ham is not None and previous._group == self._group
         carried = {}
         if order is not None and previous is not None:
             # A re-sorted space: `order` maps its rows to those of the previous
@@ -1308,24 +1335,35 @@ class SelectedCIResponse:
                 return np.concatenate([v, np.zeros(n - len(v), dtype=v.dtype)])[order]
 
             guess = moved(previous.ground)
-            carried = {key: [(moved(x), shift) for x, shift in stored] for key, stored in previous._guesses.items()}
+            carried = {key: [(moved(previous._to_full(x)), shift) for x, shift in stored]
+                       for key, stored in previous._guesses.items()}
+        elif previous is not None and prefix:
+            # The previous space is a prefix: its solutions, as determinant
+            # vectors padded with zeros, start this space's solves.
+            carried = {key: [(previous._to_full(x), shift) for x, shift in stored]
+                       for key, stored in previous._guesses.items()}
         try:
             if previous is not None and not extend:
-                if prefix:              # rebuilt: the previous solutions still start this space's solves
-                    if guess is None:
-                        guess = previous.ground
-                    carried = previous._guesses
+                if prefix and guess is None:    # rebuilt: the previous solutions still start this space's solves
+                    guess = previous.ground
                 previous._release_matrices()
             self._space = sci._space(self.determinants)
             single = sci._single(n)
             if extend:
                 if guess is None:
                     guess = previous.ground
-                carried = previous._guesses
-                self._ham = self.kernels.sci_hamiltonian_extend(self._space, previous._ham, previous.size, 1e-15,
-                                                                single, threads)
-            else:
+                if self._group is None:
+                    self._ham = self.kernels.sci_hamiltonian_extend(self._space, previous._ham, previous.size, 1e-15,
+                                                                    single, threads)
+                else:
+                    self._ham = self.kernels.sci_hamiltonian_pairs_extend(
+                        self._space, previous._ham, previous.size, float(self._group[0]), float(self._group[1]),
+                        1e-15, single, threads)
+            elif self._group is None:
                 self._ham = self.kernels.sci_hamiltonian(self._space, 1e-15, single, threads)
+            else:
+                self._ham = self.kernels.sci_hamiltonian_pairs(self._space, float(self._group[0]),
+                                                               float(self._group[1]), 1e-15, single, threads)
             if not self._ham:
                 raise MemoryError("Could not build the Hamiltonian")
             for j, d in enumerate(self._dipoles):
@@ -1342,10 +1380,13 @@ class SelectedCIResponse:
                 self._ops[j] = op
             if previous is not None:
                 previous.close()
-            self._diagonal = np.empty(n)
+            if self._group is not None:
+                self._basis = _Pairs(sci, self._space, n, *self._group)
+            self._m = n if self._basis is None else self._basis.count      # length of the internal vectors
+            self._diagonal = np.empty(self._m)
             self.kernels.sci_ham_diagonal(self._ham, self._diagonal.ctypes.data)
             self._partner = None
-            if spin_parity is not None:
+            if spin_parity is not None and self._basis is None:
                 self._partner = np.empty(n, dtype=np.int64)
                 self.kernels.sci_partners(self._space, self._partner.ctypes.data, threads)
             fill_from = None
@@ -1358,20 +1399,40 @@ class SelectedCIResponse:
         except BaseException:
             self.close()
             raise
-        # The previous space's solutions (zero-padded, or permuted) start this space's solves.
+        # The previous space's solutions (determinant vectors, zero-padded or
+        # permuted) start this space's solves.
         for key, stored in carried.items():
-            self._guesses[key] = [(x if len(x) == n else np.concatenate([x, np.zeros(n - len(x), dtype=x.dtype)]), s)
+            self._guesses[key] = [(self._to_internal(x if len(x) == n else
+                                                     np.concatenate([x, np.zeros(n - len(x), dtype=x.dtype)])), s)
                                   for x, s in stored]
+
+    def _to_full(self, v):
+        """An internal (orbit-basis) vector as a determinant vector."""
+        if self._basis is None:
+            return v
+        if np.iscomplexobj(v):
+            return self._to_full(v.real) + 1j * self._to_full(v.imag)
+        return np.ascontiguousarray(self._basis.to_full(np.asarray(v, dtype=np.float64)[None])[0])
+
+    def _to_internal(self, v):
+        """A determinant vector projected onto the internal (orbit) basis."""
+        if self._basis is None:
+            return v
+        if np.iscomplexobj(v):
+            return self._to_internal(v.real) + 1j * self._to_internal(v.imag)
+        return np.ascontiguousarray(self._basis.to_pairs(np.asarray(v, dtype=np.float64)[None])[0])
 
     def _ground_state(self, guess, residual_tol, fill_from=None):
         sci, threads = self.sci, self.sci._threads()
         energies, vectors = sci._diagonalize(self._ham, self._space, self.size, 1, guess, self.spin_parity,
-                                             residual_tol, None, fill_from, self.determinants)
+                                             residual_tol, None, fill_from, self.determinants, pairs=self._group)
         self.residual_tol = residual_tol
         self.energy = float(energies[0])
         self._e0 = self.energy - sci.constant
-        self.ground = np.ascontiguousarray(vectors[0])
-        # Q mu_j |0> from the compiled one-body matrices.
+        self.ground = np.ascontiguousarray(vectors[0])           # determinant vector
+        self._g = self._to_internal(self.ground)
+        self._g = self._g / np.linalg.norm(self._g)
+        # Q mu_j |0> from the compiled one-body matrices (determinants), as internal vectors.
         self.sources, moments = [], np.zeros(3)
         for j, op in enumerate(self._ops):
             if op is None:
@@ -1380,7 +1441,7 @@ class SelectedCIResponse:
             y = np.empty(self.size)
             self.kernels.sci_matvec(op, self.ground.ctypes.data, y.ctypes.data, threads)
             moments[j] = _dot(self.ground, y)
-            self.sources.append(self._project(y))
+            self.sources.append(self._project(self._to_internal(y)))
         self.dipole_au = moments
 
     def refine(self, residual_tol):
@@ -1432,8 +1493,8 @@ class SelectedCIResponse:
             self.kernels.sci_parity(len(v), self._partner.ctypes.data, float(self.spin_parity), v.ctypes.data,
                                     out.ctypes.data, threads)
             v = out
-        overlap = _dot(self.ground, v)
-        return _axpy(-overlap, self.ground, v)
+        overlap = _dot(self._g, v)
+        return _axpy(-overlap, self._g, v)
 
     def _project(self, v):
         if np.iscomplexobj(v):
@@ -1442,7 +1503,7 @@ class SelectedCIResponse:
 
     def _apply(self, v):
         v = np.ascontiguousarray(v, dtype=np.float64)      # held while the kernel reads it
-        out = np.empty(self.size)
+        out = np.empty(self._m)
         self.kernels.sci_matvec(self._ham, v.ctypes.data, out.ctypes.data, self.sci._threads())
         return out
 
@@ -1488,7 +1549,7 @@ class SelectedCIResponse:
         at a real shift: {j: (x, report)}, or None when the operator is not
         positive definite there (an excitation below the shift)."""
         K, threads = self.kernels, self.sci._threads()
-        n, k = self.size, len(js)
+        n, k = self._m, len(js)
         e = self._e0 + float(shift)
         ones, minus_ones = np.ones(k), -np.ones(k)
         B = np.ascontiguousarray(np.stack([self.sources[j] for j in js], axis=1))
@@ -1507,7 +1568,8 @@ class SelectedCIResponse:
                 top = np.max(np.abs(v))
                 if top > 0:
                     weights = np.maximum(weights, np.abs(v) / top)
-        block = _BlockPreconditioner.leading(self.sci, self.determinants, self._diagonal, weights)
+        block = _BlockPreconditioner.leading(self.sci, self.determinants, self._diagonal, weights,
+                                             pairs=self._basis)
 
         def dot(a, b):
             out = np.empty(k)
@@ -1521,16 +1583,16 @@ class SelectedCIResponse:
         def apply(v, out):              # out = Q (H - e) v
             K.sci_matmat(self._ham, k, v.ctypes.data, out.ctypes.data, threads)
             axpby(np.full(k, -e), v, ones, out)
-            K.sci_block_deflate(n, k, self.ground.ctypes.data, out.ctypes.data, threads)
+            K.sci_block_deflate(n, k, self._g.ctypes.data, out.ctypes.data, threads)
 
         def precondition_into(r, z):    # z = Q M^-1 r
             K.sci_block_divide(n, k, precondition.ctypes.data, 0.0, 1e-3, r.ctypes.data, z.ctypes.data, threads)
             if block is not None:
                 dv = block.denominators(block.values, e, True)
                 z[block.rows] = block.vectors @ ((block.vectors.T @ r[block.rows]) / dv[:, None])
-            K.sci_block_deflate(n, k, self.ground.ctypes.data, z.ctypes.data, threads)
+            K.sci_block_deflate(n, k, self._g.ctypes.data, z.ctypes.data, threads)
 
-        K.sci_block_deflate(n, k, self.ground.ctypes.data, X.ctypes.data, threads)
+        K.sci_block_deflate(n, k, self._g.ctypes.data, X.ctypes.data, threads)
         b_norm = np.sqrt(dot(B, B))
         b_norm[b_norm == 0] = 1.0
         Q = np.empty_like(X)
@@ -1588,15 +1650,16 @@ class SelectedCIResponse:
         return {j: self._gmres(j, shift, tol, restart, maxiter) for j in js}
 
     def statics(self, tol=1e-8, maxiter=1000):
-        """The static response vectors (H - E_0)^-1 Q mu_j|0>, j = 0..2 (None for a zero component)."""
+        """The static response vectors (H - E_0)^-1 Q mu_j|0>, j = 0..2 (None for a zero
+        component), as determinant vectors."""
         found = self._solve_many(0.0, tol, 40, maxiter)
-        return [found[j][0] if j in found else None for j in range(3)]
+        return [self._to_full(found[j][0]) if j in found else None for j in range(3)]
 
     def static(self, j, tol=1e-8, restart=40, maxiter=1000):
         """The static response vector of component j (None for a zero component)."""
         if self.sources[j] is None:
             return None
-        return self._solve_many(0.0, tol, restart, maxiter, components=[j])[j][0]
+        return self._to_full(self._solve_many(0.0, tol, restart, maxiter, components=[j])[j][0])
 
     def field_screen(self, field_au, tol=1e-6):
         """|c_0| + F max_j |x_j|: a bound on the magnitudes of the states in
@@ -1639,6 +1702,8 @@ class SelectedCIResponse:
                 tensor[i, j] = sum(np.dot(self.sources[i], side[j][0]) + np.dot(side[i][0], side[j][2])
                                    for side in (plus, minus))
         tensor = 0.5 * (tensor + tensor.T)
+        if self.sci.axial and self.sources[1] is None and self.sources[0] is not None:
+            tensor[1, 1] = tensor[0, 0]          # cylindrical symmetry: y as x
         return Polarizability(wavelength_nm, frequency, damping_Eh, tensor, tuple(reports))
 
 

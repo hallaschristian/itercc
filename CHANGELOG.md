@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Selected-CI polarizabilities in the symmetry-adapted bases (core ABI 47).
+  `SelectedCIResponse` and `SelectedCI.polarizability` solve the ground
+  state and the responses on the spin pairs (the dipoles are spin-free),
+  and in axial orbitals take `axial.axial_dipoles` (x and z real there;
+  alpha_yy = alpha_xx) with `mirror_parity=1` for a Sigma+ ground state:
+  the response spaces hold M_L = 0 and +-1, over swap x reflection orbits.
+  CuF aug-cc-pVDZ-DK (26 electrons), the same natural orbitals: alpha_iso
+  17.1 au from 2.9 million determinants, 4.4 GB and 138 s in axial
+  orbitals; real orbitals with spin pairs need about three times the memory
+  and time for that value.
+  PT2 over swap x reflection orbits (`itercc_sci_pt2_orbits`,
+  `_stochastic_orbits`): each orbit of externals once, on its image of
+  lowest hash, from the orbits' representative internals; the
+  semistochastic part adds an internal's terms to all images of one
+  external together. CuF Sigma states, 0.66 million determinants:
+  deterministic 12.5 -> 7.4 s with the reflection (25.7 s before spin pairs).
+- Fixed: a selected-CI polarizability stage that the memory budget or
+  `max_determinants` stopped before any response determinants joined its
+  ground space was recorded, with zero response components (the series now
+  ends there).
+
 - Selected CI, symmetry round (core ABI 46). Spin pairs: with
   `spin_parity`, the variational problem lives on one function per
   alpha-beta swap pair, (D + sign D') / sqrt(2) (`SelectedCI(spin_pairs=True)`,

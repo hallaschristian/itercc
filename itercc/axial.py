@@ -288,3 +288,30 @@ def axial_natural_orbitals(density, lz, mirror):
             rotation[np.ix_(minus, minus)] = v
             occupations[minus] = w
     return rotation, occupations
+
+
+def axial_dipoles(dipoles, orbitals, *, tol=1e-8):
+    """The x, y, z dipole matrices (real orbitals, aligned by `orbitals.real`)
+    in the axial orbitals: z (Delta m = 0) and x (Delta m = +-1) are real and
+    symmetric there; y is imaginary, and is returned as zeros (by the
+    cylindrical symmetry alpha_yy = alpha_xx, which `SelectedCIResponse`
+    fills in for axial orbitals)."""
+    t = orbitals.transform
+    lz = np.asarray(orbitals.lz)
+    out = []
+    for k, d in enumerate(np.asarray(dipoles, dtype=np.float64)):
+        dc = t.conj().T @ d @ t
+        if k == 1:
+            if np.abs(dc.real).max() > tol:
+                raise ValueError("the y dipole is not imaginary in the axial orbitals")
+            out.append(np.zeros_like(d))
+            continue
+        if np.abs(dc.imag).max() > tol:
+            raise ValueError("a dipole component is not real in the axial orbitals")
+        dc = dc.real
+        allowed = np.abs(lz[:, None] - lz[None, :]) == (1 if k == 0 else 0)
+        if np.abs(dc[~allowed]).max(initial=0.0) > tol:
+            raise ValueError("a dipole component breaks the axial selection rule")
+        dc[~allowed] = 0.0
+        out.append(0.5 * (dc + dc.T))
+    return tuple(out)
