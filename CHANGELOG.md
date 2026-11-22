@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Larger Douglas-Kroll basis sets bundled (copied unchanged from PySCF
+  2.14.0): aug-cc-pVTZ-DK, aug-cc-pVQZ-DK, aug-cc-pV5Z-DK, aug-cc-pwCVQZ-DK
+  and aug-cc-pwCV5Z-DK, so scalar-relativistic models up to 5Z build without
+  PySCF (CuF, Cu aug-cc-pwCVQZ-DK / F aug-cc-pVQZ-DK: 265 functions, native
+  ERIs in about 6.5 minutes and sfX2C RHF in 11 s on 12 cores).
+  `active_space.natural_virtuals(density, nocc, count, fock=,
+  orbital_irreps= | orbital_lz=, mirror=)` keeps the `count` most occupied
+  natural virtuals of a (for example state-averaged selected-CI) density,
+  per symmetry label and, in axial orbitals, with each +-m pair kept or
+  dropped together and the same rotation for both; semicanonical with
+  `fock`. The same columns rotate the aligned real orbitals, so coupled
+  cluster runs on the identical truncated space.
+
 - Selected-CI polarizabilities in the symmetry-adapted bases (core ABI 47).
   `SelectedCIResponse` and `SelectedCI.polarizability` solve the ground
   state and the responses on the spin pairs (the dipoles are spin-free),

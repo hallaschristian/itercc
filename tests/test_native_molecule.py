@@ -85,6 +85,27 @@ def test_bundled_basis_sets_give_pyscf_energies(basis, monkeypatch):
     assert mol.nao == reference.mol.nao and abs(result.energy - reference.e_tot) < 1e-9
 
 
+@pytest.mark.parametrize("cu, f, nao", [("aug-cc-pwCVTZ-DK", "aug-cc-pVTZ-DK", 173),
+                                          ("aug-cc-pwCVQZ-DK", "aug-cc-pVQZ-DK", 265),
+                                          ("aug-cc-pwCV5Z-DK", "aug-cc-pV5Z-DK", None)])
+def test_bundled_douglas_kroll_sets_cover_copper_fluoride(cu, f, nao, monkeypatch):
+    """The Douglas-Kroll correlation-consistent sets up to 5Z load from the
+    package's own files (no PySCF on the path), with PySCF's AO counts."""
+    from pathlib import Path
+
+    import itercc.molecule as molecule
+
+    bundled = Path(molecule.__file__).parent / "basis_sets"
+    monkeypatch.setattr(molecule, "_basis_directories", lambda: [bundled])
+    mol = molecule.Molecule("Cu 0 0 0; F 0 0 1.76", {"Cu": cu, "F": f})
+    if nao is not None:
+        assert mol.nao == nao
+    from pyscf import gto
+
+    reference = gto.M(atom="Cu 0 0 0; F 0 0 1.76", basis={"Cu": cu, "F": f}, verbose=0)
+    assert mol.nao == reference.nao
+
+
 def test_effective_core_potentials_are_refused():
     from itercc.molecule import Molecule
 

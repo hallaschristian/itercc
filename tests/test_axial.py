@@ -207,3 +207,63 @@ def test_reflection_pt2_matches_and_samples_without_bias(lih):
     np.testing.assert_array_equal(runs[0].pt2, runs[1].pt2)
     assert np.all(runs[0].pt2_error > 0)
     assert np.all(np.abs(runs[0].pt2 - stage.pt2) < 3 * runs[0].pt2_error + 1e-12)
+
+
+def test_natural_virtuals_keep_axial_pairs(lih):
+    """Frozen natural virtuals of a selected-CI density in axial orbitals:
+    pairs kept together, labels and reflection consistent; keeping every
+    virtual is a rotation (same full-CI energy), fewer give a higher one."""
+    from itercc.active_space import natural_virtuals
+
+    hc, eric = lih["complex"]
+    model, axial = lih["model"], lih["axial"]
+    sci = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz, orbital_mirror=axial.mirror)
+    ground = sci.solve(1, spin_parity=1, mirror_parity=1, epsilons=(1e-3,))
+    density = sci.density_matrix(ground)
+    nocc, n = model.nocc, len(hc)
+    occ = np.arange(nocc)
+    fock = hc + 2 * eric[:, :, occ, occ].sum(-1) - np.einsum("piiq->pq", eric[:, :nocc, :nocc, :])
+    energies = {}
+    for count in (n - nocc, 10):
+        c, lz, mirror, discarded = natural_virtuals(density, nocc, count, fock=fock, orbital_lz=axial.lz,
+                                                    mirror=axial.mirror)
+        assert c.shape == (n, nocc + count)
+        np.testing.assert_allclose(c.T @ c, np.eye(nocc + count), atol=1e-12)
+        np.testing.assert_array_equal(lz[mirror], -lz)
+        np.testing.assert_array_equal(mirror[mirror], np.arange(nocc + count))
+        h2, eri2 = rotate_integrals(hc, eric, c, axial=True)
+        # The reference energy is unchanged (occupied orbitals untouched).
+        a = np.arange(nocc)
+        e_ref = model.constant + 2 * np.trace(h2[np.ix_(a, a)]) + 2 * np.einsum("iijj->", eri2[np.ix_(a, a, a, a)]) \
+            - np.einsum("ijji->", eri2[np.ix_(a, a, a, a)])
+        assert e_ref == pytest.approx(lih["model"].constant + 2 * np.trace(hc[np.ix_(a, a)])
+                                      + 2 * np.einsum("iijj->", eric[np.ix_(a, a, a, a)])
+                                      - np.einsum("ijji->", eric[np.ix_(a, a, a, a)]), abs=1e-10)
+        small = SelectedCI(h2, eri2, 4, model.constant, orbital_lz=lz, orbital_mirror=mirror)
+        energies[count] = small.solve(1, spin_parity=1, mirror_parity=1, **FULL).energies[0]
+        if count == n - nocc:
+            assert discarded == pytest.approx(0.0, abs=1e-12)
+        else:
+            assert discarded > 0
+    full = sci.solve(1, spin_parity=1, mirror_parity=1, **FULL).energies[0]
+    assert energies[n - nocc] == pytest.approx(full, abs=1e-9)
+    assert energies[10] > full
+
+
+def test_natural_virtuals_with_c2v_labels(lih):
+    """Real orbitals: natural virtuals within each C2v irrep; keeping all is a rotation."""
+    from itercc.active_space import natural_virtuals
+
+    h, eri = lih["real"]
+    model, labels = lih["model"], lih["labels"]
+    sci = SelectedCI(h, eri, 4, model.constant, orbital_irreps=labels)
+    density = sci.density_matrix(sci.solve(1, spin_parity=1, epsilons=(1e-3,)))
+    nocc, n = model.nocc, len(h)
+    c, new_labels, mirror, discarded = natural_virtuals(density, nocc, n - nocc, orbital_irreps=labels)
+    assert mirror is None and discarded == pytest.approx(0.0, abs=1e-12)
+    for k in range(n):
+        assert np.all(labels[np.abs(c[:, k]) > 1e-12] == new_labels[k])
+    h2, eri2 = rotate_integrals(h, eri, c, orbital_irreps=new_labels)
+    a = SelectedCI(h2, eri2, 4, model.constant, orbital_irreps=new_labels).solve(1, spin_parity=1, **FULL)
+    b = sci.solve(1, spin_parity=1, **FULL)
+    assert a.energies[0] == pytest.approx(b.energies[0], abs=1e-9)

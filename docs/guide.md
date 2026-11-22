@@ -514,6 +514,17 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   response spaces hold M_L = 0 and +-1, and alpha_yy is set to alpha_xx;
   with `mirror_parity=1` (a Sigma+ ground state) about a third of the memory
   and time of real orbitals with spin pairs for the same CuF alpha.
+- Larger bases: selected CI holds up to 256 orbitals, so triple- and
+  quadruple-zeta spaces are truncated to frozen natural virtuals:
+  `active_space.natural_virtuals(density, nocc, count, fock=fock,
+  orbital_lz=ax.lz, mirror=ax.mirror)` returns the columns of the kept
+  orbitals (occupied unchanged; virtuals by occupation of the density's
+  virtual block, pairs together, semicanonical), their labels and
+  reflection map, and the discarded occupation; `rotate_integrals(hc, eric,
+  columns, axial=True)` gives the truncated Hamiltonian, and the same
+  columns applied to the aligned real orbitals give the real one for
+  coupled cluster. The Douglas-Kroll sets up to aug-cc-pV5Z-DK and
+  aug-cc-pwCV5Z-DK are bundled.
 - Results do not depend on the thread count (sums in 128-bit fixed point).
   Up to 256 orbitals; the full-space limit equals full CI (tests against the
   determinant oracle and PySCF).
