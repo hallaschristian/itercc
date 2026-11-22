@@ -13,8 +13,15 @@ the variational energies linearly in the PT2 correction to full CI
 Spaces of M_S = 0 contain each determinant's alpha-beta swap, and
 `spin_parity` keeps states of even (+1: singlets, quintets) or odd (-1:
 triplets) total spin: with alpha creators before beta creators, the swap
-maps a spin-S, M_S = 0 state to (-1)^S times itself. Orbital irreps (Abelian
-labels, XOR products) keep every determinant in the references' irrep.
+maps a spin-S, M_S = 0 state to (-1)^S times itself. The variational
+problem then lives on one function per swap pair, (D + sign D') / sqrt(2)
+(`spin_pairs`, the default): half the rows and about half the nonzeros of
+the determinant Hamiltonian, and Davidson vectors of half the length; the
+roots come back as determinant vectors. Orbital irreps (Abelian
+labels, XOR products) keep every determinant in the references' irrep. For
+linear molecules, `orbital_lz` (the m of complex, Lz-adapted orbitals from
+`itercc.axial`) keeps every determinant's M_L instead (sums of m), a finer
+label than C2v's: M_L = 0 holds Sigma states, where A1 also holds Delta.
 
 Dipole polarizabilities come from linear response in a selected space
 (`SelectedCIResponse`, with the `DipoleResponse` interface and results;
@@ -118,19 +125,85 @@ class _MemoryPlan:
         return need <= self.budget, need + held <= self.budget
 
 
+class _Pairs:
+    """The symmetry-adapted basis of a space closed under alpha-beta swaps
+    (spin parity `sign`) and, with `mirror_sign`, the reflection of axial
+    orbitals: one function per orbit of determinants (the normalized
+    projection of its lowest-index member; orbits whose projection vanishes,
+    such as closed determinants for sign -1, are left out), in the order of
+    those members (the core's `sci_hamiltonian_pairs`)."""
+
+    def __init__(self, sci, space, size, sign, mirror_sign=None):
+        orbit = np.empty(size, dtype=np.int64)
+        coef = np.empty(size)
+        self.sign = float(sign or 0.0)
+        self.mirror_sign = float(mirror_sign or 0.0)
+        count = int(sci.kernels.sci_orbits(space, self.sign, self.mirror_sign, orbit.ctypes.data, coef.ctypes.data,
+                                           sci._threads()))
+        if count < 0:
+            raise RuntimeError("The space is not closed under the alpha-beta swap and reflection")
+        self.size, self.count, self.orbit = size, count, orbit
+        self.index = np.flatnonzero(orbit >= 0)
+        self.member_orbit = orbit[self.index]
+        self.member_coef = coef[self.index]
+        self.norm = np.sqrt(np.bincount(self.member_orbit, self.member_coef ** 2, minlength=count))
+        _, first = np.unique(self.member_orbit, return_index=True)
+        self.reps = self.index[first]
+
+    def to_pairs(self, vectors):
+        """(k, size) determinant vectors -> (k, orbits): their projections."""
+        v = np.asarray(vectors, dtype=np.float64)
+        out = np.empty((len(v), self.count))
+        for k in range(len(v)):
+            out[k] = np.bincount(self.member_orbit, self.member_coef * v[k, self.index],
+                                 minlength=self.count) / self.norm
+        return out
+
+    def to_full(self, vectors):
+        """(k, orbits) -> (k, size) determinant vectors (zero outside orbits)."""
+        v = np.asarray(vectors, dtype=np.float64)
+        scale = self.member_coef / self.norm[self.member_orbit]
+        out = np.zeros((len(v), self.size))
+        for k in range(len(v)):
+            out[k, self.index] = scale * v[k, self.member_orbit]
+        return out
+
+    def rows(self, full_rows):
+        """The orbits holding any of the determinant indices `full_rows`."""
+        found = self.orbit[np.asarray(full_rows, dtype=np.int64)]
+        return np.unique(found[found >= 0])
+
+    def determinants(self, dets, rows):
+        """The determinants of the orbits `rows`: their representatives in
+        order, then the other members (so an orbit space built from them
+        numbers the orbits as `rows`)."""
+        rows = np.asarray(rows, dtype=np.int64)
+        chosen = np.zeros(self.count, dtype=bool)
+        chosen[rows] = True
+        reps = self.reps[rows]
+        members = self.index[chosen[self.member_orbit]]
+        others = np.setdiff1d(members, reps)
+        return np.ascontiguousarray(np.concatenate([dets[reps], dets[others]]))
+
+
 class _BlockPreconditioner:
     """(H - e)^-1 approximated by the exact inverse on a block of leading
     determinants (`rows`, by weight in the vectors being solved for) and by
     the diagonal elsewhere: the leading determinants carry the strong
-    couplings that slow diagonal-preconditioned solvers."""
+    couplings that slow diagonal-preconditioned solvers. With `pairs` the
+    rows are spin pairs (of determinants `determinants`)."""
 
-    def __init__(self, sci, determinants, diagonal, rows):
+    def __init__(self, sci, determinants, diagonal, rows, pairs=None):
         self.diagonal, self.rows = np.ascontiguousarray(diagonal, dtype=np.float64), np.ascontiguousarray(rows, dtype=np.int64)
         self.kernels, self.threads = sci.kernels, sci._threads()
         m = len(self.rows)
-        space = sci._space(np.ascontiguousarray(determinants[self.rows]))
+        block_dets = (np.ascontiguousarray(determinants[self.rows]) if pairs is None
+                      else pairs.determinants(determinants, self.rows))
+        space = sci._space(block_dets)
         try:
-            ham = sci.kernels.sci_hamiltonian(space, 0.0, 0, sci._threads())
+            ham = (sci.kernels.sci_hamiltonian(space, 0.0, 0, sci._threads()) if pairs is None
+                   else sci.kernels.sci_hamiltonian_pairs(space, pairs.sign, pairs.mirror_sign, 0.0, 0,
+                                                          sci._threads()))
             try:
                 dense = np.empty((m, m))
                 sci.kernels.sci_ham_dense(ham, dense.ctypes.data)
@@ -141,8 +214,8 @@ class _BlockPreconditioner:
         self.values, self.vectors = np.linalg.eigh(dense)
 
     @classmethod
-    def leading(cls, sci, determinants, diagonal, weights, size=None):
-        """The block of the `size` determinants with the largest weight (max |v| over the given vectors)."""
+    def leading(cls, sci, determinants, diagonal, weights, size=None, pairs=None):
+        """The block of the `size` determinants (pairs) with the largest weight (max |v| over the given vectors)."""
         size = BLOCK_PRECONDITIONER if size is None else size
         n = len(diagonal)
         if size <= 0 or n == 0:
@@ -151,7 +224,7 @@ class _BlockPreconditioner:
             rows = np.arange(n)
         else:
             rows = np.sort(np.argpartition(-np.asarray(weights), size - 1)[:size])
-        return cls(sci, determinants, diagonal, rows)
+        return cls(sci, determinants, diagonal, rows, pairs)
 
     def denominators(self, values, e, positive):
         d = values - e
@@ -284,20 +357,26 @@ class SelectedCI:
     """Selected CI of a real orbital Hamiltonian (h, chemists' eri (pq|rs))
     with `nelec` electrons (an even count with M_S = 0, or (nalpha, nbeta))."""
 
-    def __init__(self, h, eri, nelec, constant=0.0, *, orbital_irreps=None, cutoff=1e-12, cpu_threads=None,
-                 hamiltonian_precision="auto", memory_budget_gib="auto"):
+    def __init__(self, h, eri, nelec, constant=0.0, *, orbital_irreps=None, orbital_lz=None, orbital_mirror=None,
+                 cutoff=1e-12, cpu_threads=None, hamiltonian_precision="auto", memory_budget_gib="auto",
+                 spin_pairs=True):
         h = np.ascontiguousarray(h, dtype=np.float64)
         n = h.shape[0]
         if h.shape != (n, n) or not np.allclose(h, h.T, atol=1e-10):
             raise ValueError("h must be a real symmetric matrix")
+        if orbital_irreps is not None and orbital_lz is not None:
+            raise ValueError("Give orbital_irreps (real orbitals) or orbital_lz (axial orbitals), not both")
+        self.axial = orbital_lz is not None
         eri = np.ascontiguousarray(np.asarray(eri, dtype=np.float64).reshape(n, n, n, n))
-        # The core keeps one integral per 8-fold permutation class: check a sample.
+        # The core keeps one integral per permutation class (8-fold for real
+        # orbitals, 4-fold for axial ones): check a sample.
         p, q, r, s = np.random.default_rng(0).integers(0, n, size=(4, min(4096, n ** 4)))
         sample = eri[p, q, r, s]
         tolerance = 1e-10 * max(1.0, float(np.abs(sample).max()))
-        if any(np.abs(eri[a, b, c, d] - sample).max() > tolerance
-               for a, b, c, d in ((q, p, r, s), (p, q, s, r), (r, s, p, q))):
-            raise ValueError("eri must have the 8-fold permutational symmetry of real orbitals")
+        images = ((r, s, p, q), (q, p, s, r)) if self.axial else ((q, p, r, s), (p, q, s, r), (r, s, p, q))
+        if any(np.abs(eri[a, b, c, d] - sample).max() > tolerance for a, b, c, d in images):
+            raise ValueError("eri must have the 4-fold permutational symmetry of axial orbitals" if self.axial
+                             else "eri must have the 8-fold permutational symmetry of real orbitals")
         if n > 256:
             raise ValueError("At most 256 orbitals")
         if isinstance(nelec, (tuple, list)):
@@ -316,23 +395,40 @@ class SelectedCI:
         if memory_budget_gib != "auto" and memory_budget_gib is not None and not float(memory_budget_gib) > 0:
             raise ValueError('memory_budget_gib must be "auto", None or positive')
         self.memory_budget_gib = memory_budget_gib
+        self.spin_pairs = bool(spin_pairs)
         self._h, self._eri, self._cutoff = h, eri, float(cutoff)
-        self._labels_given = orbital_irreps is not None
+        self._labels_given = orbital_irreps is not None or orbital_lz is not None
         self.kernels = _cpu_kernels.library()
         if self.kernels is None:
             raise RuntimeError("SelectedCI needs the compiled core (see itercc._cpu_kernels)")
         self.norb, self.nalpha, self.nbeta = n, nalpha, nbeta
         self.constant = float(constant)
         self.cpu_threads = _runtime.thread_option(cpu_threads)
-        self.irreps = (np.zeros(n, dtype=np.int64) if orbital_irreps is None
-                       else np.ascontiguousarray(orbital_irreps, dtype=np.int64))
-        if self.irreps.shape != (n,) or self.irreps.min() < 0 or self.irreps.max() > 7:
-            raise ValueError("orbital_irreps must hold one Abelian irrep 0..7 per orbital")
+        if self.axial:
+            self.irreps = np.ascontiguousarray(orbital_lz, dtype=np.int64)
+            if self.irreps.shape != (n,):
+                raise ValueError("orbital_lz must hold one m per orbital")
+        else:
+            self.irreps = (np.zeros(n, dtype=np.int64) if orbital_irreps is None
+                           else np.ascontiguousarray(orbital_irreps, dtype=np.int64))
+            if self.irreps.shape != (n,) or self.irreps.min() < 0 or self.irreps.max() > 7:
+                raise ValueError("orbital_irreps must hold one Abelian irrep 0..7 per orbital")
         self._ctx = self.kernels.sci_create(n, nalpha, nbeta, h.ctypes.data, eri.ctypes.data,
-                                            self.irreps.ctypes.data, float(cutoff), self._threads())
+                                            self.irreps.ctypes.data, int(self.axial), float(cutoff),
+                                            self._threads())
         if not self._ctx:
             raise MemoryError("Could not create the selected-CI context")
         self.words = int(self.kernels.sci_words(self._ctx))
+        self.mirror = None
+        if orbital_mirror is not None:
+            if not self.axial:
+                raise ValueError("orbital_mirror needs axial orbitals (orbital_lz)")
+            mirror = np.ascontiguousarray(orbital_mirror, dtype=np.int64)
+            if mirror.shape != (n,) or (self.irreps[mirror] != -self.irreps).any():
+                raise ValueError("orbital_mirror must map each orbital to one of opposite m")
+            if self.kernels.sci_set_mirror(self._ctx, mirror.ctypes.data) != 0:
+                raise ValueError("orbital_mirror must be an involution")
+            self.mirror = mirror
         sizes = np.zeros(3, dtype=np.int64)
         self.context_bytes = int(self.kernels.sci_list_sizes(self._ctx, sizes.ctypes.data))
         self.list_sizes = tuple(int(x) for x in sizes)
@@ -385,7 +481,11 @@ class SelectedCI:
         return tuple(out)
 
     def irrep(self, row):
+        """The determinant's irrep (XOR of its orbitals' labels), or its M_L
+        (their sum) in axial orbitals."""
         alpha, beta = self.occupations(row)
+        if self.axial:
+            return int(sum(int(self.irreps[p]) for p in (*alpha, *beta)))
         label = 0
         for p in (*alpha, *beta):
             label ^= int(self.irreps[p])
@@ -410,6 +510,28 @@ class SelectedCI:
                     if irrep is None or self.irrep(det) == irrep:
                         out.append(det)
         return np.array(out, dtype=np.uint64).reshape(-1, 2 * self.words)
+
+    def mirrored(self, rows, chunk=1 << 20):
+        """The reflections of determinant rows (orbital p -> orbital_mirror[p]):
+        each row's bits unpacked, permuted and packed again (in chunks)."""
+        rows = np.ascontiguousarray(rows, dtype=np.uint64).reshape(-1, 2 * self.words)
+        bits = 64 * self.words
+        perm = np.arange(2 * bits)
+        for offset in (0, bits):
+            perm[offset + self.mirror] = offset + np.arange(self.norb)      # new bit mirror[p] <- old bit p
+        out = np.empty_like(rows)
+        for start in range(0, len(rows), chunk):
+            block = rows[start:start + chunk].view(np.uint8)
+            unpacked = np.unpackbits(block, axis=1, bitorder="little")
+            packed = np.packbits(unpacked[:, perm], axis=1, bitorder="little")
+            out[start:start + chunk] = np.ascontiguousarray(packed).view(np.uint64)
+        return out
+
+    def _close(self, rows, mirror):
+        """rows with their reflections (distinct) when `mirror`."""
+        if not mirror or len(rows) == 0:
+            return rows
+        return self._unique(np.concatenate([rows, self.mirrored(rows)]))
 
     def swapped(self, rows):
         rows = np.asarray(rows, dtype=np.uint64).reshape(-1, 2 * self.words)
@@ -442,7 +564,7 @@ class SelectedCI:
     def solve(self, nroots=1, *, references=None, spin_parity=None, epsilons=(1e-3, 3e-4, 1e-4, 5e-5),
               pt2_epsilon=None, pt2_batches=1, pt2_deterministic=None, pt2_samples=200, pt2_sample_batches=20,
               seed=0, residual_tol=1e-5, max_space=None, max_cycles=12, new_fraction=0.01,
-              max_determinants=None, callback=None, checkpoint=None, initial=None):
+              max_determinants=None, callback=None, checkpoint=None, initial=None, mirror_parity=None):
         """Roots `0..nroots-1` of the selected space for each epsilon in
         turn (each space grows from the previous one). `references` (rows;
         default the aufbau determinant) fix the irrep; `spin_parity` +1/-1
@@ -472,9 +594,17 @@ class SelectedCI:
         the references, e.g. to resume with the remaining epsilons: the roots
         are solved there first, unless `initial=(determinants, vectors,
         stage)` passes the checkpoint's stage too (its converged roots then
-        select directly, exactly as the uninterrupted series)."""
+        select directly, exactly as the uninterrupted series).
+        `mirror_parity` +1/-1 (axial orbitals with `orbital_mirror`, M_L = 0
+        references) keeps Sigma+ or Sigma- states: spaces then contain each
+        determinant's reflection, and the problem lives on one function per
+        orbit under the swap and the reflection (half the rows again)."""
         if spin_parity not in (None, 1, -1):
             raise ValueError("spin_parity must be None, +1 or -1")
+        if mirror_parity not in (None, 1, -1):
+            raise ValueError("mirror_parity must be None, +1 or -1")
+        if mirror_parity is not None and self.mirror is None:
+            raise ValueError("mirror_parity needs orbital_mirror")
         if spin_parity is not None and self.nalpha != self.nbeta:
             raise ValueError("Spin parity needs equal alpha and beta counts")
         threads = self._threads()
@@ -483,6 +613,9 @@ class SelectedCI:
         target = {self.irrep(r) for r in refs}
         if len(target) != 1:
             raise ValueError("The references must share one irrep")
+        if mirror_parity is not None and target != {0}:
+            raise ValueError("mirror_parity needs M_L = 0 references")
+        mirror = mirror_parity is not None
         partners = spin_parity is not None
         if spin_parity == -1 and all((r[:self.words] == r[self.words:]).all() for r in refs):
             # Closed-shell determinants have no odd-spin component: start from
@@ -491,6 +624,7 @@ class SelectedCI:
             if len(refs) == 0:
                 raise ValueError("No open-shell determinant of the references' irrep")
         dets = self._unique(np.concatenate([refs, self.swapped(refs)]) if partners else refs)
+        dets = self._close(dets, mirror)
         vectors = given = None
         if initial is not None:
             dets = np.ascontiguousarray(initial[0], dtype=np.uint64).reshape(-1, 2 * self.words)
@@ -500,15 +634,19 @@ class SelectedCI:
                     given = initial[2]
                     if given.determinants != len(dets) or len(given.energies) != nroots:
                         raise ValueError("The initial stage does not match the initial space and roots")
-        # Grow the reference space until it holds the roots comfortably.
-        while initial is None and len(dets) < 4 * nroots + 4:
+        # Grow the reference space until it holds the roots comfortably: count
+        # the symmetry-adapted functions (closed determinants carry no odd
+        # spin, reflection-invariant ones no Sigma- part).
+        while initial is None:
             space = self._space(dets)
             try:
+                if self._functions(space, len(dets), spin_parity, mirror_parity) >= 4 * nroots + 4:
+                    break
                 ones = np.ones(len(dets))          # held while the kernel reads it
                 buffer = self.kernels.sci_select(space, ones.ctypes.data, 1e-2, int(partners), threads)
             finally:
                 self.kernels.sci_space_free(space)
-            new = self._take(buffer)
+            new = self._close(self._take(buffer), mirror)
             if len(new) == 0:
                 break
             dets = np.concatenate([dets, new])
@@ -518,7 +656,7 @@ class SelectedCI:
         try:
             return self._series(dets, vectors, given, nroots, epsilons, spin_parity, partners, pt2_epsilon, pt2_batches,
                                 pt2_deterministic, pt2_samples, pt2_sample_batches, seed, residual_tol, max_space,
-                                max_cycles, new_fraction, max_determinants, callback, checkpoint)
+                                max_cycles, new_fraction, max_determinants, callback, checkpoint, mirror_parity)
         finally:
             if self._kept is not None:
                 self.kernels.sci_ham_free(self._kept)
@@ -527,13 +665,31 @@ class SelectedCI:
     _kept = None
     _kept_n = 0
 
-    def _hamiltonian(self, space, size):
+    def _functions(self, space, size, spin_parity, mirror_parity):
+        """The number of basis functions of a space for the given parities
+        (orbits with a nonzero projection; determinants without them)."""
+        if spin_parity is None and mirror_parity is None:
+            return size
+        orbit, coef = np.empty(size, dtype=np.int64), np.empty(size)
+        count = int(self.kernels.sci_orbits(space, float(spin_parity or 0), float(mirror_parity or 0),
+                                            orbit.ctypes.data, coef.ctypes.data, self._threads()))
+        return size if count < 0 else count
+
+    def _hamiltonian(self, space, size, group=None):
+        """The space's Hamiltonian (over the orbits of `group` = (spin parity,
+        reflection parity), 0 for an unused operation, if given), extending
+        the kept one of the previous cycle."""
         threads = self._threads()
-        if self._kept is not None and self._kept_n <= size:
-            ham = self.kernels.sci_hamiltonian_extend(space, self._kept, self._kept_n, 1e-15, self._single(size),
-                                                      threads)
+        single = self._single(size)
+        extend = self._kept is not None and self._kept_n <= size
+        if group is None:
+            ham = (self.kernels.sci_hamiltonian_extend(space, self._kept, self._kept_n, 1e-15, single, threads)
+                   if extend else self.kernels.sci_hamiltonian(space, 1e-15, single, threads))
         else:
-            ham = self.kernels.sci_hamiltonian(space, 1e-15, self._single(size), threads)
+            t, m = (float(x) for x in group)
+            ham = (self.kernels.sci_hamiltonian_pairs_extend(space, self._kept, self._kept_n, t, m, 1e-15, single,
+                                                             threads)
+                   if extend else self.kernels.sci_hamiltonian_pairs(space, t, m, 1e-15, single, threads))
         if self._kept is not None:
             self._release(self._kept)
             self._kept = None
@@ -543,11 +699,17 @@ class SelectedCI:
 
     def _series(self, dets, vectors, given, nroots, epsilons, spin_parity, partners, pt2_epsilon, pt2_batches,
                 pt2_deterministic, pt2_samples, pt2_sample_batches, seed, residual_tol, max_space, max_cycles,
-                new_fraction, max_determinants, callback, checkpoint):
+                new_fraction, max_determinants, callback, checkpoint, mirror_parity=None):
         threads = self._threads()
         stages = []
         capped = False
         fresh = None            # rows without amplitudes yet (first-order fill)
+        mirror = mirror_parity is not None
+        # The reflection's orbits include the swap whenever the spin parity is kept.
+        sign = spin_parity if (spin_parity is not None and (self.spin_pairs or mirror)) else None
+        group = None
+        if sign is not None or mirror:
+            group = (0 if sign is None else sign, 0 if mirror_parity is None else mirror_parity)
         plan = self._memory_plan()
         # Davidson's subspace and images, the roots' product buffers (about
         # STRIPES/2 + 1 rows each), residuals, indices and determinant copies.
@@ -571,7 +733,7 @@ class SelectedCI:
                 try:
                     if not solved:
                         start = time.perf_counter()
-                        ham = self._hamiltonian(space, len(dets))
+                        ham = self._hamiltonian(space, len(dets), group)
                         nnz = int(self.kernels.sci_ham_nnz(ham))
                         held = int(self.kernels.sci_ham_bytes(ham))
                         plan.record(len(dets), held)
@@ -579,14 +741,14 @@ class SelectedCI:
                         self._kept, self._kept_n = ham, len(dets)
                         start = time.perf_counter()
                         energies, vectors = self._diagonalize(ham, space, len(dets), nroots, vectors, spin_parity,
-                                                              steer, max_space, fresh, dets)
+                                                              steer, max_space, fresh, dets, pairs=group)
                         fresh = None
                         solved, refined = True, steer <= residual_tol
                         seconds["davidson"] += time.perf_counter() - start
                     start = time.perf_counter()
                     cmax = np.ascontiguousarray(np.max(np.abs(vectors), axis=0))
                     buffer = self.kernels.sci_select(space, cmax.ctypes.data, float(eps), int(partners), threads)
-                    new = self._take(buffer)
+                    new = self._close(self._take(buffer), mirror)
                     seconds["select"] += time.perf_counter() - start
                     kept = held + 8 * 34 * nroots * len(dets) if self._kept is not None else 0
                     fits, extends = plan.check(len(dets) + len(new), per_determinant, kept)
@@ -598,7 +760,8 @@ class SelectedCI:
                         if not refined:         # the stage's space: its roots to residual_tol
                             start = time.perf_counter()
                             energies, vectors = self._diagonalize(ham, space, len(dets), nroots, vectors,
-                                                                  spin_parity, residual_tol, max_space, None, dets)
+                                                                  spin_parity, residual_tol, max_space, None, dets,
+                                                                  pairs=group)
                             refined = True
                             seconds["davidson"] += time.perf_counter() - start
                         s2 = np.zeros(nroots)
@@ -616,18 +779,28 @@ class SelectedCI:
                             stats = np.zeros(2, dtype=np.int64)
                             electronic = np.ascontiguousarray(energies - self.constant)
                             exact_eps = pt2_epsilon if pt2_deterministic is None else pt2_deterministic
-                            self.kernels.sci_pt2(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
-                                                 float(exact_eps), int(pt2_batches), pt2.ctypes.data,
-                                                 pt2_norm.ctypes.data, stats.ctypes.data, threads)
+                            if sign is None:
+                                self.kernels.sci_pt2(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
+                                                     float(exact_eps), int(pt2_batches), pt2.ctypes.data,
+                                                     pt2_norm.ctypes.data, stats.ctypes.data, threads)
+                            else:       # each swap pair of externals once
+                                self.kernels.sci_pt2_pairs(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
+                                                           float(exact_eps), int(pt2_batches), float(sign),
+                                                           pt2.ctypes.data, pt2_norm.ctypes.data, stats.ctypes.data,
+                                                           threads)
                             externals = int(stats[0])
                             if pt2_deterministic is not None and pt2_deterministic > pt2_epsilon:
                                 mean = np.zeros(nroots)
                                 norm = np.zeros(nroots)
-                                self.kernels.sci_pt2_stochastic(
-                                    space, vectors.ctypes.data, nroots, electronic.ctypes.data, float(pt2_epsilon),
-                                    float(pt2_deterministic), int(pt2_samples), int(pt2_sample_batches), int(seed),
-                                    mean.ctypes.data, pt2_error.ctypes.data, norm.ctypes.data, stats.ctypes.data,
-                                    threads)
+                                common = (space, vectors.ctypes.data, nroots, electronic.ctypes.data, float(pt2_epsilon),
+                                          float(pt2_deterministic), int(pt2_samples), int(pt2_sample_batches),
+                                          int(seed))
+                                outputs = (mean.ctypes.data, pt2_error.ctypes.data, norm.ctypes.data,
+                                           stats.ctypes.data, threads)
+                                if sign is None:
+                                    self.kernels.sci_pt2_stochastic(*common, *outputs)
+                                else:
+                                    self.kernels.sci_pt2_stochastic_pairs(*common, float(sign), *outputs)
                                 pt2 = pt2 + mean
                                 pt2_norm = pt2_norm + norm
                             seconds["pt2"] += time.perf_counter() - start
@@ -701,7 +874,26 @@ class SelectedCI:
         return out
 
     def _diagonalize(self, ham, space, size, nroots, previous, spin_parity, residual_tol, max_space, fill_from=None,
-                     dets=None):
+                     dets=None, pairs=None):
+        """The lowest `nroots` roots of `ham` (determinant vectors back).
+        With `pairs` = (spin parity, reflection parity), `ham` is the
+        Hamiltonian over that group's orbits: the roots are solved there and
+        expanded."""
+        if pairs is not None and pairs is not False:
+            basis = _Pairs(self, space, size, *pairs)
+            if previous is not None:
+                previous = basis.to_pairs(previous)
+            if fill_from is not None:
+                rows = np.arange(fill_from, size) if np.ndim(fill_from) == 0 else fill_from
+                fill_from = basis.rows(rows)
+            energies, vectors = self._solve_roots(ham, space, basis.count, nroots, previous, None, residual_tol,
+                                                  max_space, fill_from, dets, basis)
+            return energies, np.ascontiguousarray(basis.to_full(vectors))
+        return self._solve_roots(ham, space, size, nroots, previous, spin_parity, residual_tol, max_space, fill_from,
+                                 dets, None)
+
+    def _solve_roots(self, ham, space, size, nroots, previous, spin_parity, residual_tol, max_space, fill_from, dets,
+                     block_pairs):
         threads = self._threads()
         diagonal = np.empty(size)
         self.kernels.sci_ham_diagonal(ham, diagonal.ctypes.data)
@@ -765,7 +957,8 @@ class SelectedCI:
                     break
         space_size = max_space or max(4 * nroots + 4, 24)
         weights = np.max(np.abs(np.asarray(guesses)), axis=0) if guesses else -diagonal
-        block = (_BlockPreconditioner.leading(self, dets, diagonal, weights) if dets is not None else None)
+        block = (_BlockPreconditioner.leading(self, dets, diagonal, weights, pairs=block_pairs)
+                 if dets is not None else None)
 
         def precondition(residual, energy, vector):
             # Olsen's correction t = M^-1 r - e M^-1 x with x . t = 0, M the block
@@ -834,6 +1027,8 @@ class SelectedCI:
 
     # ----- polarizabilities -------------------------------------------------------------
     def _dipole_irreps(self, dipoles, dipole_irreps):
+        if self.axial:
+            raise NotImplementedError("polarizabilities in axial orbitals are not supported; use real orbitals")
         from .finite_field import _irreps
         return _irreps(dipoles, self.irreps if self._labels_given else None, dipole_irreps)
 
@@ -1001,6 +1196,8 @@ class SelectedCI:
         the screening instead (|H_ai| screen_i >= pt2_epsilon at every
         field), so the doubles kept are the same at every field and E2 is
         smooth in it."""
+        if self.axial:
+            raise NotImplementedError("polarizabilities in axial orbitals are not supported; use real orbitals")
         dets = np.ascontiguousarray(determinants, dtype=np.uint64)
         parent = self
         screen = None
@@ -1458,13 +1655,20 @@ def _axpy(a, x, y):
     return combine(np.array([a, 1.0]), [np.ascontiguousarray(x), np.ascontiguousarray(y)], out)
 
 
-def rotate_integrals(h, eri, coefficients, *, orbital_irreps=None):
-    """h and chemists' eri in the orbitals `coefficients` (columns); the
+def rotate_integrals(h, eri, coefficients, *, orbital_irreps=None, axial=False):
+    """h and chemists' eri in the orbitals `coefficients` (columns, real); the
     two-electron part by the native transformation (`integrals.mo_eri`, with
-    exact zeros for the symmetry-forbidden entries given `orbital_irreps`)."""
+    exact zeros for the symmetry-forbidden entries given `orbital_irreps`).
+    `axial=True` takes integrals of axial orbitals (4-fold symmetric only)
+    and transforms them index by index."""
     from .integrals import mo_eri
     c = np.ascontiguousarray(coefficients, dtype=np.float64)
     n = c.shape[0]
     h2 = c.T @ np.asarray(h, dtype=np.float64) @ c
+    if axial:
+        g = np.asarray(eri, dtype=np.float64).reshape(n, n, n, n)
+        for _ in range(4):           # contract the leading index, move it last
+            g = np.tensordot(g, c, axes=([0], [0]))
+        return h2, np.ascontiguousarray(g)
     g = mo_eri(np.ascontiguousarray(eri, dtype=np.float64).reshape(n, n, n, n), c, orbital_irreps=orbital_irreps)
     return h2, np.ascontiguousarray(g.reshape(c.shape[1], c.shape[1], c.shape[1], c.shape[1]))

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Selected CI, symmetry round (core ABI 46). Spin pairs: with
+  `spin_parity`, the variational problem lives on one function per
+  alpha-beta swap pair, (D + sign D') / sqrt(2) (`SelectedCI(spin_pairs=True)`,
+  the default): half the rows and about half the nonzeros of the
+  determinant Hamiltonian, Davidson vectors of half the length, the same
+  roots (`itercc_sci_hamiltonian_pairs`). PT2 accumulates each swap pair of
+  externals once, from the representative internals
+  (`itercc_sci_pt2_pairs`, `_stochastic_pairs`): the same E2 in about half
+  the generation and map entries (CuF, 0.68 million determinants:
+  deterministic 25.7 -> 14.1 s; the semistochastic remainder 25% lower
+  error for the same samples).
+  Axial orbitals for linear molecules (`itercc.axial`):
+  `axial_orbitals(basis, coefficients)` pairs cos- and sin-type orbitals
+  into Lz eigenfunctions (projecting out an SCF's small mixing of |m|),
+  `axial_integrals` gives their real integrals (4-fold symmetric only, the
+  core stores them as such: `SelectedCI(orbital_lz=m)`, `rotate_integrals(...,
+  axial=True)`), and `axial_natural_orbitals` keeps the pairing. Spaces then
+  keep M_L, a finer label than C2v's (A1 holds Sigma+ and Delta, M_L = 0
+  Sigma only): CuF aug-cc-pVDZ-DK, 26 electrons, the same natural orbitals,
+  reaches a variational energy with 1.25-1.35 times fewer determinants
+  (growing with the space) and 15% fewer nonzeros per determinant. With
+  `orbital_mirror` and `solve(mirror_parity=+1/-1)` Sigma+ and Sigma-
+  states also use the reflection: one function per orbit under swap and
+  reflection, half the rows and nonzeros again (CuF, 3.3 million
+  determinants: 398 -> 201 million nonzeros, Davidson 17.2 -> 9.0 s).
+
 - Fixed: deterministic selected-CI PT2 chose each external's batch from
   hash bits 20-23, which are also slot bits once a hash-map shard holds
   2^21 slots. Each batch then filled one sixteenth of every table and

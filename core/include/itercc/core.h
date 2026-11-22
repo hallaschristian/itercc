@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 45
+#define ITERCC_CORE_ABI 46
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -896,9 +896,13 @@ void itercc_triplet_contraction_profile(int64_t count, double *seconds, int64_t 
  * string (orbital p = bit p % 64 of word p / 64). A space indexes a fixed,
  * duplicate-free determinant array. Energies exclude any constant. Results
  * do not depend on the thread count (sums in 128-bit fixed point). Up to 256
- * orbitals and fewer than 64 alpha electrons (create returns NULL otherwise). */
+ * orbitals and fewer than 64 alpha electrons (create returns NULL otherwise).
+ * irrep: one label per orbital (singles keep it). axial != 0: the orbitals
+ * are complex Lz eigenfunctions with real integrals, for which only
+ * (pq|rs) = (rs|pq) = (qp|sr) hold (not the 8-fold real-orbital symmetry);
+ * irrep then holds each orbital's m. */
 void *itercc_sci_create(int64_t norb, int64_t nalpha, int64_t nbeta, const double *h, const double *eri,
-                        const int64_t *irrep, double cutoff, int threads);
+                        const int64_t *irrep, int64_t axial, double cutoff, int threads);
 void itercc_sci_free(void *ctx);
 int64_t itercc_sci_words(const void *ctx);
 /* out (three entries): opposite-spin, same-spin and singles list lengths;
@@ -917,6 +921,26 @@ void *itercc_sci_hamiltonian(void *space, double drop, int single, int threads);
  * longer usable). */
 void *itercc_sci_hamiltonian_extend(void *space, const void *old, int64_t n_old, double drop,
                                     int single, int threads);
+/* The Hamiltonian in a symmetry-adapted basis: one function per orbit of
+ * the space's determinants under the alpha-beta swap (spin parity sigma_t,
+ * +1 or -1; 0: not used) and the orbital reflection set by
+ * itercc_sci_set_mirror (parity sigma_m; 0: not used), the normalized
+ * projection of the orbit's lowest-index determinant (orbits numbered by
+ * it; orbits whose projection vanishes are left out). With the swap alone:
+ * (D + sigma D') / sqrt(2), or D when D' = D. _extend: as
+ * itercc_sci_hamiltonian_extend, with n_old the old space's determinant count
+ * (complete orbits). NULL when the space is not closed under the operations. */
+void *itercc_sci_hamiltonian_pairs(void *space, double sigma_t, double sigma_m, double drop, int single, int threads);
+void *itercc_sci_hamiltonian_pairs_extend(void *space, const void *old, int64_t n_old, double sigma_t,
+                                          double sigma_m, double drop, int single, int threads);
+/* Each determinant's orbit (-1: none) and coefficient in its orbit's
+ * unnormalized projection sum_g chi(g) g D (D the orbit's lowest index; the
+ * norm squared is the sum of its members' coefficients squared); returns the
+ * orbit count, -1 when the space is not closed. */
+int64_t itercc_sci_orbits(void *space, double sigma_t, double sigma_m, int64_t *orbit, double *coef, int threads);
+/* The reflection of axial orbitals (orbital p -> mirror[p], an involution;
+ * each orbital's image with phase +1); NULL clears it. -1 if not an involution. */
+int itercc_sci_set_mirror(void *ctx, const int64_t *mirror);
 int64_t itercc_sci_ham_nnz(const void *ham);
 void itercc_sci_ham_free(void *ham);
 void itercc_sci_ham_diagonal(const void *ham, double *out);
@@ -956,6 +980,18 @@ void itercc_sci_pt2_screened(void *space, const double *coeffs, int64_t nroots, 
 void itercc_sci_pt2_stochastic(void *space, const double *coeffs, int64_t nroots, const double *energies,
                                double eps, double eps_det, int64_t samples, int64_t nbatches, int64_t seed,
                                double *mean, double *error, double *norm, int64_t *stats, int threads);
+/* itercc_sci_pt2 and itercc_sci_pt2_stochastic for states of spin parity
+ * sigma (+1 or -1) in a space closed under alpha-beta swaps (coefficients
+ * with c(D') = sigma c(D)): each swap pair of externals is accumulated once,
+ * from the pairs' representative internals, so the same E2 costs about half
+ * the generation and half the hash-map entries; stats[0] still counts every
+ * external determinant. */
+void itercc_sci_pt2_pairs(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
+                          int64_t batches, double sigma, double *out, double *norm, int64_t *stats, int threads);
+void itercc_sci_pt2_stochastic_pairs(void *space, const double *coeffs, int64_t nroots, const double *energies,
+                                     double eps, double eps_det, int64_t samples, int64_t nbatches, int64_t seed,
+                                     double sigma, double *mean, double *error, double *norm, int64_t *stats,
+                                     int threads);
 /* Spin-summed one-particle density matrix sum_k weights_k gamma_k (n x n). */
 void itercc_sci_rdm1(void *space, const double *coeffs, int64_t nroots, const double *weights, double *out,
                      int threads);

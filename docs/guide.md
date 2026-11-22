@@ -482,6 +482,34 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   determinant, so give `references` that contain them): `sci.natural_orbitals(result)`
   gives occupations, coefficients and their irreps, and
   `rotate_integrals(h, eri, coefficients)` the Hamiltonian to start again in.
+- Spin pairs: with `spin_parity` the problem lives on one function per
+  alpha-beta swap pair (`spin_pairs=True`, the default): half the rows and
+  about half the nonzeros of the determinant Hamiltonian, and PT2 counts
+  each pair of externals once (about half the time); `spin_pairs=False`
+  keeps the projected determinant problem (the same roots and PT2).
+- Linear molecules: axial (Lz) orbitals keep M_L, a finer label than C2v's,
+  and the reflection. From real orbitals (`model.mo_coeff`, symmetry-adapted
+  and of a cylindrically symmetric state):
+
+  ```python
+  from itercc.axial import axial_orbitals, axial_integrals, axial_natural_orbitals
+  ax = axial_orbitals(molecule.basis, model.mo_coeff)
+  h, eri = rotate_integrals(model.h, model.eri, ax.real, orbital_irreps=model.orbital_irreps)
+  hc, eric = axial_integrals(h, eri, ax)
+  sci = SelectedCI(hc, eric, 2 * model.nocc, model.constant, orbital_lz=ax.lz, orbital_mirror=ax.mirror)
+  sigma = sci.solve(2, spin_parity=1, mirror_parity=1, epsilons=eps)        # Sigma+ (M_L = 0)
+  refs = sci.single_excitations(sci.aufbau(), irrep=1)[:4]                    # irrep = M_L
+  pi = sci.solve(1, references=refs, spin_parity=1, epsilons=eps)            # Pi (M_L = 1)
+  ```
+
+  `irrep` arguments are M_L values; `mirror_parity=+1/-1` (M_L = 0) keeps
+  Sigma+ or Sigma- and halves the problem again. `axial_natural_orbitals(
+  density, ax.lz, ax.mirror)` gives natural orbitals that keep the pairing
+  (the cylindrical average of a Pi state's density), and
+  `rotate_integrals(hc, eric, rotation, axial=True)` applies them. CuF
+  aug-cc-pVDZ-DK (26 electrons): the same variational energies with 1.25-1.35
+  times fewer determinants than C2v labels. Polarizabilities are not yet
+  available in axial orbitals.
 - Results do not depend on the thread count (sums in 128-bit fixed point).
   Up to 256 orbitals; the full-space limit equals full CI (tests against the
   determinant oracle and PySCF).

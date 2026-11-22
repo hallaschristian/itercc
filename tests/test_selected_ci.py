@@ -61,6 +61,33 @@ def test_full_space_limit_equals_full_ci(model, irrep):
     assert np.min(found) == pytest.approx(exact[0], abs=1e-10)
 
 
+@pytest.mark.parametrize("parity", [1, -1])
+def test_spin_pair_basis_equals_projected_determinants(model, parity):
+    """The spin-pair Hamiltonian gives the projected determinant problem's
+    roots and PT2 with half the rows and about half the nonzeros."""
+    refs = references(solver(model), 3)
+    options = dict(references=refs, spin_parity=parity, epsilons=(3e-2, 1e-2, 1e-3), pt2_epsilon=1e-6)
+    pairs = solver(model).solve(2, **options)
+    full = solver(model, spin_pairs=False).solve(2, **options)
+    np.testing.assert_array_equal(pairs.determinants, full.determinants)
+    for a, b in zip(pairs.stages, full.stages):
+        np.testing.assert_allclose(a.energies, b.energies, atol=1e-10)
+        np.testing.assert_allclose(a.pt2, b.pt2, atol=1e-12)
+        np.testing.assert_allclose(a.s2, b.s2, atol=1e-8)
+        assert a.nonzeros < 0.75 * b.nonzeros
+    # Root vectors: the same states (up to sign), with the swap symmetry.
+    sci = solver(model)
+    space = sci._space(pairs.determinants)
+    try:
+        partner = np.empty(len(pairs.determinants), dtype=np.int64)
+        sci.kernels.sci_partners(space, partner.ctypes.data, 2)
+    finally:
+        sci.kernels.sci_space_free(space)
+    for u, v in zip(pairs.vectors, full.vectors):
+        assert abs(abs(u @ v) - 1.0) < 1e-8
+        np.testing.assert_allclose(u[partner], parity * u, atol=1e-12)
+
+
 def test_results_do_not_depend_on_threads(model):
     one = solver(model, cpu_threads=1).solve(2, spin_parity=1, epsilons=(1e-2, 1e-3), pt2_epsilon=1e-6)
     many = solver(model, cpu_threads=3).solve(2, spin_parity=1, epsilons=(1e-2, 1e-3), pt2_epsilon=1e-6)
@@ -100,6 +127,22 @@ def test_pt2_equals_brute_force_and_batches(model):
         sci.kernels.sci_space_free(space)
     batched = sci.solve(2, spin_parity=1, epsilons=(3e-2,), pt2_epsilon=0.0, pt2_batches=3)
     np.testing.assert_array_equal(batched.stages[-1].pt2, stage.pt2)
+
+
+def test_paired_semistochastic_pt2_matches_determinant_sums(model):
+    """The swap-paired semistochastic remainder estimates the same E2 as the
+    determinant sums (unbiased against the exact paired E2), seeded."""
+    options = dict(spin_parity=1, epsilons=(3e-2,), pt2_epsilon=0.0)
+    exact = solver(model).solve(2, **options).stages[-1]
+    full = solver(model, spin_pairs=False).solve(2, **options).stages[-1]
+    np.testing.assert_allclose(exact.pt2, full.pt2, atol=1e-13)
+    assert exact.pt2_externals == full.pt2_externals
+    runs = [solver(model).solve(2, pt2_deterministic=5e-3, pt2_samples=30, pt2_sample_batches=400, seed=seed,
+                                **options).stages[-1] for seed in (3, 3)]
+    np.testing.assert_array_equal(runs[0].pt2, runs[1].pt2)
+    # Many batches: a missing cross term between the two members of an
+    # external pair (both reached from one open internal) shows as a bias.
+    assert np.all(np.abs(runs[0].pt2 - exact.pt2) < 3 * runs[0].pt2_error + 1e-12)
 
 
 def test_semistochastic_pt2_is_unbiased_and_seeded(model):
