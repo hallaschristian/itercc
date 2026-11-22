@@ -103,6 +103,28 @@ def test_prebuilt_and_runtime_builds_agree_bitwise(monkeypatch):
         np.testing.assert_array_equal(left, right)
 
 
+def test_runtime_build_install_never_replaces_a_library(tmp_path, monkeypatch):
+    # A second build of the same key must not rename over the first: on a
+    # network file system that deletes the file under processes mapping it.
+    target = tmp_path / "libitercc_core.runtime-0.so"
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    _cpu_kernels._install(first, target)
+    inode = target.stat().st_ino
+    _cpu_kernels._install(second, target)
+    assert target.read_bytes() == b"first" and target.stat().st_ino == inode
+
+    def no_links(source, name):
+        raise PermissionError("no hard links")
+    monkeypatch.setattr(_cpu_kernels.os, "link", no_links)
+    _cpu_kernels._install(second, target)
+    assert target.read_bytes() == b"first"
+    fresh = tmp_path / "libitercc_core.runtime-1.so"
+    _cpu_kernels._install(second, fresh)
+    assert fresh.read_bytes() == b"second"
+
+
 def test_cuda_backend_selftest():
     backend = _core.cuda()
     if backend is None:

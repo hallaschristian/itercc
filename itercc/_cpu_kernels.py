@@ -124,8 +124,25 @@ def _full_build(compiler, files, cache):
             subprocess.run([compiler, *FLAGS, f"-I{CORE / 'include'}",
                             *(str(CORE / name) for name in SOURCES), "-o", str(built)],
                            check=True, capture_output=True, text=True)
-            os.replace(built, target)       # atomic for concurrent first builds
+            _install(built, target)
     return _core._load(target, "itercc_core_abi", _core.CORE_ABI, _core.CPU_FUNCTIONS)
+
+
+def _install(built, target):
+    """Put a finished build at `target` unless a concurrent build already did.
+
+    Never replaces an existing library: on a network file system, renaming over
+    a file that another node has mapped deletes it under that process, which
+    then dies of SIGBUS at its next page fault (seven jobs starting together
+    on a shared cache did). A hard link is atomic and fails if the name exists;
+    builds of the same key are interchangeable."""
+    try:
+        os.link(built, target)
+    except FileExistsError:
+        pass
+    except OSError:                         # no hard links here: rename, if still absent
+        if not target.exists():
+            os.replace(built, target)
 
 
 def library():

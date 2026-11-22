@@ -178,13 +178,20 @@ def test_resume_from_a_checkpoint_reproduces_the_series(model):
     options = dict(spin_parity=1, pt2_epsilon=1e-6)
     whole = sci.solve(2, epsilons=(3e-2, 1e-2, 3e-3), **options)
     saved = {}
-    sci.solve(2, epsilons=(3e-2,), checkpoint=lambda st, d, v: saved.update(dets=d.copy(), vectors=v.copy()),
+    sci.solve(2, epsilons=(3e-2,), checkpoint=lambda st, d, v: saved.update(dets=d.copy(), vectors=v.copy(), stage=st),
               **options)
-    rest = sci.solve(2, epsilons=(1e-2, 3e-3), initial=(saved["dets"], saved["vectors"]), **options)
+    # With the checkpoint's stage the converged roots select directly: the same series.
+    rest = sci.solve(2, epsilons=(1e-2, 3e-3), initial=(saved["dets"], saved["vectors"], saved["stage"]), **options)
     np.testing.assert_array_equal(rest.determinants, whole.determinants)
     for a, b in zip(rest.stages, whole.stages[1:]):
         np.testing.assert_array_equal(a.energies, b.energies)
         np.testing.assert_array_equal(a.pt2, b.pt2)
+    # Without it the roots are solved again in the space first.
+    again = sci.solve(2, epsilons=(1e-2, 3e-3), initial=(saved["dets"], saved["vectors"]), **options)
+    for a, b in zip(again.stages, whole.stages[1:]):
+        np.testing.assert_allclose(a.energies, b.energies, atol=1e-9)
+    with pytest.raises(ValueError):
+        sci.solve(2, epsilons=(1e-2,), initial=(saved["dets"][:-1], saved["vectors"][:, :-1], saved["stage"]))
 
 
 def test_determinant_cap_ends_the_series(model):
@@ -193,6 +200,39 @@ def test_determinant_cap_ends_the_series(model):
     cap = free.stages[0].determinants + 1
     capped = sci.solve(1, spin_parity=1, epsilons=(3e-2, 1e-3, 1e-4), max_determinants=cap)
     assert len(capped.stages) == 1 and len(capped.determinants) <= cap
+
+
+def test_memory_budget_ends_the_series_and_rebuilds_match_extensions(model, monkeypatch):
+    import itercc.selected_ci as selected_ci
+    from test_finite_field import symmetric_dipoles
+
+    plan = selected_ci._MemoryPlan(1000.0)
+    plan.record(100, 1000)
+    plan.record(200, 2400)                      # bytes ~ n^1.26
+    assert plan.projected(400) == pytest.approx(2400 * 2 ** np.log2(2.4))
+    assert plan.check(200, 0.0, held=0) == (False, False)
+    assert selected_ci._MemoryPlan(None).check(10**9, 1e3, held=10**12) == (True, True)
+    with pytest.raises(ValueError):
+        solver(model, memory_budget_gib=0)
+
+    options = dict(spin_parity=1, epsilons=(3e-2, 1e-2, 1e-14), residual_tol=1e-10)
+    # A budget no space fits: the series stops at its first space.
+    tight = solver(model, memory_budget_gib=1e-9).solve(1, **options)
+    free = solver(model, memory_budget_gib=None).solve(1, **options)
+    assert len(tight.stages) == 1 < len(free.stages)
+    assert tight.stages[0].determinants == free.stages[0].determinants < free.stages[-1].determinants
+    # Spaces that fit only without the old matrices are built afresh: same results.
+    dipoles = symmetric_dipoles(model[4], (3, 2, 0))
+    pol_options = dict(epsilons=(3e-2, 1e-14), tol=1e-10, ground_tol=1e-10)
+    free_pol = solver(model, memory_budget_gib=None).polarizability(dipoles, **pol_options)[-1]
+    monkeypatch.setattr(selected_ci._MemoryPlan, "check", lambda self, size, per, held=0: (True, False))
+    rebuilt = solver(model).solve(1, **options)
+    rebuilt_pol = solver(model).polarizability(dipoles, **pol_options)[-1]
+    assert [s.determinants for s in rebuilt.stages] == [s.determinants for s in free.stages]
+    np.testing.assert_allclose([s.energies[0] for s in rebuilt.stages], [s.energies[0] for s in free.stages],
+                               atol=1e-10)
+    np.testing.assert_array_equal(rebuilt_pol.space, free_pol.space)
+    np.testing.assert_allclose(rebuilt_pol.tensors_au, free_pol.tensors_au, atol=1e-8)
 
 
 def test_density_matrix_and_natural_orbitals(model):

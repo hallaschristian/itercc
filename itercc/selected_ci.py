@@ -22,9 +22,10 @@ Dipole polarizabilities come from linear response in a selected space
 response-coupled determinants).
 
 The C kernels (core/src/cpu/selected_ci.cpp) hold the integrals, the sorted
-excitation lists, the sparse Hamiltonian (upper triangle, 12 bytes per
-nonzero), the one-body operator matrices, the selections and the PT2 hash
-maps; results do not depend on the thread count.
+excitation lists, the sparse Hamiltonian (upper triangle; values in single
+precision from `SINGLE_FROM` determinants, column gaps in about 1.5 bytes),
+the one-body operator matrices, the selections and the PT2 hash maps;
+results do not depend on the thread count.
 """
 
 from dataclasses import dataclass, field
@@ -32,25 +33,27 @@ import time
 
 import numpy as np
 
-from . import _cpu_kernels, _runtime, krylov
+from . import _core, _cpu_kernels, _cpu_quadruples, _runtime, krylov
 from .response import HC_EH_NM, Polarizability, _shifted_guesses
 
 
 # Spaces from this size store the Hamiltonian's values in single precision
 # (hamiltonian_precision="auto"): a third less memory and memory traffic.
 SINGLE_FROM = 1_000_000
-# Intermediate rounds of the polarizability selection only steer the
-# selection: their ground states and static responses are solved loosely.
+# Intermediate rounds of a selection only steer it: their roots (and the
+# polarizability's static responses) are solved loosely, and each stage's
+# final space is solved again to the requested tolerance. (A two-root CuF
+# series at 1e-4 throughout: Davidson 25% faster, energies within 3e-8 Eh.)
 # (Looser steering selects worse response spaces: at 5e-2 the polarizability
 # of a CuF space of 0.9 million determinants fell by 0.05 au.)
 _SELECT_GROUND_TOL = 1e-4
 _SELECT_RESPONSE_TOL = 1e-2
 
 
-# From this size each stage starts by sorting the space by alpha string, then
-# beta string: connected determinants then lie close together, and products
-# with the Hamiltonian, limited by their scattered reads, run 1.5x faster
-# (CuF, 1.8 and 3.5 million determinants). Rounds within a stage append.
+# From this size a stage's first growth sorts the grown space by alpha string,
+# then beta string: connected determinants then lie close together, and
+# products with the Hamiltonian, limited by their scattered reads, run 1.5x
+# faster (CuF, 1.8 and 3.5 million determinants). Later rounds append.
 SORT_FROM = 200_000
 
 
@@ -64,6 +67,57 @@ def _locality_order(dets, words):
 BLOCK_PRECONDITIONER = 1500
 
 
+# With memory_budget_gib="auto" the series may use this fraction of the
+# host's memory limit (`_runtime.host_memory_limit`: cgroup, Slurm
+# allocation, NUMA nodes) for the next space's matrices and vectors.
+MEMORY_FRACTION = 0.85
+
+
+class _MemoryPlan:
+    """Projected memory of a grown space against a budget (bytes, or None).
+
+    A space's matrices grow faster than the space (each determinant finds
+    more connected ones): bytes ~ n^p, p fitted to the last two builds of
+    the series that differ by 10% or more (CuF, 27 to 43 million
+    determinants: 1.26), else `EXPONENT`. Besides its matrices a space
+    holds `per_determinant` bytes per determinant (solver vectors, product
+    buffers, indices). glibc keeps blocks below 32 MiB that are freed during
+    an extension in per-thread heaps (`_core.keep_freed_memory`), so an
+    extension can hold the old and the new matrices at once: when both would
+    not fit, the old ones are freed (and the free heap returned to the
+    kernel) and the new ones built from scratch."""
+
+    EXPONENT = 1.35
+
+    def __init__(self, budget):
+        self.budget = budget
+        self.history = []               # (determinants, matrix bytes)
+
+    def record(self, size, nbytes):
+        self.history.append((int(size), int(nbytes)))
+
+    def projected(self, size):
+        """Matrix bytes of a space of `size` determinants (0 before any build)."""
+        if not self.history:
+            return 0
+        n1, b1 = self.history[-1]
+        exponent = self.EXPONENT
+        for n0, b0 in reversed(self.history[:-1]):
+            if n1 >= 1.1 * n0 and b0 > 0:
+                exponent = min(max(np.log(b1 / b0) / np.log(n1 / n0), 1.0), 1.6)
+                break
+        return b1 * (size / n1) ** exponent
+
+    def check(self, size, per_determinant, held=0):
+        """(fits, extends): whether a space of `size` determinants fits the
+        budget, and whether it also fits next to `held` bytes of the current
+        matrices (so they can be extended)."""
+        if self.budget is None or not self.history:
+            return True, True
+        need = self.projected(size) + per_determinant * size
+        return need <= self.budget, need + held <= self.budget
+
+
 class _BlockPreconditioner:
     """(H - e)^-1 approximated by the exact inverse on a block of leading
     determinants (`rows`, by weight in the vectors being solved for) and by
@@ -71,7 +125,8 @@ class _BlockPreconditioner:
     couplings that slow diagonal-preconditioned solvers."""
 
     def __init__(self, sci, determinants, diagonal, rows):
-        self.diagonal, self.rows = diagonal, np.ascontiguousarray(rows, dtype=np.int64)
+        self.diagonal, self.rows = np.ascontiguousarray(diagonal, dtype=np.float64), np.ascontiguousarray(rows, dtype=np.int64)
+        self.kernels, self.threads = sci.kernels, sci._threads()
         m = len(self.rows)
         space = sci._space(np.ascontiguousarray(determinants[self.rows]))
         try:
@@ -107,8 +162,14 @@ class _BlockPreconditioner:
     def apply(self, r, e, positive):
         """M^-1 r with M = H - e (positive: |H - e|, a positive definite
         preconditioner) for r of shape (n,) or (n, k)."""
-        d = self.denominators(self.diagonal, e, positive)
-        z = r / (d if r.ndim == 1 else d[:, None])
+        if not positive and r.dtype == np.float64 and r.flags.c_contiguous and self.kernels is not None:
+            z = np.empty_like(r)        # the diagonal part on all threads
+            k = 1 if r.ndim == 1 else r.shape[1]
+            self.kernels.sci_block_divide(len(self.diagonal), k, self.diagonal.ctypes.data, float(e), 1e-3,
+                                          r.ctypes.data, z.ctypes.data, self.threads)
+        else:
+            d = self.denominators(self.diagonal, e, positive)
+            z = r / (d if r.ndim == 1 else d[:, None])
         block = self.vectors.T @ r[self.rows]
         dv = self.denominators(self.values, e, positive)
         z[self.rows] = self.vectors @ (block / (dv if r.ndim == 1 else dv[:, None]))
@@ -224,12 +285,19 @@ class SelectedCI:
     with `nelec` electrons (an even count with M_S = 0, or (nalpha, nbeta))."""
 
     def __init__(self, h, eri, nelec, constant=0.0, *, orbital_irreps=None, cutoff=1e-12, cpu_threads=None,
-                 hamiltonian_precision="auto"):
+                 hamiltonian_precision="auto", memory_budget_gib="auto"):
         h = np.ascontiguousarray(h, dtype=np.float64)
         n = h.shape[0]
         if h.shape != (n, n) or not np.allclose(h, h.T, atol=1e-10):
             raise ValueError("h must be a real symmetric matrix")
         eri = np.ascontiguousarray(np.asarray(eri, dtype=np.float64).reshape(n, n, n, n))
+        # The core keeps one integral per 8-fold permutation class: check a sample.
+        p, q, r, s = np.random.default_rng(0).integers(0, n, size=(4, min(4096, n ** 4)))
+        sample = eri[p, q, r, s]
+        tolerance = 1e-10 * max(1.0, float(np.abs(sample).max()))
+        if any(np.abs(eri[a, b, c, d] - sample).max() > tolerance
+               for a, b, c, d in ((q, p, r, s), (p, q, s, r), (r, s, p, q))):
+            raise ValueError("eri must have the 8-fold permutational symmetry of real orbitals")
         if n > 256:
             raise ValueError("At most 256 orbitals")
         if isinstance(nelec, (tuple, list)):
@@ -245,6 +313,9 @@ class SelectedCI:
         if hamiltonian_precision not in ("auto", "single", "double"):
             raise ValueError('hamiltonian_precision must be "auto", "single" or "double"')
         self.hamiltonian_precision = hamiltonian_precision
+        if memory_budget_gib != "auto" and memory_budget_gib is not None and not float(memory_budget_gib) > 0:
+            raise ValueError('memory_budget_gib must be "auto", None or positive')
+        self.memory_budget_gib = memory_budget_gib
         self._h, self._eri, self._cutoff = h, eri, float(cutoff)
         self._labels_given = orbital_irreps is not None
         self.kernels = _cpu_kernels.library()
@@ -274,6 +345,18 @@ class SelectedCI:
 
     def _threads(self):
         return self.cpu_threads if self.cpu_threads is not None else _runtime.cpu_threads()
+
+    def _memory_plan(self):
+        budget = self.memory_budget_gib
+        if budget == "auto":
+            limit = _runtime.host_memory_limit()
+            budget = None if limit is None else MEMORY_FRACTION * limit / 2**30
+        return _MemoryPlan(None if budget is None or not np.isfinite(budget) else float(budget) * 2**30)
+
+    def _release(self, handle):
+        """Free a compiled matrix and return the free heap to the kernel."""
+        self.kernels.sci_ham_free(handle)
+        _core.release_free_memory()
 
     def _single(self, size):
         """1 when a Hamiltonian of `size` determinants stores single-precision values."""
@@ -370,17 +453,26 @@ class SelectedCI:
         exact above `pt2_deterministic`, plus E2[pt2_epsilon] -
         E2[pt2_deterministic] estimated from `pt2_sample_batches` batches of
         `pt2_samples` determinants (seeded by `seed`; `stage.pt2_error`).
+        Each stage starts from the previous stage's converged roots: it selects
+        first and builds the Hamiltonian of the grown space only.
         `max_determinants` ends the series at the first stage that would
-        outgrow it (that stage keeps the space reached so far). From
-        `SORT_FROM` determinants each stage starts by sorting the space by
-        alpha and beta string (faster products), so a stage's space is not a
-        prefix of the next one's; `checkpoint` receives each stage's space. Davidson
-        stops at `residual_tol` (the energy error is about its square over
-        the gap to the next root: 1e-5 gives about 1e-9 Eh).
+        outgrow it (that stage keeps the space reached so far), and so does
+        the memory budget (`memory_budget_gib`): the series stops before a
+        space whose projected Hamiltonian and vectors would not fit. From
+        `SORT_FROM` determinants a stage's first growth sorts the grown space
+        by alpha and beta string (faster products), so a stage's space is not a
+        prefix of the next one's; `checkpoint` receives each stage's space.
+        Each stage's roots are solved to Davidson residual `residual_tol`
+        (the energy error is about its square over the gap to the next root:
+        1e-5 gives about 1e-9 Eh); the rounds before, which only steer the
+        selection, stop at 1e-4.
         `checkpoint(stage, determinants, vectors)` runs after each stage;
         `initial=(determinants, vectors)` (from a checkpoint or a result;
         vectors may be None) starts the series from that space instead of
-        the references, e.g. to resume with the remaining epsilons."""
+        the references, e.g. to resume with the remaining epsilons: the roots
+        are solved there first, unless `initial=(determinants, vectors,
+        stage)` passes the checkpoint's stage too (its converged roots then
+        select directly, exactly as the uninterrupted series)."""
         if spin_parity not in (None, 1, -1):
             raise ValueError("spin_parity must be None, +1 or -1")
         if spin_parity is not None and self.nalpha != self.nbeta:
@@ -399,11 +491,15 @@ class SelectedCI:
             if len(refs) == 0:
                 raise ValueError("No open-shell determinant of the references' irrep")
         dets = self._unique(np.concatenate([refs, self.swapped(refs)]) if partners else refs)
-        vectors = None
+        vectors = given = None
         if initial is not None:
             dets = np.ascontiguousarray(initial[0], dtype=np.uint64).reshape(-1, 2 * self.words)
             if initial[1] is not None:
                 vectors = np.ascontiguousarray(initial[1], dtype=np.float64).reshape(nroots, len(dets))
+                if len(initial) > 2 and initial[2] is not None:
+                    given = initial[2]
+                    if given.determinants != len(dets) or len(given.energies) != nroots:
+                        raise ValueError("The initial stage does not match the initial space and roots")
         # Grow the reference space until it holds the roots comfortably.
         while initial is None and len(dets) < 4 * nroots + 4:
             space = self._space(dets)
@@ -420,7 +516,7 @@ class SelectedCI:
         # current one) is extended rather than rebuilt; it is released before
         # PT2, whose hash maps need the memory.
         try:
-            return self._series(dets, vectors, nroots, epsilons, spin_parity, partners, pt2_epsilon, pt2_batches,
+            return self._series(dets, vectors, given, nroots, epsilons, spin_parity, partners, pt2_epsilon, pt2_batches,
                                 pt2_deterministic, pt2_samples, pt2_sample_batches, seed, residual_tol, max_space,
                                 max_cycles, new_fraction, max_determinants, callback, checkpoint)
         finally:
@@ -439,55 +535,72 @@ class SelectedCI:
         else:
             ham = self.kernels.sci_hamiltonian(space, 1e-15, self._single(size), threads)
         if self._kept is not None:
-            self.kernels.sci_ham_free(self._kept)
+            self._release(self._kept)
             self._kept = None
         if not ham:
             raise MemoryError("Could not build the Hamiltonian")
         return ham
 
-    def _series(self, dets, vectors, nroots, epsilons, spin_parity, partners, pt2_epsilon, pt2_batches,
+    def _series(self, dets, vectors, given, nroots, epsilons, spin_parity, partners, pt2_epsilon, pt2_batches,
                 pt2_deterministic, pt2_samples, pt2_sample_batches, seed, residual_tol, max_space, max_cycles,
                 new_fraction, max_determinants, callback, checkpoint):
         threads = self._threads()
         stages = []
         capped = False
-        fill_from = None
+        fresh = None            # rows without amplitudes yet (first-order fill)
+        plan = self._memory_plan()
+        # Davidson's subspace and images, the roots' product buffers (about
+        # STRIPES/2 + 1 rows each), residuals, indices and determinant copies.
+        subspace = max_space or max(4 * nroots + 4, 24)
+        per_determinant = 8 * (2 * subspace + 37 * nroots + 6) + 48 * self.words
+        # Roots converged in the current space select without a Hamiltonian:
+        # those of the previous stage, or of a given checkpoint stage.
+        solved = refined = given is not None
+        steer = max(residual_tol, _SELECT_GROUND_TOL)
+        energies = None if given is None else np.asarray(given.energies, dtype=np.float64)
+        nnz = 0 if given is None else int(given.nonzeros)
+        held = 0
+        if nnz:
+            plan.record(len(dets), nnz * (8 if self._single(len(dets)) else 12) + 16 * len(dets))
         for eps in epsilons:
             cycles = 0
             seconds = dict(hamiltonian=0.0, davidson=0.0, select=0.0, pt2=0.0)
-            if len(dets) >= SORT_FROM:
-                order = _locality_order(dets, self.words)
-                if np.any(order != np.arange(len(order))):
-                    dets = np.ascontiguousarray(dets[order])
-                    if vectors is not None:
-                        vectors = np.ascontiguousarray(vectors[:, order])
-                    if self._kept is not None:          # its rows follow the old order
-                        self.kernels.sci_ham_free(self._kept)
-                        self._kept = None
             while True:
                 cycles += 1
                 space = self._space(dets)
                 try:
-                    start = time.perf_counter()
-                    ham = self._hamiltonian(space, len(dets))
-                    nnz = int(self.kernels.sci_ham_nnz(ham))
-                    seconds["hamiltonian"] += time.perf_counter() - start
-                    self._kept, self._kept_n = ham, len(dets)
-                    start = time.perf_counter()
-                    energies, vectors = self._diagonalize(ham, space, len(dets), nroots, vectors, spin_parity,
-                                                          residual_tol, max_space, fill_from, dets)
-                    fill_from = None
-                    seconds["davidson"] += time.perf_counter() - start
+                    if not solved:
+                        start = time.perf_counter()
+                        ham = self._hamiltonian(space, len(dets))
+                        nnz = int(self.kernels.sci_ham_nnz(ham))
+                        held = int(self.kernels.sci_ham_bytes(ham))
+                        plan.record(len(dets), held)
+                        seconds["hamiltonian"] += time.perf_counter() - start
+                        self._kept, self._kept_n = ham, len(dets)
+                        start = time.perf_counter()
+                        energies, vectors = self._diagonalize(ham, space, len(dets), nroots, vectors, spin_parity,
+                                                              steer, max_space, fresh, dets)
+                        fresh = None
+                        solved, refined = True, steer <= residual_tol
+                        seconds["davidson"] += time.perf_counter() - start
                     start = time.perf_counter()
                     cmax = np.ascontiguousarray(np.max(np.abs(vectors), axis=0))
                     buffer = self.kernels.sci_select(space, cmax.ctypes.data, float(eps), int(partners), threads)
                     new = self._take(buffer)
                     seconds["select"] += time.perf_counter() - start
-                    capped = max_determinants is not None and len(dets) + len(new) > max_determinants
+                    kept = held + 8 * 34 * nroots * len(dets) if self._kept is not None else 0
+                    fits, extends = plan.check(len(dets) + len(new), per_determinant, kept)
+                    capped = (max_determinants is not None and len(dets) + len(new) > max_determinants) or not fits
                     done = len(new) <= new_fraction * len(dets) or cycles >= max_cycles or capped
                     if done and capped and cycles == 1 and stages and stages[-1].determinants == len(dets):
                         pass        # the cap stopped growth: the previous stage already holds this space
                     elif done:
+                        if not refined:         # the stage's space: its roots to residual_tol
+                            start = time.perf_counter()
+                            energies, vectors = self._diagonalize(ham, space, len(dets), nroots, vectors,
+                                                                  spin_parity, residual_tol, max_space, None, dets)
+                            refined = True
+                            seconds["davidson"] += time.perf_counter() - start
                         s2 = np.zeros(nroots)
                         if self.nalpha == self.nbeta:
                             self.kernels.sci_s2(space, vectors.ctypes.data, nroots, s2.ctypes.data, threads)
@@ -496,8 +609,9 @@ class SelectedCI:
                         pt2_norm = np.zeros(nroots)
                         externals = 0
                         if pt2_epsilon is not None:
-                            self.kernels.sci_ham_free(self._kept)
-                            self._kept = None
+                            if self._kept is not None:
+                                self._release(self._kept)
+                                self._kept = None
                             start = time.perf_counter()
                             stats = np.zeros(2, dtype=np.int64)
                             electronic = np.ascontiguousarray(energies - self.constant)
@@ -528,9 +642,25 @@ class SelectedCI:
                     self.kernels.sci_space_free(space)
                 if done:
                     break
+                old = len(dets)
                 dets = np.concatenate([dets, new])
-                fill_from = len(dets) - len(new)
                 vectors = np.concatenate([vectors, np.zeros((nroots, len(new)))], axis=1)
+                if cycles == 1 and len(dets) >= SORT_FROM:
+                    # A stage's first growth sorts the grown space (the new
+                    # determinants among the old) and builds it afresh.
+                    order = _locality_order(dets, self.words)
+                    dets = np.ascontiguousarray(dets[order])
+                    vectors = np.ascontiguousarray(vectors[:, order])
+                    fresh = np.flatnonzero(order >= old)
+                    if self._kept is not None:
+                        self._release(self._kept)
+                        self._kept = None
+                else:
+                    fresh = np.arange(old, len(dets))
+                    if not extends and self._kept is not None:      # rebuilt: old and new would not fit
+                        self._release(self._kept)
+                        self._kept = None
+                solved = False
             if capped:
                 break
         return SCIResult(stages, dets, vectors, self.constant)
@@ -545,21 +675,29 @@ class SelectedCI:
         finally:
             self.kernels.sci_buffer_free(buffer)
 
-    def _first_order(self, ham, vectors, start, diagonal):
-        """`vectors` (roots x size) whose entries from `start` on are new: those
+    def _first_order(self, ham, vectors, rows, diagonal):
+        """`vectors` (roots x size) whose entries at `rows` are new (zero): those
         get first-order amplitudes (H c)_a / (E - H_aa), E the Rayleigh
         quotient of the old part, from one pass over H for all roots."""
         k = len(vectors)
-        block = np.ascontiguousarray(np.asarray(vectors, dtype=np.float64).T)
+        threads = self._threads()
+        block = _cpu_quadruples.copy(np.asarray(vectors, dtype=np.float64).T)
         image = np.empty_like(block)
-        self.kernels.sci_matmat(ham, k, block.ctypes.data, image.ctypes.data, self._threads())
+        self.kernels.sci_matmat(ham, k, block.ctypes.data, image.ctypes.data, threads)
         out = np.array(vectors, dtype=np.float64)
+        numerators, norms = np.zeros(k), np.zeros(k)
+        if k <= 16:                 # the block-dot kernel's width
+            self.kernels.sci_block_dot(len(block), k, block.ctypes.data, image.ctypes.data,
+                                       numerators.ctypes.data, threads)
+            self.kernels.sci_block_dot(len(block), k, block.ctypes.data, block.ctypes.data, norms.ctypes.data,
+                                       threads)
+        else:
+            numerators, norms = np.einsum("ir,ir->r", block, image), np.einsum("ir,ir->r", block, block)
         for r in range(k):
-            energy = _dot(block[:, r].copy(), image[:, r].copy()) / max(_dot(block[:, r].copy(), block[:, r].copy()),
-                                                                      1e-300)
-            denominator = energy - diagonal[start:]
+            energy = numerators[r] / max(norms[r], 1e-300)
+            denominator = energy - diagonal[rows]
             denominator = np.where(np.abs(denominator) < 1e-3, np.copysign(1e-3, denominator), denominator)
-            out[r, start:] = image[start:, r] / denominator
+            out[r, rows] = image[rows, r] / denominator
         return out
 
     def _diagonalize(self, ham, space, size, nroots, previous, spin_parity, residual_tol, max_space, fill_from=None,
@@ -567,8 +705,11 @@ class SelectedCI:
         threads = self._threads()
         diagonal = np.empty(size)
         self.kernels.sci_ham_diagonal(ham, diagonal.ctypes.data)
-        if previous is not None and fill_from is not None and 0 < fill_from < size:
-            previous = self._first_order(ham, previous, fill_from, diagonal)
+        if previous is not None and fill_from is not None:
+            # `fill_from`: the first new row (the rest are new), or the new rows' indices.
+            rows = np.arange(fill_from, size) if np.ndim(fill_from) == 0 else np.asarray(fill_from, dtype=np.int64)
+            if 0 < len(rows) < size:
+                previous = self._first_order(ham, previous, rows, diagonal)
         if spin_parity is not None:
             partner = np.empty(size, dtype=np.int64)
             self.kernels.sci_partners(space, partner.ctypes.data, threads)
@@ -632,14 +773,14 @@ class SelectedCI:
             u = block.apply(residual, energy, positive=False)
             w = block.apply(vector, energy, positive=False)
             ratio = _dot(vector, u) / _dot(vector, w)
-            return -(u - ratio * w)
+            return _cpu_quadruples.permuted_add(u, u, w, -1.0, ratio)        # -(u - ratio w)
 
         def sigma_block(rows):
-            # The new directions of several roots in one pass over H.
-            block_in = np.ascontiguousarray(np.asarray(rows, dtype=np.float64).T)
+            # The new directions of several roots in one pass over H (transposes on all threads).
+            block_in = _cpu_quadruples.copy(np.asarray(rows, dtype=np.float64).T)
             block_out = np.empty_like(block_in)
             self.kernels.sci_matmat(ham, block_in.shape[1], block_in.ctypes.data, block_out.ctypes.data, threads)
-            return np.ascontiguousarray(block_out.T)
+            return _cpu_quadruples.copy(block_out.T)
 
         outcome = krylov.davidson(sigma, diagonal, project, size=size, nroots=nroots, xp=np,
                                   residual_tol=residual_tol, max_iter=200, max_space=space_size,
@@ -699,7 +840,8 @@ class SelectedCI:
     def _perturbed(self, h):
         """A context of the same two-electron Hamiltonian with another h (no labels)."""
         return SelectedCI(h, self._eri, (self.nalpha, self.nbeta), self.constant, cutoff=self._cutoff,
-                          cpu_threads=self.cpu_threads, hamiltonian_precision=self.hamiltonian_precision)
+                          cpu_threads=self.cpu_threads, hamiltonian_precision=self.hamiltonian_precision,
+                          memory_budget_gib=self.memory_budget_gib)
 
     def _difference(self, space, candidates):
         """The distinct rows of `candidates` outside the indexed space (compiled)."""
@@ -739,7 +881,9 @@ class SelectedCI:
         tensors against it). `initial` (determinants, for example a
         record's `.space`, or (determinants, ground vector)) continues a
         series: the ground state's selection starts from that space, with
-        the given `epsilons`."""
+        the given `epsilons`. Like `max_determinants`, the memory budget
+        (`memory_budget_gib`) ends the series before a space that would not
+        fit."""
         dipoles = _symmetric(dipoles)
         wavelengths = tuple(float(w) for w in np.atleast_1d(wavelengths_nm))
         irreps = self._dipole_irreps(dipoles, dipole_irreps)
@@ -778,6 +922,10 @@ class SelectedCI:
                             pt2_epsilon=pt2_epsilon, max_determinants=max_determinants, initial=initial,
                             checkpoint=keep, **(solve_options or {}))
         union, response = None, None
+        plan = self._memory_plan()
+        # Block PCG on the dipole components (about 8 vectors each) or the
+        # ground state's Davidson subspace, plus indices and determinant copies.
+        per_determinant = 8 * 52 + 48 * self.words
         try:
             for stage, (base, base_vector) in zip(ground.stages, stage_spaces):
                 start = time.perf_counter()
@@ -786,7 +934,8 @@ class SelectedCI:
                     union = base
                 else:
                     grown = np.concatenate([union, self._difference(response._space, base)])
-                    if max_determinants is not None and len(grown) > max_determinants:
+                    fits, _ = plan.check(len(grown), per_determinant)
+                    if (max_determinants is not None and len(grown) > max_determinants) or not fits:
                         break       # the cap ends the series; earlier stages stand
                     union = grown
                     if len(union) >= SORT_FROM:      # each stage starts from a sorted space
@@ -796,10 +945,12 @@ class SelectedCI:
                     guess = None
                     if response is None:        # this stage's ground vector
                         guess = base_vector.copy()
+                    rebuild = cycle > 0 and not extends
                     response = SelectedCIResponse(self, dipoles, union, spin_parity=spin_parity,
                                                   dipole_irreps=irreps, previous=response, guess=guess,
                                                   residual_tol=_SELECT_GROUND_TOL,
-                                                  order=order if cycle == 0 else None)
+                                                  order=order if cycle == 0 else None, rebuild=rebuild)
+                    plan.record(len(union), response.hamiltonian_bytes)
                     c0 = np.ascontiguousarray(np.abs(response.ground))
                     fresh = []
                     for d in dipoles:
@@ -818,7 +969,8 @@ class SelectedCI:
                         fresh.append(self._take(buffer))
                     fresh = [f for f in fresh if len(f)]
                     new = self._difference(response._space, np.concatenate(fresh)) if fresh else union[:0]
-                    if (len(new) <= new_fraction * len(union) or cycle == max_cycles - 1
+                    fits, extends = plan.check(len(union) + len(new), per_determinant, response.hamiltonian_bytes)
+                    if (len(new) <= new_fraction * len(union) or cycle == max_cycles - 1 or not fits
                             or (max_determinants is not None and len(union) + len(new) > max_determinants)):
                         break
                     union = np.concatenate([union, new])
@@ -930,12 +1082,14 @@ class SelectedCIResponse:
     Solves start from the earlier solutions of the same component
     (`response._shifted_guesses`), so wavelength scans get cheap. With
     `previous` (a response whose space is a prefix of this one) its
-    Hamiltonian and dipole matrices are extended instead of rebuilt, its
-    solutions start the new solves, and `previous` is closed.
+    Hamiltonian and dipole matrices are extended instead of rebuilt (unless
+    `rebuild`), its solutions start the new solves, and `previous` is
+    closed; matrices that are not extended are freed before the new ones are
+    built.
     """
 
     def __init__(self, sci, dipoles, determinants, *, spin_parity=1, dipole_irreps=None, guess=None,
-                 residual_tol=1e-9, previous=None, order=None):
+                 residual_tol=1e-9, previous=None, order=None, rebuild=False):
         self.sci, self.kernels, self.spin_parity = sci, sci.kernels, spin_parity
         threads = sci._threads()
         self.determinants = np.ascontiguousarray(determinants, dtype=np.uint64).reshape(-1, 2 * sci.words)
@@ -943,8 +1097,9 @@ class SelectedCIResponse:
         self._dipoles = _symmetric(dipoles)
         self.irreps = sci._dipole_irreps(self._dipoles, dipole_irreps)
         self._ham, self._space, self._ops, self._guesses = None, None, [None, None, None], {}
-        extend = (order is None and previous is not None and previous._ham is not None and previous.size <= n
+        prefix = (order is None and previous is not None and previous.size <= n
                   and np.array_equal(previous.determinants, self.determinants[:previous.size]))
+        extend = prefix and not rebuild and previous._ham is not None
         carried = {}
         if order is not None and previous is not None:
             # A re-sorted space: `order` maps its rows to those of the previous
@@ -958,6 +1113,12 @@ class SelectedCIResponse:
             guess = moved(previous.ground)
             carried = {key: [(moved(x), shift) for x, shift in stored] for key, stored in previous._guesses.items()}
         try:
+            if previous is not None and not extend:
+                if prefix:              # rebuilt: the previous solutions still start this space's solves
+                    if guess is None:
+                        guess = previous.ground
+                    carried = previous._guesses
+                previous._release_matrices()
             self._space = sci._space(self.determinants)
             single = sci._single(n)
             if extend:
@@ -1037,6 +1198,17 @@ class SelectedCIResponse:
         """Bytes held by the compiled Hamiltonian and dipole matrices."""
         handles = [h for h in (self._ham, *self._ops) if h is not None]
         return int(sum(self.kernels.sci_ham_bytes(h) for h in handles))
+
+    def _release_matrices(self):
+        """Free the compiled Hamiltonian and dipole matrices (the vectors stay)."""
+        if self._ham is not None:
+            self.kernels.sci_ham_free(self._ham)
+            self._ham = None
+        for j, op in enumerate(self._ops):
+            if op is not None:
+                self.kernels.sci_ham_free(op)
+                self._ops[j] = None
+        _core.release_free_memory()
 
     def close(self):
         """Release the compiled Hamiltonian, dipole matrices and space."""

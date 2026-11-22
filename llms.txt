@@ -147,7 +147,7 @@ Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
 - `share=other_engine` (same ground state and labels) reuses its ground blocks and cached intermediates
   (38 GiB for CuF aug-cc-pVDZ-DK, 13 occupied/63 virtual: about 24 s per action on one 56-core socket).
 
-### SelectedCI(h, eri, nelec, constant=0.0, *, orbital_irreps=None, cutoff=1e-12, cpu_threads=None, hamiltonian_precision="auto")
+### SelectedCI(h, eri, nelec, constant=0.0, *, orbital_irreps=None, cutoff=1e-12, cpu_threads=None, hamiltonian_precision="auto", memory_budget_gib="auto")
 `from itercc.selected_ci import SelectedCI, SelectedCIResponse, extrapolate_gap, rotate_integrals`. Heat-bath selected CI with
 Epstein-Nesbet PT2 (near-full CI) of any real orbital Hamiltonian, compiled CPU kernels, up to 256 orbitals.
 - `.solve(nroots=1, *, references=None, spin_parity=None, epsilons=(1e-3, 3e-4, 1e-4, 5e-5), pt2_epsilon=None,

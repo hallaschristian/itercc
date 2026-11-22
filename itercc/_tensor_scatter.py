@@ -137,16 +137,21 @@ class PermutedGather:
 def unpack_sector(vector, indices, shape, *, xp=np, threads=None):
     """Expand distinct flat sector indices, retaining zeros outside the sector.
 
-    Real float64 CPU tensors use parallel first-touch and scatter for large,
-    sufficiently populated outputs with at least four workers. Small/sparse
+    Real float64 CPU tensors use parallel first-touch and scatter for large
+    outputs with at least four workers whose sector fills at least 1/64 of
+    them (eight entries per 4 KiB page on average: NumPy's lazily zeroed
+    pages would all be faulted in by one thread anyway). Very sparse or small
     tensors and smaller thread pools avoid the parallel zeroing overhead;
-    complex and device tensors retain the backend implementation.
+    complex and device tensors retain the backend implementation. (A 1/4
+    threshold sent C2v sectors a hair under a quarter, such as a CuF B1 EOM
+    triples sector at 0.2500 of the dense array, to a single-threaded scatter
+    that took most of each action.)
     """
     if vector.ndim != 1 or indices.shape != vector.shape:
         raise ValueError("Sector vector and indices must be matching one-dimensional arrays")
     size = prod(shape)
     if (xp is np and isinstance(vector, np.ndarray) and vector.dtype == np.float64
-            and size >= 2**18 and vector.size * 4 >= size
+            and size >= 2**18 and vector.size * 64 >= size
             and 4 <= cpu_threads(threads) <= size // 2**16):
         kernel = _cpu_kernels.library()
         if kernel is not None:

@@ -2,6 +2,80 @@
 
 ## Unreleased
 
+- Fixed: deterministic selected-CI PT2 chose each external's batch from
+  hash bits 20-23, which are also slot bits once a hash-map shard holds
+  2^21 slots. Each batch then filled one sixteenth of every table and
+  inserts went quadratic above about a million entries per shard (8.6e9
+  externals at 16 batches): CuF stages stalled for hours. Batches now come
+  from bits 32-54, which slots and shards never use; PT2 values are
+  unchanged to the bit (the sums are exact fixed point). CuF, 9.4e9
+  externals: 350 s instead of not finishing in 3.6 hours.
+- Fixed: `unpack_sector` sent sectors under a quarter of the dense array to
+  NumPy's single-threaded scatter, including C2v sectors a hair under it
+  (a CuF B1 EOM-CCSDT triples sector: 0.24999994). With slow page faults
+  on a busy node, that took most of each action (2400 instead of 130 s per
+  iteration). Sectors of at least 1/64 now take the parallel scatter.
+- Fixed: a runtime core build renamed its library over an existing one of
+  the same key. On a network file system shared by several nodes that
+  deletes the file under processes that have it mapped, and they died of
+  SIGBUS when concurrent jobs built the same key. The build is now
+  hard-linked into place and never replaces a library; where hard links
+  are not available it is renamed only if the target is still absent.
+- Selected CI, third speed and memory round. Column indices are stored as
+  the gaps between a row's consecutive columns in a grouped variable-byte
+  code (a control byte gives the byte lengths of the next four gaps, decoded
+  with one SSSE3 shuffle per group): about 1.5 instead of 4 bytes per
+  nonzero, so the single-precision Hamiltonian takes 27% less memory (CuF,
+  1.8 million determinants: 5.8 -> 4.2 GB) at the same product speed. Each
+  stage now selects directly from the previous stage's converged roots and
+  sorts the grown space once, so it builds one fresh Hamiltonian (with the
+  new determinants sorted in) instead of rebuilding the previous space and
+  extending it: no old and new matrices at once, and faster products in
+  the stage's Davidson. `solve(initial=(determinants, vectors, stage))`
+  resumes without solving the roots again. Davidson's full-length vector
+  updates (Gram-Schmidt as one GEMM pass with beta = 1, scaled adds,
+  copies; selected CI's preconditioner, transposes and first-order fill)
+  run on all threads instead of NumPy's one. A two-root CuF series to 1.8
+  million determinants: 70.3 -> 51 s on 12 cores (the unthreaded updates
+  weigh more on 56 cores).
+  PT2 2.7x faster: the hash maps of the
+  deterministic and semistochastic passes are kept across batches (a fresh
+  map per batch grew every shard by doubling, rehashing and faulting in
+  gigabytes of new pages: 96% of the semistochastic time went to inserts,
+  4% to generating the terms), keep their entries in dense per-shard arrays
+  behind 8-byte slots (sequential writes for new entries, a reset clears the
+  slots only), and stage 16 instead of 64 records per shard and thread (the
+  semistochastic records, eight 128-bit accumulators each, had overflowed
+  L2). Fixed-point conversions skip libgcc's soft-float `__fixdfti`, and
+  diagonal energies read a precomputed J - K. Then: the space's index keeps
+  a 32-bit hash tag in each slot (lookups of determinants outside the space,
+  most PT2 externals and selection candidates, rarely read a determinant),
+  the final passes reuse the entries' stored hashes, each flush prefetches
+  the entries its slots point to, and diagonal energies sum in four partial
+  sums instead of one chain of dependent adds (values change in the last
+  bit). CuF, 0.43 million determinants, two roots, PT2 to 1e-6 (exact above
+  5e-6, 16,000 samples): 87 -> 33 s on 12 cores.
+  Rounds before a stage's last only steer the selection: their roots stop at
+  Davidson residual 1e-4, and the stage's final space is solved to
+  `residual_tol` (spaces change by a few determinants in a million).
+  The context keeps one two-electron integral per 8-fold permutation class
+  (126 orbitals: 0.26 instead of 2 GB); `SelectedCI` checks a sample of
+  `eri` for that symmetry.
+
+- Selected-CI series fit their memory. `SelectedCI(memory_budget_gib=)`
+  ("auto": 85% of `_runtime.host_memory_limit()`, None: no limit) ends
+  `solve` and `polarizability` before a space whose Hamiltonian (projected
+  from the series' last builds, bytes ~ n^p with p fitted, 1.26 for CuF)
+  and solver vectors would not fit, as `max_determinants` does. glibc keeps
+  the blocks freed during an extension in per-thread heaps, so an
+  extension can hold the old and the new matrices at once: when both would
+  not fit, the old ones are freed first and the new ones built afresh.
+  Freed matrices go back to the kernel (`malloc_trim`) before PT2, whose
+  hash maps were mapped on top of them, and `SelectedCIResponse` frees the
+  previous space's matrices before building a re-sorted space's. A CuF
+  aug-cc-pVDZ-DK series had been killed at 480 GiB extending 43 to about
+  69 million determinants (200 + 375 GB of matrices).
+
 - Selected CI, second speed round. The Hamiltonian build finds each
   determinant's opposite-spin doubles from the cheaper side (the alpha or
   the beta neighbours' groups, by their summed sizes), tests the other

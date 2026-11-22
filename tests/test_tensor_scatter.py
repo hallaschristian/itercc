@@ -77,7 +77,7 @@ def test_legacy_spin_import_is_the_shared_implementation():
     assert _spin_quadruples_storage.signed_permutations is _tensor_symmetry.signed_permutations
 
 
-@pytest.mark.parametrize("threads,stride", [(1, 4), (2, 4), (4, 8), (56, 4)])
+@pytest.mark.parametrize("threads,stride", [(1, 4), (2, 4), (4, 128), (56, 4)])
 def test_sector_dispatch_avoids_parallel_overhead(threads, stride, monkeypatch):
     def unexpected():
         raise AssertionError("Ineligible layouts must not invoke the native core")
@@ -86,6 +86,31 @@ def test_sector_dispatch_avoids_parallel_overhead(threads, stride, monkeypatch):
     values = np.ones(len(indices))
     result = _tensor_scatter.unpack_sector(values, indices, (2**18,), threads=threads)
     assert np.count_nonzero(result) == len(indices)
+
+
+@pytest.mark.parametrize("stride", [4, 5, 8, 64])
+def test_sector_dispatch_takes_symmetry_sectors_below_a_quarter(stride, monkeypatch):
+    # Abelian sectors fill about 1/|G| of the dense array, some a hair under a
+    # quarter in C2v (a CuF B1 EOM triples sector: 0.24999994): all of them
+    # take the parallel scatter, never one thread over every page.
+    library = _cpu_kernels.library()
+    if library is None:
+        pytest.skip("Compiled CPU core unavailable")
+    calls = []
+
+    class Recorded:
+        def sector_unpack(self, *args):
+            calls.append(args[:2])
+            return library.sector_unpack(*args)
+
+    monkeypatch.setattr(_cpu_kernels, "library", Recorded)
+    indices = np.arange(0, 2**18, stride)
+    values = np.random.default_rng(723).normal(size=len(indices))
+    result = _tensor_scatter.unpack_sector(values, indices, (2**18,), threads=4)
+    assert calls == [(2**18, len(indices))]
+    expected = np.zeros(2**18)
+    expected[indices] = values
+    np.testing.assert_array_equal(result, expected)
 
 
 @pytest.mark.parametrize("holes_first", [False, True])

@@ -408,10 +408,12 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   `-1` odd (triplets): spaces contain each determinant's alpha-beta swap.
   `references` fix the irrep (default the aufbau determinant); `s2` checks
   the spin of each root.
-- PT2 holds one hash-map entry per external determinant (about 96 bytes
-  for two roots and up to 128 orbitals, at most half-full tables); `pt2_batches=k` makes k passes over 1/k of them.
-  The Hamiltonian keeps its upper triangle (12 bytes per nonzero, plus
-  about 32 doubles per determinant for the product).
+- PT2 holds one hash-map entry per external determinant (about 80-100
+  bytes for two roots and up to 128 orbitals: the entry and two or three
+  8-byte slots; about 200 in the semistochastic part); `pt2_batches=k` makes k passes over 1/k of them.
+  The Hamiltonian keeps its upper triangle (about 5.5 bytes per nonzero in
+  single precision, 9.5 in double: values plus compressed column gaps; plus
+  about 33 doubles per determinant and product vector).
 - Semistochastic PT2 for large spaces: `pt2_deterministic=2e-6` is exact
   above that threshold and samples the rest down to `pt2_epsilon`
   (`pt2_samples` determinants per batch, `pt2_sample_batches` batches,
@@ -457,6 +459,14 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   solves x and z together by block conjugate gradients and returns the
   stationary tensor, so the default `tol=1e-5` is accurate to about 1e-5
   au; `SelectedCIResponse.hamiltonian_bytes` reports the matrix memory.
+- Memory: `SelectedCI(memory_budget_gib="auto")` (85% of the job's or
+  host's memory limit; a number, or None for no limit) ends a series before
+  a space whose projected Hamiltonian and vectors would not fit, so a
+  memory-bound series keeps its last stage instead of being killed. The
+  Hamiltonian takes about 5.5 bytes per nonzero in single precision, and
+  its nonzeros grow faster than the space (CuF aug-cc-pVDZ-DK, 18
+  electrons: 507 per determinant at 27 million, 575 at 43 million); a 480
+  GiB job holds spaces of about 80 million such determinants.
 - The variational polarizability of a truncated space is a lower bound
   that converges slowly in diffuse bases (CuF aug-cc-pVDZ-DK: 15.7, 17.1,
   18.3 au at 0.35, 0.69, 1.68 million determinants, CCSDT 23.1).

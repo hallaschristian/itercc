@@ -77,6 +77,31 @@ def _norm(xp, a):
 _CHUNK = 1 << 21          # entries per chunk of elementwise vector updates (16 MiB)
 
 
+def _axpby_(xp, y, x, a, b):
+    """y = a y + b x in place; real contiguous float64 NumPy vectors on all
+    threads (`_cpu_quadruples.permuted_add`), others through xp."""
+    if _core_vectors(xp, y, x) and y is not x:
+        from . import _cpu_quadruples
+
+        _cpu_quadruples.permuted_add(y, y, x, float(a), float(b))
+        return y
+    if a != 1.0:
+        y *= a
+    y += b * x
+    return y
+
+
+def _scale_(xp, y, a):
+    """y *= a in place (on all threads where `_axpby_` is)."""
+    if _core_vectors(xp, y):
+        from . import _cpu_quadruples
+
+        _cpu_quadruples.scale_(y, a)
+        return y
+    y *= a
+    return y
+
+
 def _chunks(size, chunk=_CHUNK):
     """Slices covering range(size), `chunk` entries each: elementwise updates
     of full-length vectors without full-length temporaries."""
@@ -124,6 +149,21 @@ class Columns:
             return real + 1j * _product(xp, xp.asarray(np.ascontiguousarray(coefficients.imag)), block)
         return _product(xp, xp.asarray(coefficients.astype(block.dtype, copy=False)), block)
 
+    def subtract(self, coefficients, vector, stop=None):
+        """vector -= sum_i c_i q_i in place (real blocks: one GEMM pass, beta = 1)."""
+        xp = self.xp
+        coefficients = np.asarray(coefficients)
+        block = self.block(len(coefficients) if stop is None else stop)
+        if (xp is np and not np.iscomplexobj(coefficients) and block.dtype == np.float64
+                and vector.dtype == np.float64 and vector.flags.c_contiguous and len(block)):
+            from ._cpu_triples import matmul
+
+            matmul(np.ascontiguousarray(coefficients, dtype=np.float64).reshape(1, -1), block,
+                   vector.reshape(1, -1), alpha=-1.0, beta=1.0)
+            return vector
+        vector -= self.combine(coefficients, stop)
+        return vector
+
     def orthogonalize(self, vector, stop=None):
         """Two-pass classical Gram-Schmidt in place; returns the coefficients."""
         stop = self.count if stop is None else stop
@@ -139,7 +179,14 @@ class Columns:
     def append(self, vector):
         if self.count >= self.capacity:
             raise IndexError("Krylov block is full")
-        self.data[self.count] = vector
+        row = self.data[self.count]
+        if _core_vectors(self.xp, row) and isinstance(vector, np.ndarray) and vector.shape == row.shape \
+                and vector.dtype == np.float64:
+            from . import _cpu_quadruples
+
+            _cpu_quadruples.permuted_add(row, None, vector, 0.0, 1.0)
+        else:
+            row[...] = vector
         self.count += 1
 
     def transform(self, coefficients):
@@ -315,13 +362,14 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
         if candidate is vector or getattr(candidate, "base", None) is vector:
             candidate = candidate.copy()
         for _ in range(2):
-            candidate -= basis.combine(basis.overlaps(candidate))
+            if basis.count:
+                basis.subtract(basis.overlaps(candidate), candidate)
             for other in others:
-                candidate -= _dot(xp, other, candidate) * other
+                _axpby_(xp, candidate, other, 1.0, -_dot(xp, other, candidate))
         length = _norm(xp, candidate)
         if length < 1e-13:
             return None
-        candidate /= length
+        _scale_(xp, candidate, 1.0 / length)
         return candidate
 
     def append(vector):
@@ -360,8 +408,11 @@ def davidson(sigma, diagonal, project, *, size, nroots, xp, residual_tol=1e-8, m
             energy = float(np.real(energy))
         vector = ritz(column)
         image = images.combine(column)
-        for part in _chunks(size):
-            image[part] -= energy * vector[part]
+        if _core_vectors(xp, image, vector):
+            _axpby_(xp, image, vector, 1.0, -energy)
+        else:
+            for part in _chunks(size):
+                image[part] -= energy * vector[part]
         return vector, image
 
     history, previous = [], None

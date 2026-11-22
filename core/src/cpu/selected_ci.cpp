@@ -28,6 +28,9 @@
 #include <numeric>
 #include <type_traits>
 #include <vector>
+#if defined(__SSSE3__)
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -38,7 +41,28 @@ constexpr double FIXED_SCALE = 1208925819614629174706176.0;   // 2^80
 constexpr double NUMERATOR_SCALE = 4503599627370496.0;          // 2^52 for int64 PT2 numerators
 inline int64_t to_numerator(double x) { return static_cast<int64_t>(x * NUMERATOR_SCALE); }
 inline double from_numerator(int64_t v) { return static_cast<double>(v) / NUMERATOR_SCALE; }
-inline i128 to_fixed(double x) { return static_cast<i128>(x * FIXED_SCALE); }
+// trunc(x * 2^80) as static_cast<i128> gives it, from the bits of x: the cast
+// calls libgcc's soft-float __fixdfti, and the stochastic PT2 converts eight
+// values per term. |x| < 2^47 (the fixed-point range); NaN and infinities
+// are outside it as for the cast.
+inline i128 to_fixed(double x)
+{
+    u64 bits;
+    std::memcpy(&bits, &x, sizeof bits);
+    const int exponent = static_cast<int>((bits >> 52) & 0x7FF);
+    if (exponent == 0) return 0;                       // zero and subnormals (|x| 2^80 < 1)
+    const u64 mantissa = (bits & ((u64(1) << 52) - 1)) | (u64(1) << 52);
+    // x 2^80 = mantissa 2^(exponent - 1075 + 80)
+    const int shift = exponent - 995;
+    i128 v;
+    if (shift >= 0)
+        v = static_cast<i128>(mantissa) << shift;
+    else if (shift > -53)
+        v = static_cast<i128>(mantissa >> -shift);
+    else
+        return 0;
+    return (bits >> 63) ? -v : v;
+}
 inline double from_fixed(i128 v) { return static_cast<double>(v) / FIXED_SCALE; }
 
 inline int popc(u64 x) { return __builtin_popcountll(x); }
@@ -107,6 +131,17 @@ template <int W> inline u64 hash_det(const Det<W> &x)
     return h;
 }
 
+// The PT2 batch of an external with hash h, from bits 32-54: hash maps take
+// their slots from the low bits and their shards from the top 9, so a batch
+// spreads over whole tables. (Bits 20-23 were slot bits too once a shard held
+// 2^21 slots: each batch then crowded one sixteenth of every table and inserts
+// went quadratic above ~1 million entries per shard, 8.6e9 externals at 16
+// batches.)
+inline int64_t batch_of(u64 h, int64_t batches)
+{
+    return static_cast<int64_t>((((h >> 32) & 0x7FFFFFULL) * static_cast<u64>(batches)) >> 23);
+}
+
 template <int W> inline u64 hash_string(const u64 *s)
 {
     u64 h = 0x51afd7ed558ccd25ULL;
@@ -162,9 +197,13 @@ struct SinglesEntry {
 struct itercc_sci_context {
     int64_t n, na, nb;
     int words;
-    std::vector<double> h, eri;      // eri[((p n + q) n + r) n + s] = (pq|rs)
+    // eri: (pq|rs) once per 8-fold permutation class (real orbitals), at
+    // pair(pair(p, q), pair(r, s)): an eighth of the n^4 array (126 orbitals:
+    // 0.26 instead of 2 GB per context), at the same build speed.
+    std::vector<double> h, eri;
     std::vector<int64_t> irrep;
     std::vector<double> J, K;        // J[p n + q] = (pp|qq), K[p n + q] = (pq|qp)
+    std::vector<double> JK;          // J - K: same-spin pairs in diagonal energies (one load)
     std::vector<double> Dk, Xk;      // Dk[(p n + r) n + k] = (pr|kk), Xk = (pk|kr)
     std::vector<int64_t> os_start;   // opposite spin: pair p n + q -> entries over (r, s)
     std::vector<Entry> os;
@@ -173,10 +212,12 @@ struct itercc_sci_context {
     std::vector<int64_t> single_start;
     std::vector<SinglesEntry> singles;
 
-    double E(int64_t p, int64_t q, int64_t r, int64_t s) const
+    static int64_t pair(int64_t p, int64_t q)
     {
-        return eri[((p * n + q) * n + r) * n + s];
+        const int64_t a = p > q ? p : q, b = p > q ? q : p;
+        return a * (a + 1) / 2 + b;
     }
+    double E(int64_t p, int64_t q, int64_t r, int64_t s) const { return eri[pair(pair(p, q), pair(r, s))]; }
 };
 
 namespace {
@@ -184,20 +225,33 @@ namespace {
 using Ctx = itercc_sci_context;
 
 // <x| H |x> without the constant.
+// sum_k row[idx[k]] in four partial sums: a single accumulator makes every
+// add wait on the previous one (about 150 per diagonal energy).
+inline double gathered_sum(const double *row, const int *idx, int m)
+{
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    int k = 0;
+    for (; k + 4 <= m; k += 4) {
+        s0 += row[idx[k]];
+        s1 += row[idx[k + 1]];
+        s2 += row[idx[k + 2]];
+        s3 += row[idx[k + 3]];
+    }
+    for (; k < m; ++k) s0 += row[idx[k]];
+    return (s0 + s1) + (s2 + s3);
+}
+
 inline double diagonal_energy(const Ctx &c, const int *oa, int na, const int *ob, int nb)
 {
     const int64_t n = c.n;
     double e = 0.0;
     for (int i = 0; i < na; ++i) {
-        int p = oa[i];
-        e += c.h[p * n + p];
-        for (int j = 0; j < i; ++j) e += c.J[p * n + oa[j]] - c.K[p * n + oa[j]];
-        for (int j = 0; j < nb; ++j) e += c.J[p * n + ob[j]];
+        const int p = oa[i];
+        e += c.h[p * n + p] + gathered_sum(&c.JK[p * n], oa, i) + gathered_sum(&c.J[p * n], ob, nb);
     }
     for (int i = 0; i < nb; ++i) {
-        int p = ob[i];
-        e += c.h[p * n + p];
-        for (int j = 0; j < i; ++j) e += c.J[p * n + ob[j]] - c.K[p * n + ob[j]];
+        const int p = ob[i];
+        e += c.h[p * n + p] + gathered_sum(&c.JK[p * n], ob, i);
     }
     return e;
 }
@@ -382,11 +436,16 @@ void excitations(const Ctx &c, const Det<W> &x, u64 hx, double threshold, Accept
     }
 }
 
-// Open-addressing index of a fixed determinant array (indices, -1 empty).
+// Open addressing over the space's determinants: each slot holds a 32-bit
+// hash tag and the determinant's index (-1 empty), so a lookup of a
+// determinant outside the space (most PT2 externals and selection
+// candidates) compares tags and rarely reads a determinant.
 template <int W> struct DetIndex {
     const Det<W> *dets = nullptr;
     std::vector<int64_t> slot;
     u64 mask = 0;
+
+    static int64_t entry(u64 h, int64_t i) { return static_cast<int64_t>(((h >> 32) << 32) | static_cast<u64>(i)); }
 
     void build(const Det<W> *d, int64_t count, int threads)
     {
@@ -397,10 +456,11 @@ template <int W> struct DetIndex {
         slot.assign(cap, -1);
 #pragma omp parallel for schedule(static) num_threads(threads)
         for (int64_t i = 0; i < count; ++i) {
-            u64 k = hash_det<W>(d[i]) & mask;
+            const u64 h = hash_det<W>(d[i]);
+            u64 k = h & mask;
             for (;;) {
                 int64_t expected = -1;
-                if (__atomic_compare_exchange_n(&slot[k], &expected, i, false, __ATOMIC_RELAXED,
+                if (__atomic_compare_exchange_n(&slot[k], &expected, entry(h, i), false, __ATOMIC_RELAXED,
                                                 __ATOMIC_RELAXED))
                     break;
                 k = (k + 1) & mask;
@@ -410,10 +470,14 @@ template <int W> struct DetIndex {
 
     int64_t find(const Det<W> &x, u64 h) const
     {
+        const u64 tag = h >> 32;
         for (u64 k = h & mask;; k = (k + 1) & mask) {
-            const int64_t i = slot[k];
-            if (i < 0) return -1;
-            if (same(dets[i], x)) return i;
+            const int64_t s = slot[k];
+            if (s == -1) return -1;
+            if ((static_cast<u64>(s) >> 32) == tag) {
+                const int64_t i = static_cast<int64_t>(static_cast<u64>(s) & 0xFFFFFFFFULL);
+                if (same(dets[i], x)) return i;
+            }
         }
     }
 };
@@ -429,25 +493,29 @@ struct Spinlock {
 
 // A determinant hash map split into independently locked shards, with
 // `nvalues` fixed-point accumulators of type V per key (zero: a set). Each
-// shard is one array of entries (the key's 2W words, then the accumulators),
-// so an insert touches one cache line or two; an empty entry has its first
-// word all ones (no determinant has its first 64 alpha orbitals occupied:
-// itercc_sci_create needs fewer than 64 alpha electrons).
+// shard keeps its entries (the key's 2W words, its hash, the accumulators)
+// in one dense array in insertion order, and an open-addressing table of
+// 8-byte slots (a 32-bit hash tag, the entry's index + 1; 0 empty) at most
+// half full. New entries are appended (sequential writes), lookups compare
+// tags before keys, scans read the filled entries only, and a reset (the next
+// PT2 batch) clears the slots and keeps both arrays. Entry order depends on
+// the thread schedule: readers sort the keys or sum the fixed-point values,
+// which is exact in any order.
 template <int W, class V = i128> struct ShardedMap {
-    static constexpr u64 EMPTY = ~0ULL;
     struct Shard {
         Spinlock lock;
-        u64 *table = nullptr;
-        size_t cap = 0, count = 0;
+        u64 *slots = nullptr;
+        size_t cap = 0;                  // slots (a power of two)
+        u64 *entries = nullptr;
+        size_t count = 0, room = 0;      // entries used and allocated
     };
     int nvalues;
-    size_t stride;                       // words per entry, even (16-byte aligned accumulators)
+    size_t stride;                       // words per entry: key, hash, pad, accumulators (16-byte aligned)
     std::vector<Shard> shards;
     static constexpr int SHARD_BITS = 9;
 
     explicit ShardedMap(int nv)
-        : nvalues(nv), stride((2 * W + nv * sizeof(V) / sizeof(u64) + 1) & ~size_t(1)),
-          shards(size_t(1) << SHARD_BITS)
+        : nvalues(nv), stride(2 * W + 2 + nv * sizeof(V) / sizeof(u64)), shards(size_t(1) << SHARD_BITS)
     {
     }
     ~ShardedMap() { clear(); }
@@ -455,58 +523,82 @@ template <int W, class V = i128> struct ShardedMap {
     ShardedMap &operator=(const ShardedMap &) = delete;
 
     static size_t shard_of(u64 h) { return h >> (64 - SHARD_BITS); }
-    V *values_of(u64 *row) const { return reinterpret_cast<V *>(row + 2 * W); }
+    static u64 tag_of(u64 h) { return (h >> 20) & 0xFFFFFFFFULL; }
+    u64 *entry(const Shard &s, size_t i) const { return s.entries + i * stride; }
+    V *values_of(u64 *row) const { return reinterpret_cast<V *>(row + 2 * W + 2); }
     static const Det<W> &key_of(const u64 *row) { return *reinterpret_cast<const Det<W> *>(row); }
+    // The hash stored after a key passed to a for_each callback.
+    static u64 hash_of(const Det<W> &key) { return reinterpret_cast<const u64 *>(&key)[2 * W]; }
 
-    // Tables of 2 MB or more are 2 MB aligned and ask for transparent huge
-    // pages: random inserts over gigabytes of 4 KB pages miss the TLB.
-    u64 *allocate(size_t cap) const
+    // Arrays of 2 MB or more are 2 MB aligned and ask for transparent huge
+    // pages: random accesses over gigabytes of 4 KB pages miss the TLB.
+    static u64 *allocate(size_t words)
     {
         constexpr size_t HUGE_PAGE = size_t(1) << 21;
-        size_t bytes = cap * stride * sizeof(u64);
+        size_t bytes = std::max<size_t>(words, 1) * sizeof(u64);
         const size_t align = bytes >= HUGE_PAGE ? HUGE_PAGE : 64;
         bytes = (bytes + align - 1) & ~(align - 1);
         u64 *t = static_cast<u64 *>(std::aligned_alloc(align, bytes));
         if (!t) throw std::bad_alloc();
         if (align == HUGE_PAGE) madvise(t, bytes, MADV_HUGEPAGE);
-        for (size_t k = 0; k < cap; ++k) t[k * stride] = EMPTY;
         return t;
     }
 
-    void resize(Shard &s, size_t cap)
+    void rehash(Shard &s, size_t cap)
     {
-        u64 *table = allocate(cap);
+        u64 *slots = allocate(cap);
+        std::memset(slots, 0, cap * sizeof(u64));
         const u64 mask = cap - 1;
-        for (size_t i = 0; i < s.cap; ++i) {
-            const u64 *row = s.table + i * stride;
-            if (row[0] == EMPTY) continue;
-            u64 k = hash_det<W>(key_of(row)) & mask;
-            while (table[k * stride] != EMPTY) k = (k + 1) & mask;
-            std::memcpy(table + k * stride, row, stride * sizeof(u64));
+        for (size_t i = 0; i < s.count; ++i) {
+            const u64 h = entry(s, i)[2 * W];
+            u64 k = h & mask;
+            while (slots[k]) k = (k + 1) & mask;
+            slots[k] = (tag_of(h) << 32) | (i + 1);
         }
-        std::free(s.table);
-        s.table = table;
+        std::free(s.slots);
+        s.slots = slots;
         s.cap = cap;
+    }
+
+    void reserve_entries(Shard &s, size_t room)
+    {
+        u64 *entries = allocate(room * stride);
+        if (s.count) std::memcpy(entries, s.entries, s.count * stride * sizeof(u64));
+        std::free(s.entries);
+        s.entries = entries;
+        s.room = room;
     }
 
     // Adds `add` (nvalues entries, may be null for a set) to key x's
     // accumulators; the caller holds the shard's lock.
     void insert_locked(Shard &s, const Det<W> &x, u64 h, const V *add)
     {
-        if (2 * (s.count + 1) > s.cap) resize(s, s.cap ? 2 * s.cap : 64);
-        const u64 mask = s.cap - 1;
+        if (2 * (s.count + 1) > s.cap) rehash(s, s.cap ? 2 * s.cap : 128);
+        const u64 mask = s.cap - 1, tag = tag_of(h);
         u64 k = h & mask;
-        u64 *row = s.table + k * stride;
-        while (row[0] != EMPTY && !same(key_of(row), x)) {
-            k = (k + 1) & mask;
-            row = s.table + k * stride;
+        u64 *row = nullptr;
+        for (;; k = (k + 1) & mask) {
+            const u64 slot = s.slots[k];
+            if (!slot) break;
+            if ((slot >> 32) == tag) {
+                u64 *candidate = entry(s, (slot & 0xFFFFFFFFULL) - 1);
+                if (same(key_of(candidate), x)) {
+                    row = candidate;
+                    break;
+                }
+            }
         }
-        V *vals = values_of(row);
-        if (row[0] == EMPTY) {
+        if (!row) {
+            if (s.count == s.room) reserve_entries(s, s.room ? 2 * s.room : 64);
+            row = entry(s, s.count);
             std::memcpy(row, x.w, sizeof(x.w));
+            row[2 * W] = h;
+            V *vals = values_of(row);
             for (int v = 0; v < nvalues; ++v) vals[v] = 0;
+            s.slots[k] = (tag << 32) | (s.count + 1);
             ++s.count;
         }
+        V *vals = values_of(row);
         for (int v = 0; v < nvalues; ++v) vals[v] += add[v];
     }
 
@@ -522,18 +614,21 @@ template <int W, class V = i128> struct ShardedMap {
     template <class F> void for_each(size_t s, F &&f) const
     {
         const Shard &sh = shards[s];
-        for (size_t k = 0; k < sh.cap; ++k) {
-            u64 *row = sh.table + k * stride;
-            if (row[0] != EMPTY) f(key_of(row), values_of(row));
+        for (size_t i = 0; i < sh.count; ++i) {
+            u64 *row = entry(sh, i);
+            f(key_of(row), values_of(row));
         }
     }
 
     // Per-thread staging: records grouped by shard and inserted DEPTH at a
     // time under one lock acquisition (the lock cache line moves between
     // cores once per DEPTH inserts), each flush prefetching its records'
-    // entries before inserting them. flush_all() before the map is read.
+    // slots before inserting them. flush_all() before the map is read. 16
+    // keeps a thread's staging (512 shards) near its L2 cache with the PT2's
+    // eight 16-byte accumulators per record (64 made the stochastic PT2 1.6x
+    // slower; 8 slowed the deterministic one).
     struct Stage {
-        static constexpr int DEPTH = 64;
+        static constexpr int DEPTH = 16;
         ShardedMap &map;
         std::vector<Det<W>> keys;
         std::vector<u64> hashes;
@@ -562,9 +657,14 @@ template <int W, class V = i128> struct ShardedMap {
             Shard &sh = map.shards[s];
             sh.lock.lock();
             if (sh.cap) {
+                // Slots first, then the entries their home slots point to
+                // (an insert into an existing entry waits on both).
                 const u64 mask = sh.cap - 1;
-                for (int t = 0; t < f; ++t)
-                    __builtin_prefetch(sh.table + (hashes[s * DEPTH + t] & mask) * map.stride, 1);
+                for (int t = 0; t < f; ++t) __builtin_prefetch(sh.slots + (hashes[s * DEPTH + t] & mask), 1);
+                for (int t = 0; t < f; ++t) {
+                    const u64 h = hashes[s * DEPTH + t], slot = sh.slots[h & mask];
+                    if (slot && (slot >> 32) == tag_of(h)) __builtin_prefetch(map.entry(sh, (slot & 0xFFFFFFFFULL) - 1), 1);
+                }
             }
             for (int t = 0; t < f; ++t) {
                 const size_t slot = s * DEPTH + t;
@@ -590,9 +690,24 @@ template <int W, class V = i128> struct ShardedMap {
     void clear()
     {
         for (Shard &s : shards) {
-            std::free(s.table);
-            s.table = nullptr;
-            s.cap = s.count = 0;
+            std::free(s.slots);
+            std::free(s.entries);
+            s.slots = s.entries = nullptr;
+            s.cap = s.count = s.room = 0;
+        }
+    }
+
+    // Empties every shard but keeps its arrays, for the next batch of a PT2:
+    // a fresh map grows each shard by doubling (rehashing and faulting in new
+    // pages, several GB per batch at CuF size), while batches are alike in
+    // size. Only the slots are cleared.
+    void reset(int threads)
+    {
+#pragma omp parallel for schedule(dynamic, 4) num_threads(threads)
+        for (size_t i = 0; i < shards.size(); ++i) {
+            Shard &sh = shards[i];
+            if (sh.slots) std::memset(sh.slots, 0, sh.cap * sizeof(u64));
+            sh.count = 0;
         }
     }
 };
@@ -868,6 +983,113 @@ template <int W, class F> void for_each_upper(const Space<W> &sp, int64_t i, int
     for (int64_t v = f_lo; v < f_hi; ++v) mark[far[v] >> 6] = 0;
 }
 
+// Column indices are stored as the gaps between a row's consecutive columns
+// (the first from the row index), minus one, in a grouped variable-byte code:
+// a control byte holds the byte lengths (1-4) of the next four gaps, followed
+// by their little-endian bytes (a row's last group is padded with zero gaps).
+// Sorted spaces give mostly one- and two-byte gaps (CuF, 1.8 million
+// determinants: about 1.5 bytes per column instead of 4), and the gaps' byte
+// positions follow from the control byte alone, so a row decodes without a
+// chain through every entry (with SSSE3, one byte shuffle per group). Readers
+// load 16 bytes per group: each chunk's code ends with 16 padding bytes.
+namespace columns {
+struct Tables {
+    uint8_t length[256];            // bytes of a group's four gaps
+    uint8_t offset[256][4];         // each gap's first byte within the group
+    alignas(16) uint8_t shuffle[256][16];   // the group's bytes -> four little-endian uint32 gaps
+    Tables()
+    {
+        for (int c = 0; c < 256; ++c) {
+            int at = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int bytes = ((c >> (2 * k)) & 3) + 1;
+                offset[c][k] = static_cast<uint8_t>(at);
+                for (int b = 0; b < 4; ++b)
+                    shuffle[c][4 * k + b] = b < bytes ? static_cast<uint8_t>(at + b) : 0x80;
+                at += bytes;
+            }
+            length[c] = static_cast<uint8_t>(at);
+        }
+    }
+};
+inline const Tables &tables()
+{
+    static const Tables t;
+    return t;
+}
+constexpr uint32_t MASK[4] = {0xFFu, 0xFFFFu, 0xFFFFFFu, 0xFFFFFFFFu};
+constexpr int PADDING = 16;
+
+inline uint32_t load32(const uint8_t *p)
+{
+    uint32_t x;
+    std::memcpy(&x, p, 4);
+    return x;
+}
+
+// Appends row i's code for its m increasing columns (all > i).
+inline void encode(std::vector<uint8_t> &code, int64_t i, const int32_t *col, int64_t m)
+{
+    const int64_t groups = (m + 3) >> 2;
+    const size_t base = code.size();
+    code.resize(base + groups, 0);
+    uint32_t previous = static_cast<uint32_t>(i);
+    for (int64_t t = 0; t < 4 * groups; ++t) {
+        uint32_t gap = 0;
+        if (t < m) {
+            gap = static_cast<uint32_t>(col[t]) - previous - 1;
+            previous = static_cast<uint32_t>(col[t]);
+        }
+        const int bytes = gap < (1u << 8) ? 1 : gap < (1u << 16) ? 2 : gap < (1u << 24) ? 3 : 4;
+        code[base + (t >> 2)] |= static_cast<uint8_t>((bytes - 1) << (2 * (t & 3)));
+        for (int b = 0; b < bytes; ++b) code.push_back(static_cast<uint8_t>(gap >> (8 * b)));
+    }
+}
+
+// Row i's m columns into out (room for m rounded up to a multiple of 4).
+inline void decode(const uint8_t *p, int64_t i, int64_t m, int32_t *out)
+{
+    const Tables &T = tables();
+    const int64_t groups = (m + 3) >> 2;
+    const uint8_t *data = p + groups;
+#if defined(__SSSE3__)
+    const __m128i one = _mm_set1_epi32(1);
+    __m128i base = _mm_set1_epi32(static_cast<int32_t>(i));
+    for (int64_t g = 0; g < groups; ++g) {
+        const unsigned c = p[g];
+        __m128i d = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(data)),
+                                     _mm_load_si128(reinterpret_cast<const __m128i *>(T.shuffle[c])));
+        d = _mm_add_epi32(d, one);
+        d = _mm_add_epi32(d, _mm_slli_si128(d, 4));
+        d = _mm_add_epi32(d, _mm_slli_si128(d, 8));
+        d = _mm_add_epi32(d, base);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(out + 4 * g), d);
+        base = _mm_shuffle_epi32(d, 0xFF);
+        data += T.length[c];
+    }
+    return;
+#endif
+    uint32_t j = static_cast<uint32_t>(i);
+    for (int64_t g = 0; g < groups; ++g) {
+        const unsigned c = p[g];
+        const uint8_t *o = T.offset[c];
+        const uint32_t d0 = load32(data + o[0]) & MASK[c & 3];
+        const uint32_t d1 = load32(data + o[1]) & MASK[(c >> 2) & 3];
+        const uint32_t d2 = load32(data + o[2]) & MASK[(c >> 4) & 3];
+        const uint32_t d3 = load32(data + o[3]) & MASK[c >> 6];
+        data += T.length[c];
+        j += d0 + 1;
+        out[4 * g] = static_cast<int32_t>(j);
+        j += d1 + 1;
+        out[4 * g + 1] = static_cast<int32_t>(j);
+        j += d2 + 1;
+        out[4 * g + 2] = static_cast<int32_t>(j);
+        j += d3 + 1;
+        out[4 * g + 3] = static_cast<int32_t>(j);
+    }
+}
+}  // namespace columns
+
 // Rows are kept in chunks of CHUNK rows, each with its own arrays (no copy
 // into one array after the build, so a build peaks at the matrix's size), and
 // an extension releases each old chunk once its rows are copied.
@@ -882,7 +1104,8 @@ struct Hamiltonian {
     bool single = false;
     std::vector<double> diag;
     std::vector<std::vector<int64_t>> start;   // per chunk: CHUNK + 1 (or fewer) local row offsets
-    std::vector<std::vector<int32_t>> col;
+    std::vector<std::vector<uint32_t>> code_start;   // per chunk: each row's first byte in code
+    std::vector<std::vector<uint8_t>> code;          // per chunk: the rows' column code (see columns)
     std::vector<std::vector<double>> val;      // values (single == false)
     std::vector<std::vector<float>> val32;     // values (single == true)
     std::vector<int64_t> stripe;               // STRIPES + 1 row boundaries
@@ -894,7 +1117,8 @@ struct Hamiltonian {
     {
         int64_t b = static_cast<int64_t>(diag.size() + buffer.size()) * 8;
         for (const auto &v : start) b += static_cast<int64_t>(v.capacity()) * 8;
-        for (const auto &v : col) b += static_cast<int64_t>(v.capacity()) * 4;
+        for (const auto &v : code_start) b += static_cast<int64_t>(v.capacity()) * 4;
+        for (const auto &v : code) b += static_cast<int64_t>(v.capacity());
         for (const auto &v : val) b += static_cast<int64_t>(v.capacity()) * 8;
         for (const auto &v : val32) b += static_cast<int64_t>(v.capacity()) * 4;
         return b;
@@ -905,7 +1129,32 @@ struct Hamiltonian {
         const auto &st = start[i / CHUNK];
         return st[i % CHUNK + 1] - st[i % CHUNK];
     }
+
+    // Row i's columns into out (room for row_length(i) rounded up to 4).
+    void columns_of(int64_t i, int32_t *out) const
+    {
+        const int64_t ch = i / CHUNK, local = i % CHUNK;
+        columns::decode(code[ch].data() + code_start[ch][local], i, start[ch][local + 1] - start[ch][local], out);
+    }
+
+    int64_t longest = 0;                       // longest row (set by finish_stripes)
+    int64_t longest_row() const { return longest; }
 };
+
+// Appends one row (its columns, increasing) to a chunk's column code.
+inline void append_row_code(std::vector<uint8_t> &code, std::vector<uint32_t> &code_start, int64_t local, int64_t i,
+                            const int32_t *col, int64_t m)
+{
+    code_start[local] = static_cast<uint32_t>(code.size());
+    columns::encode(code, i, col, m);
+    code_start[local + 1] = static_cast<uint32_t>(code.size());
+}
+
+inline void finish_chunk_code(std::vector<uint8_t> &code)
+{
+    code.insert(code.end(), columns::PADDING, 0);
+    code.shrink_to_fit();
+}
 
 struct Buffer {
     int64_t rows = 0, width = 0;
@@ -928,6 +1177,8 @@ void finish_stripes(Hamiltonian &H)
     }
     H.offset.assign(Hamiltonian::STRIPES + 1, 0);
     for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s) H.offset[s + 1] = H.offset[s] + (count - H.stripe[s]);
+    H.longest = 0;
+    for (int64_t r = 0; r < count; ++r) H.longest = std::max(H.longest, H.row_length(r));
     std::vector<double>().swap(H.buffer);
     H.buffer_width = 0;
 }
@@ -948,8 +1199,10 @@ void spmm(Hamiltonian &H, const std::vector<std::vector<V>> &vals, const double 
         H.buffer.assign(H.offset[Hamiltonian::STRIPES] * K, 0.0);
         H.buffer_width = K;
     }
+    const int64_t longest = H.longest_row();
 #pragma omp parallel num_threads(threads)
     {
+        std::vector<int32_t> columns(longest + 4);      // one row's decoded columns
 #pragma omp for schedule(dynamic, 1)
         for (int64_t s = 0; s < Hamiltonian::STRIPES; ++s) {
             const int64_t lo = H.stripe[s], hi = H.stripe[s + 1];
@@ -958,18 +1211,19 @@ void spmm(Hamiltonian &H, const std::vector<std::vector<V>> &vals, const double 
             for (int64_t i = lo; i < hi; ++i) {
                 const int64_t ch = i / Hamiltonian::CHUNK, local = i % Hamiltonian::CHUNK;
                 const int64_t *st = H.start[ch].data();
-                const int32_t *col = H.col[ch].data();
-                const V *val = vals[ch].data();
+                const int64_t m = st[local + 1] - st[local];
+                const V *val = vals[ch].data() + st[local];
+                const int32_t *col = columns.data();
+                H.columns_of(i, columns.data());
                 double xi[K], v[K];
                 for (int r = 0; r < K; ++r) {
                     xi[r] = x[i * K + r];
                     v[r] = H.diag[i] * xi[r];
                 }
-                const int64_t t_end = st[local + 1];
-                for (int64_t t = st[local]; t < t_end; ++t) {
+                for (int64_t t = 0; t < m; ++t) {
                     // The columns are known ahead: request the vector and
                     // buffer lines early (the product waits on these reads).
-                    if (t + PREFETCH < t_end) {
+                    if (t + PREFETCH < m) {
                         const int64_t jp = col[t + PREFETCH];
                         __builtin_prefetch(x + jp * K, 0, 1);
                         __builtin_prefetch(buf + jp * K, 1, 1);
@@ -1039,7 +1293,8 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
     const int64_t chunk = Hamiltonian::CHUNK;
     const int64_t nchunks = (count + chunk - 1) / chunk;
     H->start.resize(nchunks);
-    H->col.resize(nchunks);
+    H->code_start.resize(nchunks);
+    H->code.resize(nchunks);
     H->val.resize(nchunks);
     H->val32.resize(nchunks);
     // The extension reads old chunks and releases each one after its rows are
@@ -1056,16 +1311,20 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
 #pragma omp parallel num_threads(threads)
     {
         std::vector<std::pair<int32_t, double>> row;
+        std::vector<int32_t> cols;
         int64_t local_stats[8] = {0};
         int64_t *stats = profile ? local_stats : nullptr;
 #pragma omp for schedule(dynamic, 1)
         for (int64_t ch = 0; ch < nchunks; ++ch) {
             const int64_t lo = ch * chunk, hi = std::min(count, lo + chunk);
             auto &st = H->start[ch];
-            auto &cc = H->col[ch];
+            auto &cs = H->code_start[ch];
+            auto &code = H->code[ch];
             auto &cv = H->val[ch];
             auto &cf = H->val32[ch];
             st.assign(hi - lo + 1, 0);
+            cs.assign(hi - lo + 1, 0);
+            int64_t entries = 0;
             for (int64_t i = lo; i < hi; ++i) {
                 row.clear();
                 int occ[2 * MAX_ORB];
@@ -1081,10 +1340,13 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
                           [](const std::pair<int32_t, double> &x, const std::pair<int32_t, double> &y) {
                               return x.first < y.first;
                           });
+                cols.clear();
                 if (kept) {         // the old row's columns all precede the new ones
                     const auto &os = old->start[ch];
                     const int64_t a = os[i - lo], b = os[i - lo + 1];
-                    cc.insert(cc.end(), old->col[ch].begin() + a, old->col[ch].begin() + b);
+                    cols.resize(b - a + 4);
+                    old->columns_of(i, cols.data());
+                    cols.resize(b - a);
                     if (old->single) {
                         const float *ov = old->val32[ch].data();
                         for (int64_t t = a; t < b; ++t) {
@@ -1100,18 +1362,21 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
                     }
                 }
                 for (auto &e : row) {
-                    cc.push_back(e.first);
+                    cols.push_back(e.first);
                     if (single) cf.push_back(static_cast<float>(e.second));
                     else cv.push_back(e.second);
                 }
-                st[i - lo + 1] = static_cast<int64_t>(cc.size());
+                append_row_code(code, cs, i - lo, i, cols.data(), static_cast<int64_t>(cols.size()));
+                entries += static_cast<int64_t>(cols.size());
+                st[i - lo + 1] = entries;
             }
-            cc.shrink_to_fit();
+            finish_chunk_code(code);
             cv.shrink_to_fit();
             cf.shrink_to_fit();
-            if (old_mut && ch < static_cast<int64_t>(old_mut->col.size())) {
+            if (old_mut && ch < static_cast<int64_t>(old_mut->code.size())) {
                 std::vector<int64_t>().swap(old_mut->start[ch]);
-                std::vector<int32_t>().swap(old_mut->col[ch]);
+                std::vector<uint32_t>().swap(old_mut->code_start[ch]);
+                std::vector<uint8_t>().swap(old_mut->code[ch]);
                 std::vector<double>().swap(old_mut->val[ch]);
                 if (ch < static_cast<int64_t>(old_mut->val32.size())) std::vector<float>().swap(old_mut->val32[ch]);
             }
@@ -1132,7 +1397,7 @@ Hamiltonian *hamiltonian_impl(Space<W> &sp, double drop, int threads, const Hami
                      static_cast<long long>(totals[5]), static_cast<long long>(totals[6]),
                      static_cast<long long>(totals[7]));
     int64_t nnz = 0;
-    for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->col[ch].size();
+    for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->start[ch].back();
     H->nnz = nnz;
     finish_stripes(*H);
     return H;
@@ -1165,18 +1430,23 @@ Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double drop, int thread
     }
     const int64_t chunk = Hamiltonian::CHUNK, nchunks = (count + chunk - 1) / chunk;
     H->start.resize(nchunks);
-    H->col.resize(nchunks);
+    H->code_start.resize(nchunks);
+    H->code.resize(nchunks);
     H->val.resize(nchunks);
 #pragma omp parallel num_threads(threads)
     {
         std::vector<std::pair<int32_t, double>> row;
+        std::vector<int32_t> cols;
 #pragma omp for schedule(dynamic, 1)
         for (int64_t ch = 0; ch < nchunks; ++ch) {
             const int64_t lo = ch * chunk, hi = std::min(count, lo + chunk);
             auto &st = H->start[ch];
-            auto &cc = H->col[ch];
+            auto &cs = H->code_start[ch];
+            auto &code = H->code[ch];
             auto &cv = H->val[ch];
             st.assign(hi - lo + 1, 0);
+            cs.assign(hi - lo + 1, 0);
+            int64_t entries = 0;
             for (int64_t i = lo; i < hi; ++i) {
                 row.clear();
                 const Det<W> &x = sp.dets[i];
@@ -1217,29 +1487,35 @@ Hamiltonian *onebody_impl(Space<W> &sp, const double *d, double drop, int thread
                           [](const std::pair<int32_t, double> &u, const std::pair<int32_t, double> &v) {
                               return u.first < v.first;
                           });
+                cols.clear();
                 if (kept) {         // the old row's columns all precede the new ones
                     const auto &os = old->start[ch];
                     const int64_t a = os[i - lo], b = os[i - lo + 1];
-                    cc.insert(cc.end(), old->col[ch].begin() + a, old->col[ch].begin() + b);
+                    cols.resize(b - a + 4);
+                    old->columns_of(i, cols.data());
+                    cols.resize(b - a);
                     cv.insert(cv.end(), old->val[ch].begin() + a, old->val[ch].begin() + b);
                 }
                 for (auto &e : row) {
-                    cc.push_back(e.first);
+                    cols.push_back(e.first);
                     cv.push_back(e.second);
                 }
-                st[i - lo + 1] = static_cast<int64_t>(cc.size());
+                append_row_code(code, cs, i - lo, i, cols.data(), static_cast<int64_t>(cols.size()));
+                entries += static_cast<int64_t>(cols.size());
+                st[i - lo + 1] = entries;
             }
-            cc.shrink_to_fit();
+            finish_chunk_code(code);
             cv.shrink_to_fit();
-            if (old && ch < static_cast<int64_t>(old->col.size())) {
+            if (old && ch < static_cast<int64_t>(old->code.size())) {
                 std::vector<int64_t>().swap(old->start[ch]);
-                std::vector<int32_t>().swap(old->col[ch]);
+                std::vector<uint32_t>().swap(old->code_start[ch]);
+                std::vector<uint8_t>().swap(old->code[ch]);
                 std::vector<double>().swap(old->val[ch]);
             }
         }
     }
     int64_t nnz = 0;
-    for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->col[ch].size();
+    for (int64_t ch = 0; ch < nchunks; ++ch) nnz += H->start[ch].back();
     H->nnz = nnz;
     finish_stripes(*H);
     return H;
@@ -1402,8 +1678,9 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
     const bool no_map = profile && profile_mode[0] == '2';     // diagnostic: generation alone
     double generate_s = 0.0, pass_s = 0.0;
     int64_t contributions = 0;
+    ShardedMap<W, int64_t> map(static_cast<int>(nroots));       // kept across batches (reset)
     for (int64_t batch = 0; batch < batches; ++batch) {
-        ShardedMap<W, int64_t> map(static_cast<int>(nroots));
+        if (batch) map.reset(threads);
         double t0 = omp_get_wtime();
 #pragma omp parallel num_threads(threads) reduction(+ : contributions)
         {
@@ -1413,7 +1690,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                 if (cmax[i] <= 0.0) continue;
                 int64_t add[16];
                 auto in_batch = [&](u64 h) {
-                    return batches == 1 || static_cast<int64_t>((h >> 20) % static_cast<u64>(batches)) == batch;
+                    return batches == 1 || batch_of(h, batches) == batch;
                 };
                 excitations<W>(c, sp.dets[i], hash_det<W>(sp.dets[i]), eps / cmax[i], in_batch,
                                [&](const Det<W> &y, double v, u64 h) {
@@ -1432,7 +1709,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
 #pragma omp parallel for schedule(dynamic, 4) num_threads(threads)
         for (int64_t s = 0; s < nshards; ++s) {
             map.for_each(s, [&](const Det<W> &y, const int64_t *vals) {
-                if (sp.index.find(y, hash_det<W>(y)) >= 0) return;   // in the space: not external
+                if (sp.index.find(y, map.hash_of(y)) >= 0) return;   // in the space: not external
                 ++found[s];
                 int oa[MAX_ORB], ob[MAX_ORB];
                 int na = occupied<W>(y.a(), oa), nb = occupied<W>(y.b(), ob);
@@ -1493,6 +1770,7 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
     const bool profile = std::getenv("ITERCC_SCI_PROFILE") != nullptr;
     double generate_s = 0.0, pass_s = 0.0, largest_task = 0.0;
     int64_t terms = 0, distinct_total = 0;
+    ShardedMap<W> map(static_cast<int>(4 * nroots));             // kept across batches (reset)
     for (int64_t batch = 0; batch < nbatches; ++batch) {
         u64 state = mix(seed ^ (0x9e3779b97f4a7c15ULL * static_cast<u64>(batch + 1)));
         std::vector<int64_t> drawn(samples);
@@ -1510,8 +1788,7 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
             distinct.emplace_back(drawn[s], static_cast<double>(t - s));
             s = t;
         }
-        const int nv = static_cast<int>(4 * nroots);
-        ShardedMap<W> map(nv);
+        if (batch) map.reset(threads);
         const double t0 = omp_get_wtime();
         distinct_total += distinct.size();
 #pragma omp parallel num_threads(threads) reduction(+ : terms) reduction(max : largest_task)
@@ -1552,7 +1829,7 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
 #pragma omp parallel for schedule(dynamic, 4) num_threads(threads)
         for (int64_t s = 0; s < nshards; ++s) {
             map.for_each(s, [&](const Det<W> &y, const i128 *vals) {
-                if (sp.index.find(y, hash_det<W>(y)) >= 0) return;   // in the space: not external
+                if (sp.index.find(y, map.hash_of(y)) >= 0) return;   // in the space: not external
                 int oa[MAX_ORB], ob[MAX_ORB];
                 int na = occupied<W>(y.a(), oa), nb = occupied<W>(y.b(), ob);
                 const double hyy = diagonal_energy(c, oa, na, ob, nb);
@@ -1761,7 +2038,22 @@ void *itercc_sci_create(int64_t norb, int64_t nalpha, int64_t nbeta, const doubl
     c->nb = nbeta;
     c->words = static_cast<int>((n + 63) / 64);
     c->h.assign(h, h + n * n);
-    c->eri.assign(eri, eri + n * n * n * n);
+    {
+        // One representative per class: p >= q, r >= s, pair(p, q) >= pair(r, s).
+        const int64_t pairs = n * (n + 1) / 2;
+        c->eri.assign(pairs * (pairs + 1) / 2, 0.0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (int64_t p = 0; p < n; ++p)
+            for (int64_t q = 0; q <= p; ++q) {
+                const int64_t pq = Ctx::pair(p, q);
+                for (int64_t r = 0; r <= p; ++r)
+                    for (int64_t t = 0; t <= r; ++t) {
+                        const int64_t rs = Ctx::pair(r, t);
+                        if (rs > pq) break;
+                        c->eri[Ctx::pair(pq, rs)] = eri[((p * n + q) * n + r) * n + t];
+                    }
+            }
+    }
     c->irrep.assign(n, 0);
     if (irrep) c->irrep.assign(irrep, irrep + n);
     c->J.resize(n * n);
@@ -1771,6 +2063,8 @@ void *itercc_sci_create(int64_t norb, int64_t nalpha, int64_t nbeta, const doubl
             c->J[p * n + q] = c->E(p, p, q, q);
             c->K[p * n + q] = c->E(p, q, q, p);
         }
+    c->JK.resize(n * n);
+    for (int64_t t = 0; t < n * n; ++t) c->JK[t] = c->J[t] - c->K[t];
     c->Dk.resize(n * n * n);
     c->Xk.resize(n * n * n);
 #pragma omp parallel for collapse(2) schedule(static) num_threads(threads)
@@ -1944,15 +2238,17 @@ void itercc_sci_ham_dense(const void *ham, double *out)
     const auto *H = static_cast<const Hamiltonian *>(ham);
     const int64_t n = H->n;
     std::fill(out, out + n * n, 0.0);
+    std::vector<int32_t> col(H->longest_row() + 4);
     for (int64_t i = 0; i < n; ++i) {
         out[i * n + i] = H->diag[i];
         const int64_t ch = i / Hamiltonian::CHUNK, local = i % Hamiltonian::CHUNK;
         const int64_t *st = H->start[ch].data();
-        const int32_t *col = H->col[ch].data();
+        H->columns_of(i, col.data());
         for (int64_t t = st[local]; t < st[local + 1]; ++t) {
             const double v = H->single ? static_cast<double>(H->val32[ch][t]) : H->val[ch][t];
-            out[i * n + col[t]] = v;
-            out[col[t] * n + i] = v;
+            const int64_t j = col[t - st[local]];
+            out[i * n + j] = v;
+            out[j * n + i] = v;
         }
     }
 }
