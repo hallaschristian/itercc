@@ -210,7 +210,7 @@ def test_reflection_pt2_matches_and_samples_without_bias(lih):
 
 
 def test_automatic_pt2_batches_equal_one_pass(lih):
-    """With 0 batches and a memory limit the PT2 probes 1/32 of the
+    """With 0 batches and a memory limit the PT2 probes 1/256 of the
     externals and takes the fewest passes that fit; the fixed-point sums are
     the same bits as one pass, over determinants and over orbits."""
     hc, eric = lih["complex"]

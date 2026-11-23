@@ -413,7 +413,7 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   per-thread buckets and summed per external in cache-sized tables (about
   200 bytes per external in the semistochastic part). Every pass scans all
   excitations again, so fewer passes are faster: `pt2_batches="auto"` (the
-  default) probes 1/32 of the externals and takes the fewest passes whose
+  default) probes 1/256 of the externals and takes the fewest passes whose
   records fit the memory budget; `pt2_batches=k` makes k passes over 1/k of
   them. The result is the same to the last bit for any number of passes.
   The Hamiltonian keeps its upper triangle (about 5.5 bytes per nonzero in

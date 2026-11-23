@@ -2260,12 +2260,17 @@ template <int W> struct NearDiagonal {
 // its distinct keys go straight to the final pass. Sequential writes and
 // cache-local tables replace a large shared map's random accesses (two or
 // three cache misses per contribution). Chunks come from per-thread arenas of
-// 2 MiB blocks, kept across batches.
+// 64 MiB blocks, each its own mapping and kept across batches: blocks carved
+// from malloc's heaps (blocks below the 32 MiB mmap threshold that
+// _core.keep_freed_memory sets) and marked for huge pages one by one split
+// the heaps' mappings until a large PT2 met the kernel's limit of 65530 per
+// process (vm.max_map_count) and allocation failed.
 template <int W> struct RecordBuckets {
     static constexpr int BITS = 12;
     static constexpr size_t NB = size_t(1) << BITS;
     static constexpr size_t CHUNK = 256;                       // records per chunk
-    static constexpr size_t BLOCK_WORDS = size_t(1) << 18;     // 2 MiB
+    static constexpr size_t BLOCK_BYTES = size_t(64) << 20;
+    static constexpr size_t BLOCK_WORDS = BLOCK_BYTES / sizeof(u64);
     const int nvalues;
     const size_t rw;                                           // words per record
     struct Local {
@@ -2273,6 +2278,7 @@ template <int W> struct RecordBuckets {
         std::vector<uint32_t> fill;                            // records in each bucket's last chunk
         std::vector<u64 *> blocks;
         size_t block = 0, used = 0;                            // current block, words used in it
+        bool failed = false;                                   // a block could not be mapped
     };
     std::vector<Local> locals;
 
@@ -2286,7 +2292,7 @@ template <int W> struct RecordBuckets {
     ~RecordBuckets()
     {
         for (Local &L : locals)
-            for (u64 *b : L.blocks) std::free(b);
+            for (u64 *b : L.blocks) munmap(b, BLOCK_BYTES);
     }
     RecordBuckets(const RecordBuckets &) = delete;
     RecordBuckets &operator=(const RecordBuckets &) = delete;
@@ -2299,7 +2305,11 @@ template <int W> struct RecordBuckets {
             L.used = 0;
         }
         if (L.block == L.blocks.size()) {
-            L.blocks.push_back(ShardedMap<W>::allocate(BLOCK_WORDS));
+            void *b = mmap(nullptr, BLOCK_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                           -1, 0);
+            if (b == MAP_FAILED) return nullptr;
+            madvise(b, BLOCK_BYTES, MADV_HUGEPAGE);
+            L.blocks.push_back(static_cast<u64 *>(b));
             L.used = 0;
         }
         u64 *chunk = L.blocks[L.block] + L.used;
@@ -2313,7 +2323,12 @@ template <int W> struct RecordBuckets {
         uint32_t &f = L.fill[b];
         std::vector<u64 *> &cv = L.chunks[b];
         if (cv.empty() || f == CHUNK) {
-            cv.push_back(new_chunk(L));
+            u64 *chunk = L.failed ? nullptr : new_chunk(L);
+            if (!chunk) {                                      // out of memory: the PT2 reports it
+                L.failed = true;
+                return;
+            }
+            cv.push_back(chunk);
             f = 0;
         }
         u64 *dst = cv.back() + static_cast<size_t>(f) * rw;
@@ -2321,6 +2336,13 @@ template <int W> struct RecordBuckets {
         std::memcpy(dst, x.w, sizeof(x.w));
         dst[2 * W] = h;
         std::memcpy(dst + 2 * W + 1, values, sizeof(int64_t) * nvalues);
+    }
+
+    bool failed() const
+    {
+        for (const Local &L : locals)
+            if (L.failed) return true;
+        return false;
     }
 
     // Empties every bucket, keeping the arenas.
@@ -2407,8 +2429,10 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
     // Externals' diagonal energies from the leading determinant's.
     const NearDiagonal<W> near(c, sp.dets[std::max_element(cmax.begin(), cmax.end()) - cmax.begin()]);
     // Batches are ranges of the externals' 23-bit keys: `batches` equal ones,
-    // or (batches 0, with a memory limit) a probe of 1/32 of the keys whose
-    // contributions set the fewest ranges that fit the limit for the rest.
+    // or (batches 0, with a memory limit) a probe of 1/256 of the keys whose
+    // contributions set the fewest ranges that fit the limit for the rest
+    // (a 26-electron triple-zeta stage has 7e10 contributions: 1/32 of them
+    // took 150 GB).
     // Every batch scans all excitations again, so fewer batches are faster;
     // the result does not depend on them (fixed-point sums).
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
@@ -2416,7 +2440,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
     if (batches == 0 && !automatic)
         ranges.emplace_back(0u, BATCH_KEYS);
     else if (automatic)
-        ranges.emplace_back(0u, BATCH_KEYS / 32);
+        ranges.emplace_back(0u, BATCH_KEYS / 256);
     else
         for (int64_t b = 0; b < batches; ++b)
             ranges.emplace_back(static_cast<uint32_t>((static_cast<u64>(b) << 23) / batches),
@@ -2475,6 +2499,16 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
             }
         }
         contributions += batch_contributions;
+        if (buckets.failed()) {                                // stats[0] -1: out of memory
+            if (profile) std::fprintf(stderr, "itercc_sci_pt2: out of memory in batch %zu of %zu\n", batch,
+                                      ranges.size());
+            for (int64_t r = 0; r < nroots; ++r) {
+                out[r] = std::nan("");
+                if (norm) norm[r] = std::nan("");
+            }
+            if (stats) stats[0] = stats[1] = -1;
+            return;
+        }
         double t1 = omp_get_wtime();
         generate_s += t1 - t0;
         // Each bucket: its records summed per key (a table of 8-byte slots, a

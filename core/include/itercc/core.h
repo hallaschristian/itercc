@@ -964,8 +964,9 @@ void itercc_sci_buffer_free(void *buffer);
  * determinants outside the space reached with |H_ai c_i| >= eps, in
  * `batches` passes over hash-partitioned external determinants (0: the
  * fewest whose records fit itercc_sci_set_pt2_memory's limit, sized by a
- * probe pass over 1/32 of them; one pass without a limit); stats (may
- * be NULL, two entries): external determinants, the largest batch; norm
+ * probe pass over 1/256 of them; one pass without a limit); stats (may
+ * be NULL, two entries): external determinants, the largest batch (both -1,
+ * and the energies NaN, when the records did not fit in memory); norm
  * (may be NULL) gets the first-order norm sum_a (num_a / (E - H_aa))^2 of
  * each state, for the renormalized correction E2 / (1 + norm). */
 /* Memory (bytes) a deterministic PT2 of this context may give its hash maps

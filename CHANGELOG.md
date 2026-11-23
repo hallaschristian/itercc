@@ -2,12 +2,20 @@
 
 ## Unreleased
 
+- Fixed: the deterministic PT2 of a large space (26 electrons, 130
+  orbitals) aborted with std::bad_alloc on 56 threads. Its record arenas
+  took 2 MiB blocks from malloc's heaps and marked each for huge pages,
+  splitting the heaps' mappings past the kernel's 65530 per process; they
+  are now whole 64 MiB mappings. A PT2 whose records do not fit raises
+  MemoryError instead of aborting, and the automatic batches probe 1/256
+  of the externals (1/32 of a 7e10-contribution stage was 150 GB).
+
 - Faster selected-CI stages (core ABI 48), same results. Deterministic PT2:
   contributions are written as records into per-thread buckets and summed
   per external in cache-sized tables (no shared hash map); batches are
   ranges of an orbit-invariant additive key tested before an excitation's
   image hashes are formed; `pt2_batches="auto"` (now the default) probes
-  1/32 of the externals and takes the fewest passes that fit the memory
+  1/256 of the externals and takes the fewest passes that fit the memory
   budget (`itercc_sci_set_pt2_memory`); externals' diagonal energies come
   from the leading determinant's in O(k^2); per-thread sums no longer share
   cache lines. Selection: `itercc_sci_select` flag bit 1 adds reflections in

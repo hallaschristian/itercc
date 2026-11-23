@@ -455,7 +455,7 @@ class SelectedCI:
         """The PT2 kernels' batch argument: `batches` passes, or for "auto"
         0 with the context's PT2 memory set to the budget left beside a space
         of `size` determinants (`per_determinant` bytes each): the kernel then
-        probes 1/32 of the externals and takes the fewest passes that fit
+        probes 1/256 of the externals and takes the fewest passes that fit
         (each pass scans every excitation again). Without a budget, one pass."""
         if batches != "auto":
             if int(batches) < 1:
@@ -838,6 +838,9 @@ class SelectedCI:
                                                             float(group[1]), pt2.ctypes.data, pt2_norm.ctypes.data,
                                                             stats.ctypes.data, threads)
                             externals = int(stats[0])
+                            if externals < 0:
+                                raise MemoryError("The deterministic PT2's records did not fit in memory: lower "
+                                                  "memory_budget_gib or pass more pt2_batches")
                             if pt2_deterministic is not None and pt2_deterministic > pt2_epsilon:
                                 mean = np.zeros(nroots)
                                 norm = np.zeros(nroots)
@@ -1312,6 +1315,8 @@ class SelectedCI:
                                                  sci._threads())
                 finally:
                     sci.kernels.sci_space_free(space)
+                if stats[0] < 0:
+                    raise MemoryError("The PT2's records did not fit in memory: pass more pt2_batches")
                 return out[0], norm[0]
 
         return lambda h, orbital_irreps=None: _FixedSpace(h)
