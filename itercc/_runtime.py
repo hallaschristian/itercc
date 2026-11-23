@@ -133,6 +133,7 @@ SWITCHES = {
         "pieces (default 2^22)"),
     "ITERCC_SLOT_PROFILE": Switch("", "core", "`1`: slot-program phase timers (`itercc_triplet_profile`)"),
     "ITERCC_SCI_PROFILE": Switch("", "core", "`1`: selected-CI PT2 phase timers (deterministic and semistochastic) on stderr; `2`: excitation generation alone (diagnostic, no PT2); `3`: Hamiltonian-build search counters; `4`: the search alone (diagnostic, no matrix)"),
+    "ITERCC_SCI_KEY_CODES": Switch("1", "core", "`0`: selected-CI PT2 records keep whole determinant keys instead of their difference from the leading determinant (diagnostic; same results)"),
     "ITERCC_SLOT_SORT": Switch("", "core", "`0`: with `ITERCC_SLOT_WAVES=1`, a wave's tiles in slot order "
                                "(diagnostic)"),
     "ITERCC_MERGE_TILES": Switch(

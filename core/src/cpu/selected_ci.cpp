@@ -2253,6 +2253,59 @@ template <int W> struct NearDiagonal {
     }
 };
 
+// A determinant near a reference as its difference from it, in two words:
+// the count (4 bits), then up to 13 differing spin orbitals (9 bits each,
+// spin << 8 | orbital) in increasing order and zeros, so equal determinants
+// have equal codes. PT2 externals differ from the leading determinant in a
+// few spin orbitals: 16 bytes per record key instead of 16 W (130 orbitals:
+// records of 40 instead of 72 bytes, so fewer passes).
+template <int W> struct KeyCodec {
+    Det<W> ref;
+
+    bool encode(const Det<W> &y, u64 *out) const
+    {
+        u64 lo = 0, hi = 0;
+        int k = 0, pos = 4;
+        for (int s = 0; s < 2; ++s)
+            for (int w = 0; w < W; ++w) {
+                u64 d = ref.w[s * W + w] ^ y.w[s * W + w];
+                if (!d) continue;
+                if (k + popc(d) > 13) return false;
+                for (; d; d &= d - 1, ++k, pos += 9) {
+                    const u64 v = (static_cast<u64>(s) << 8) | static_cast<u64>((w << 6) + lowest(d));
+                    if (pos + 9 <= 64)
+                        lo |= v << pos;
+                    else if (pos >= 64)
+                        hi |= v << (pos - 64);
+                    else {
+                        lo |= v << pos;
+                        hi |= v >> (64 - pos);
+                    }
+                }
+            }
+        out[0] = lo | static_cast<u64>(k);
+        out[1] = hi;
+        return true;
+    }
+
+    void decode(const u64 *in, Det<W> &y) const
+    {
+        y = ref;
+        const int k = static_cast<int>(in[0] & 15);
+        for (int j = 0, pos = 4; j < k; ++j, pos += 9) {
+            u64 v;
+            if (pos + 9 <= 64)
+                v = in[0] >> pos;
+            else if (pos >= 64)
+                v = in[1] >> (pos - 64);
+            else
+                v = (in[0] >> pos) | (in[1] << (64 - pos));
+            v &= 511;
+            flip(y.w + (v >> 8) * W, static_cast<int>(v & 255));
+        }
+    }
+};
+
 // The contributions of one deterministic PT2 batch, partitioned without
 // locks: each thread appends (key, hash, numerators) records to its own chunks
 // of NB buckets (by the hash's low bits); each bucket's records from every
@@ -2272,7 +2325,8 @@ template <int W> struct RecordBuckets {
     static constexpr size_t BLOCK_BYTES = size_t(64) << 20;
     static constexpr size_t BLOCK_WORDS = BLOCK_BYTES / sizeof(u64);
     const int nvalues;
-    const size_t rw;                                           // words per record
+    const int kw;                                              // key words
+    const size_t rw;                                           // words per record: key, hash, values
     struct Local {
         std::vector<std::vector<u64 *>> chunks;                // per bucket, in order
         std::vector<uint32_t> fill;                            // records in each bucket's last chunk
@@ -2282,7 +2336,8 @@ template <int W> struct RecordBuckets {
     };
     std::vector<Local> locals;
 
-    RecordBuckets(int nv, int threads) : nvalues(nv), rw(2 * W + 1 + nv), locals(threads)
+    RecordBuckets(int key_words, int nv, int threads)
+        : nvalues(nv), kw(key_words), rw(key_words + 1 + nv), locals(threads)
     {
         for (Local &L : locals) {
             L.chunks.resize(NB);
@@ -2317,7 +2372,7 @@ template <int W> struct RecordBuckets {
         return chunk;
     }
 
-    void add(Local &L, const Det<W> &x, u64 h, const int64_t *values) const
+    void add(Local &L, const u64 *key, u64 h, const int64_t *values) const
     {
         const size_t b = h & (NB - 1);
         uint32_t &f = L.fill[b];
@@ -2333,9 +2388,9 @@ template <int W> struct RecordBuckets {
         }
         u64 *dst = cv.back() + static_cast<size_t>(f) * rw;
         ++f;
-        std::memcpy(dst, x.w, sizeof(x.w));
-        dst[2 * W] = h;
-        std::memcpy(dst + 2 * W + 1, values, sizeof(int64_t) * nvalues);
+        std::memcpy(dst, key, sizeof(u64) * kw);
+        dst[kw] = h;
+        std::memcpy(dst + kw + 1, values, sizeof(int64_t) * nvalues);
     }
 
     bool failed() const
@@ -2425,9 +2480,15 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
     const bool no_map = profile && profile_mode[0] == '2';     // diagnostic: generation alone
     double generate_s = 0.0, pass_s = 0.0, summing_s = 0.0;
     int64_t contributions = 0;
-    RecordBuckets<W> buckets(static_cast<int>(nroots), threads);    // arenas kept across batches
-    // Externals' diagonal energies from the leading determinant's.
-    const NearDiagonal<W> near(c, sp.dets[std::max_element(cmax.begin(), cmax.end()) - cmax.begin()]);
+    // Externals' diagonal energies from the leading determinant's, and their
+    // keys stored as their difference from it when that is small (KeyCodec),
+    // else whole: two sets of buckets, arenas kept across batches.
+    const Det<W> &leading = sp.dets[std::max_element(cmax.begin(), cmax.end()) - cmax.begin()];
+    const NearDiagonal<W> near(c, leading);
+    const KeyCodec<W> codec{leading};
+    const char *codes_switch = std::getenv("ITERCC_SCI_KEY_CODES");     // "0": whole keys (diagnostic)
+    const bool use_codes = !(codes_switch && codes_switch[0] == '0');
+    RecordBuckets<W> compact(2, static_cast<int>(nroots), threads), whole(2 * W, static_cast<int>(nroots), threads);
     // Batches are ranges of the externals' 23-bit keys: `batches` equal ones,
     // or (batches 0, with a memory limit) a probe of 1/256 of the keys whose
     // contributions set the fewest ranges that fit the limit for the rest
@@ -2445,16 +2506,26 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
         for (int64_t b = 0; b < batches; ++b)
             ranges.emplace_back(static_cast<uint32_t>((static_cast<u64>(b) << 23) / batches),
                                 static_cast<uint32_t>((static_cast<u64>(b + 1) << 23) / batches));
-    const size_t rw = buckets.rw;
     for (size_t batch = 0; batch < ranges.size(); ++batch) {
         const uint32_t lo = ranges[batch].first, hi = ranges[batch].second;
         const bool every = lo == 0 && hi == BATCH_KEYS;
-        if (batch) buckets.reset();
+        if (batch) {
+            compact.reset();
+            whole.reset();
+        }
         double t0 = omp_get_wtime();
         int64_t batch_contributions = 0;
 #pragma omp parallel num_threads(threads) reduction(+ : batch_contributions)
         {
-            typename RecordBuckets<W>::Local &local = buckets.locals[omp_get_thread_num()];
+            const int tid = omp_get_thread_num();
+            typename RecordBuckets<W>::Local &local_c = compact.locals[tid], &local_w = whole.locals[tid];
+            auto store = [&](const Det<W> &key, u64 h, const int64_t *values) {
+                u64 code[2];
+                if (use_codes && codec.encode(key, code))
+                    compact.add(local_c, code, h, values);
+                else
+                    whole.add(local_w, key.w, h, values);
+            };
 #pragma omp for schedule(dynamic, 16)
             for (int64_t i = 0; i < count; ++i) {
                 if (cmax[i] <= 0.0) continue;
@@ -2481,7 +2552,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                         const double f = G.factor(hy, 0, hmin, phase_m) * weight;
                         if (f == 0.0) return;
                         for (int64_t k = 0; k < nroots; ++k) add[k] = to_numerator(f * v * coeffs[k * count + i]);
-                        if (!no_map) buckets.add(local, image_of<W>(y, m, which), hmin, add);
+                        if (!no_map) store(image_of<W>(y, m, which), hmin, add);
                         ++batch_contributions;
                     });
                     continue;
@@ -2493,13 +2564,13 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                 excitations<W>(c, sp.dets[i], hash_det<W>(sp.dets[i]), eps / cmax[i], in_batch,
                                [&](const Det<W> &y, double v, u64 h) {
                     for (int64_t k = 0; k < nroots; ++k) add[k] = to_numerator(v * coeffs[k * count + i]);
-                    if (!no_map) buckets.add(local, y, h, add);
+                    if (!no_map) store(y, h, add);
                     ++batch_contributions;
                 });
             }
         }
         contributions += batch_contributions;
-        if (buckets.failed()) {                                // stats[0] -1: out of memory
+        if (compact.failed() || whole.failed()) {              // stats[0] -1: out of memory
             if (profile) std::fprintf(stderr, "itercc_sci_pt2: out of memory in batch %zu of %zu\n", batch,
                                       ranges.size());
             for (int64_t r = 0; r < nroots; ++r) {
@@ -2528,8 +2599,13 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
             i128 sum[16] = {0}, sum_norm[16] = {0};
             int64_t found_here = 0;
 #pragma omp for schedule(dynamic, 1) nowait
-            for (int64_t b = 0; b < nb; ++b) {
-                const size_t n = buckets.records(b);
+            for (int64_t id = 0; id < 2 * nb; ++id) {
+                const bool coded = id < nb;
+                const RecordBuckets<W> &set = coded ? compact : whole;
+                const int64_t b = id % nb;
+                const int kw = set.kw;
+                const size_t rw = set.rw;
+                const size_t n = set.records(b);
                 if (!n) continue;
                 const double bucket_start = profile ? omp_get_wtime() : 0.0;
                 int bits = 6;
@@ -2539,9 +2615,9 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                 if (entries.size() < n * rw) entries.resize(n * rw);
                 size_t used = 0;
                 auto home = [&](u64 h) { return static_cast<size_t>((h * 0x9e3779b97f4a7c15ULL) >> (64 - bits)); };
-                buckets.for_each(b, [&](const u64 *r) { __builtin_prefetch(slots.data() + home(r[2 * W]), 1); },
-                                 [&](const u64 *r) {
-                    const u64 h = r[2 * W], tag = (h >> 32) & 0xFFFFFFFFULL;
+                set.for_each(b, [&](const u64 *r) { __builtin_prefetch(slots.data() + home(r[kw]), 1); },
+                             [&](const u64 *r) {
+                    const u64 h = r[kw], tag = (h >> 32) & 0xFFFFFFFFULL;
                     for (size_t k = home(h);; k = (k + 1) & mask) {
                         const u64 slot = slots[k];
                         if (!slot) {
@@ -2553,10 +2629,10 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                         if ((slot >> 32) == tag) {
                             u64 *e = entries.data() + ((slot & 0xFFFFFFFFULL) - 1) * rw;
                             bool equal = true;
-                            for (int w = 0; w < 2 * W; ++w) equal = equal && e[w] == r[w];
+                            for (int w = 0; w < kw; ++w) equal = equal && e[w] == r[w];
                             if (equal) {
-                                int64_t *acc = reinterpret_cast<int64_t *>(e + 2 * W + 1);
-                                const int64_t *v = reinterpret_cast<const int64_t *>(r + 2 * W + 1);
+                                int64_t *acc = reinterpret_cast<int64_t *>(e + kw + 1);
+                                const int64_t *v = reinterpret_cast<const int64_t *>(r + kw + 1);
                                 for (int64_t q = 0; q < nroots; ++q) acc[q] += v[q];
                                 return;
                             }
@@ -2565,12 +2641,16 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                 });
                 if (profile) aggregate_s[t] += omp_get_wtime() - bucket_start;
                 constexpr size_t AHEAD = 12;
-                for (size_t j = 0; j < std::min(AHEAD, used); ++j) sp.index.prefetch(entries[j * rw + 2 * W]);
+                for (size_t j = 0; j < std::min(AHEAD, used); ++j) sp.index.prefetch(entries[j * rw + kw]);
                 for (size_t j = 0; j < used; ++j) {
-                    if (j + AHEAD < used) sp.index.prefetch(entries[(j + AHEAD) * rw + 2 * W]);
+                    if (j + AHEAD < used) sp.index.prefetch(entries[(j + AHEAD) * rw + kw]);
                     const u64 *e = entries.data() + j * rw;
-                    const Det<W> &y = *reinterpret_cast<const Det<W> *>(e);
-                    if (sp.index.find(y, e[2 * W]) >= 0) continue;    // in the space: not external
+                    Det<W> y;
+                    if (coded)
+                        codec.decode(e, y);
+                    else
+                        std::memcpy(y.w, e, sizeof(y.w));
+                    if (sp.index.find(y, e[kw]) >= 0) continue;       // in the space: not external
                     int images = 1;                                    // the orbit's members it stands for
                     if (paired) {
                         u64 hy[4];
@@ -2579,7 +2659,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                     }
                     found_here += images;
                     const double hyy = near(y);
-                    const int64_t *vals = reinterpret_cast<const int64_t *>(e + 2 * W + 1);
+                    const int64_t *vals = reinterpret_cast<const int64_t *>(e + kw + 1);
                     for (int64_t r = 0; r < nroots; ++r) {
                         const double num = from_numerator(vals[r]);
                         const double amplitude = num / (energies[r] - hyy);
@@ -2606,14 +2686,22 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
         largest = std::max(largest, size);
         for (int t = 0; t < threads; ++t) summing_s += aggregate_s[t] / threads;
         if (automatic && batch == 0) {
-            // The probe's contributions per key, projected over the remaining
+            // The probe's records per key, projected over the remaining
             // keys, set their batches.
-            const double records = static_cast<double>(batch_contributions) * (BATCH_KEYS - hi) /
-                                   std::max<uint32_t>(hi - lo, 1);
+            double coded_records = 0.0, whole_records = 0.0;
+            for (int64_t b = 0; b < nb; ++b) {
+                coded_records += static_cast<double>(compact.records(b));
+                whole_records += static_cast<double>(whole.records(b));
+            }
+            const double scale = static_cast<double>(BATCH_KEYS - hi) / std::max<uint32_t>(hi - lo, 1);
+            coded_records *= scale;
+            whole_records *= scale;
+            auto need = [&](double q) {
+                return (coded_records / q) * compact.bytes_per_record() + compact.fixed_bytes(coded_records / q) +
+                       (whole_records / q) * whole.bytes_per_record() + whole.fixed_bytes(whole_records / q);
+            };
             int64_t parts = 1;
-            while (parts < 4096 && (records / parts) * buckets.bytes_per_record() + buckets.fixed_bytes(records / parts) >
-                                       static_cast<double>(c.pt2_memory))
-                ++parts;
+            while (parts < 4096 && need(static_cast<double>(parts)) > static_cast<double>(c.pt2_memory)) ++parts;
             for (int64_t b = 0; b < parts; ++b)
                 ranges.emplace_back(hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * b) / parts),
                                     hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * (b + 1)) / parts));
@@ -2639,6 +2727,14 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
 // determinants with replacement, p_i proportional to max_k |c_ik|, and
 // evaluates the unbiased estimator of the PT2 energy over the terms above
 // eps and, from the same samples, over those above eps_det.
+//
+// The batches share their heavy determinants (the leading one is drawn in
+// almost every batch), so each distinct drawn determinant generates its terms
+// once, heaviest first: records (external, hash, the determinant, its value
+// and its value above eps_det) in per-thread buckets (RecordBuckets). Each
+// bucket's records are grouped by external and summed into every batch that
+// drew their determinant, with that batch's multiplicity: the same fixed-point
+// sums as one generation per draw (the external's 128-bit sums per batch).
 template <int W>
 void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *energies, double eps,
                          double eps_det, int64_t samples, int64_t nbatches, u64 seed, double *mean, double *error,
@@ -2665,12 +2761,14 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
     for (int64_t i = 0; i < count; ++i) cdf[i + 1] = cdf[i] + cmax[i];
     const double total_weight = cdf[count];
     const double nd = static_cast<double>(samples);
-    std::vector<double> values(nbatches * nroots, 0.0), norms(nbatches * nroots, 0.0);
-    int64_t externals = 0;
     const bool profile = std::getenv("ITERCC_SCI_PROFILE") != nullptr;
-    double generate_s = 0.0, pass_s = 0.0, largest_task = 0.0;
-    int64_t terms = 0, distinct_total = 0;
-    ShardedMap<W> map(static_cast<int>(4 * nroots));             // kept across batches (reset)
+    // The draws, one stream per batch, as (determinant, batch, multiplicity).
+    struct Draw {
+        int64_t det;
+        int64_t batch;
+        double w;
+    };
+    std::vector<Draw> draws;
     for (int64_t batch = 0; batch < nbatches; ++batch) {
         u64 state = mix(seed ^ (0x9e3779b97f4a7c15ULL * static_cast<u64>(batch + 1)));
         std::vector<int64_t> drawn(samples);
@@ -2681,151 +2779,312 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
             drawn[s] = std::min<int64_t>(i, count - 1);
         }
         std::sort(drawn.begin(), drawn.end());
-        std::vector<std::pair<int64_t, double>> distinct;
         for (int64_t s = 0; s < samples;) {
             int64_t t = s;
             while (t < samples && drawn[t] == drawn[s]) ++t;
-            distinct.emplace_back(drawn[s], static_cast<double>(t - s));
+            draws.push_back({drawn[s], batch, static_cast<double>(t - s)});
             s = t;
         }
-        if (batch) map.reset(threads);
+    }
+    const int64_t distinct_total = draws.size();
+    std::sort(draws.begin(), draws.end(),
+              [](const Draw &a, const Draw &b) { return a.det != b.det ? a.det < b.det : a.batch < b.batch; });
+    std::vector<int64_t> unique, first;          // distinct determinants and their first draw
+    for (size_t k = 0; k < draws.size(); ++k)
+        if (k == 0 || draws[k].det != draws[k - 1].det) {
+            unique.push_back(draws[k].det);
+            first.push_back(static_cast<int64_t>(k));
+        }
+    first.push_back(static_cast<int64_t>(draws.size()));
+    const int64_t nunique = unique.size();
+    std::vector<int64_t> order(nunique);         // heaviest first (the largest tasks start early)
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](int64_t a, int64_t b) { return cmax[unique[a]] != cmax[unique[b]] ? cmax[unique[a]] > cmax[unique[b]] : a < b; });
+    const NearDiagonal<W> near(c, sp.dets[std::max_element(cmax.begin(), cmax.end()) - cmax.begin()]);
+    std::vector<double> values(nbatches * nroots, 0.0), norms(nbatches * nroots, 0.0);
+    std::vector<i128> total(nbatches * nroots, 0), total_norm(nbatches * nroots, 0);
+    int64_t externals = 0, terms = 0;
+    double generate_s = 0.0, pass_s = 0.0, largest_task = 0.0;
+    // Records: the external's key (coded against the leading determinant
+    // when near it) and hash, then the distinct determinant's number, its
+    // value and its value above eps_det (as bits).
+    const KeyCodec<W> codec{sp.dets[std::max_element(cmax.begin(), cmax.end()) - cmax.begin()]};
+    const char *codes_switch = std::getenv("ITERCC_SCI_KEY_CODES");     // "0": whole keys (diagnostic)
+    const bool use_codes = !(codes_switch && codes_switch[0] == '0');
+    RecordBuckets<W> compact(2, 3, threads), whole(2 * W, 3, threads);
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    const bool automatic = c.pt2_memory > 0;
+    ranges.emplace_back(0u, automatic ? BATCH_KEYS / 256 : BATCH_KEYS);
+    for (size_t range = 0; range < ranges.size(); ++range) {
+        const uint32_t lo = ranges[range].first, hi = ranges[range].second;
+        const bool every = lo == 0 && hi == BATCH_KEYS;
+        if (range) {
+            compact.reset();
+            whole.reset();
+        }
         const double t0 = omp_get_wtime();
-        distinct_total += distinct.size();
 #pragma omp parallel num_threads(threads) reduction(+ : terms) reduction(max : largest_task)
         {
-        typename ShardedMap<W>::Stage stage(map);
+            const int tid = omp_get_thread_num();
+            typename RecordBuckets<W>::Local &local_c = compact.locals[tid], &local_w = whole.locals[tid];
 #pragma omp for schedule(dynamic, 1)
-        for (int64_t t = 0; t < static_cast<int64_t>(distinct.size()); ++t) {
-            const double task_start = profile ? omp_get_wtime() : 0.0;
-            const int64_t i = distinct[t].first;
-            const double w = distinct[t].second, p = cmax[i] / total_weight;
-            if (cmax[i] <= 0.0) continue;
-            i128 add[64];
-            auto record = [&](const Det<W> &y, double v, u64 h) {
-                const bool kept = std::fabs(v) * cmax[i] >= eps_det;
-                for (int64_t k = 0; k < nroots; ++k) {
-                    const double term = v * coeffs[k * count + i];
-                    const i128 a = to_fixed(w * term / p);
-                    const i128 b = to_fixed((w * (nd - 1.0) / p - w * w / (p * p)) * term * term);
-                    add[4 * k] = a;
-                    add[4 * k + 1] = b;
-                    add[4 * k + 2] = kept ? a : 0;
-                    add[4 * k + 3] = kept ? b : 0;
-                }
-                stage.add(y, h, add);
-                ++terms;
-            };
-            if (paired) {
-                // One internal i may reach several images of an external orbit
-                // (members a_j = g_j y); the estimator squares i's whole
-                // contribution to the orbit, so the members that are terms
-                // of i are added together, by the one of lowest hash.
-                const ImageGroup &G = *group;
-                const double threshold = eps / cmax[i];
-                const Det<W> &x = sp.dets[i];
-                int occ[2 * MAX_ORB];
-                const int na = occupied<W>(x.a(), occ), nb = occupied<W>(x.b(), occ + na);
-                u64 hx[4];
-                G.hashes<W>(x, hx);
-                int stabilizer = 0;
-                for (int u = 0; u < G.count; ++u) stabilizer += hx[G.elements[u]] == hx[0];
-                const double weight = 1.0 / stabilizer;
-                auto value_of = [&](const Det<W> &z) {      // <z|H|x> if a term of i (above threshold), else 0
-                    int d = 0;
-                    for (int k = 0; k < W; ++k) d += popc(x.a()[k] ^ z.a()[k]) + popc(x.b()[k] ^ z.b()[k]);
-                    if (d == 0 || d > 4) return 0.0;
-                    const double u = element_strings<W>(c, x.a(), x.b(), z.a(), z.b(), occ, na, nb);
-                    return std::fabs(u) >= threshold ? u : 0.0;
-                };
-                auto all = [](u64) { return true; };
-                excitations_images<W>(c, x, hx, G.key, 0, G.tsum, threshold, all,
-                                      [&](const Det<W> &y, double v, const u64 *hy) {
-                    int which;
-                    const u64 hmin = G.lowest_hash(hy, &which);
-                    Det<W> m;
-                    const double phase_m = G.count > 2 || G.elements[1] == 2 ? mirror_det<W>(c, y, m) : 1.0;
-                    double total = G.factor(hy, 0, hmin, phase_m) * v;
-                    double kept_total = std::fabs(v) * cmax[i] >= eps_det ? total : 0.0;
-                    for (int t = 1; t < G.count; ++t) {
-                        const int j = G.elements[t];
-                        if (hy[j] == hy[0]) continue;               // y itself
-                        bool repeat = false;                        // an image already counted
-                        for (int u = 1; u < t; ++u) repeat = repeat || hy[G.elements[u]] == hy[j];
-                        if (repeat) continue;
-                        const double u = value_of(image_of<W>(y, m, j));
-                        if (u == 0.0) continue;
-                        if (hy[j] < hy[0]) return;                  // that image adds this orbit's terms
-                        const double f = G.factor(hy, j, hmin, phase_m) * u;
-                        total += f;
-                        if (std::fabs(u) * cmax[i] >= eps_det) kept_total += f;
-                    }
-                    total *= weight;
-                    kept_total *= weight;
-                    if (total == 0.0 && kept_total == 0.0) return;
-                    const double scale = w * (nd - 1.0) / p - w * w / (p * p);
-                    for (int64_t k = 0; k < nroots; ++k) {
-                        const double ck = coeffs[k * count + i];
-                        const double term = total * ck, kept_term = kept_total * ck;
-                        add[4 * k] = to_fixed(w * term / p);
-                        add[4 * k + 1] = to_fixed(scale * term * term);
-                        add[4 * k + 2] = to_fixed(w * kept_term / p);
-                        add[4 * k + 3] = to_fixed(scale * kept_term * kept_term);
-                    }
-                    stage.add(image_of<W>(y, m, which), hmin, add);
+            for (int64_t o = 0; o < nunique; ++o) {
+                const int64_t u = order[o], i = unique[u];
+                if (cmax[i] <= 0.0) continue;
+                const double task_start = profile ? omp_get_wtime() : 0.0;
+                int64_t record[3];
+                record[0] = u;
+                auto put = [&](const Det<W> &y, u64 h, double value, double kept) {
+                    std::memcpy(&record[1], &value, sizeof(double));
+                    std::memcpy(&record[2], &kept, sizeof(double));
+                    u64 code[2];
+                    if (use_codes && codec.encode(y, code))
+                        compact.add(local_c, code, h, record);
+                    else
+                        whole.add(local_w, y.w, h, record);
                     ++terms;
-                });
+                };
+                const double threshold = eps / cmax[i];
+                if (paired) {
+                    // One determinant may reach several images of an external
+                    // orbit (members a_j = g_j y); the estimator squares its
+                    // whole contribution to the orbit, so the members that are
+                    // its terms are added together, by the one of lowest hash.
+                    const ImageGroup &G = *group;
+                    const Det<W> &x = sp.dets[i];
+                    int occ[2 * MAX_ORB];
+                    const int na = occupied<W>(x.a(), occ), nb = occupied<W>(x.b(), occ + na);
+                    u64 hx[4];
+                    G.hashes<W>(x, hx);
+                    int stabilizer = 0;
+                    for (int t = 0; t < G.count; ++t) stabilizer += hx[G.elements[t]] == hx[0];
+                    const double weight = 1.0 / stabilizer;
+                    auto value_of = [&](const Det<W> &z) {      // <z|H|x> if a term of x (above threshold), else 0
+                        int d = 0;
+                        for (int k = 0; k < W; ++k) d += popc(x.a()[k] ^ z.a()[k]) + popc(x.b()[k] ^ z.b()[k]);
+                        if (d == 0 || d > 4) return 0.0;
+                        const double v = element_strings<W>(c, x.a(), x.b(), z.a(), z.b(), occ, na, nb);
+                        return std::fabs(v) >= threshold ? v : 0.0;
+                    };
+                    auto in_range = [&](u64 sum) {
+                        const uint32_t k = ImageGroup::batch_key(sum);
+                        return every || (k >= lo && k < hi);
+                    };
+                    excitations_images<W>(c, x, hx, G.key, G.orbit_sum<W>(x), G.tsum, threshold, in_range,
+                                          [&](const Det<W> &y, double v, const u64 *hy) {
+                        int which;
+                        const u64 hmin = G.lowest_hash(hy, &which);
+                        Det<W> m;
+                        const double phase_m = G.count > 2 || G.elements[1] == 2 ? mirror_det<W>(c, y, m) : 1.0;
+                        double sum = G.factor(hy, 0, hmin, phase_m) * v;
+                        double kept_sum = std::fabs(v) * cmax[i] >= eps_det ? sum : 0.0;
+                        for (int t = 1; t < G.count; ++t) {
+                            const int j = G.elements[t];
+                            if (hy[j] == hy[0]) continue;               // y itself
+                            bool repeat = false;                        // an image already counted
+                            for (int q = 1; q < t; ++q) repeat = repeat || hy[G.elements[q]] == hy[j];
+                            if (repeat) continue;
+                            const double uj = value_of(image_of<W>(y, m, j));
+                            if (uj == 0.0) continue;
+                            if (hy[j] < hy[0]) return;                  // that image adds this orbit's terms
+                            const double f = G.factor(hy, j, hmin, phase_m) * uj;
+                            sum += f;
+                            if (std::fabs(uj) * cmax[i] >= eps_det) kept_sum += f;
+                        }
+                        sum *= weight;
+                        kept_sum *= weight;
+                        if (sum == 0.0 && kept_sum == 0.0) return;
+                        put(image_of<W>(y, m, which), hmin, sum, kept_sum);
+                    });
+                } else {
+                    auto in_range = [&](u64 h) {
+                        const uint32_t k = batch_key(h);
+                        return every || (k >= lo && k < hi);
+                    };
+                    excitations<W>(c, sp.dets[i], hash_det<W>(sp.dets[i]), threshold, in_range,
+                                   [&](const Det<W> &y, double v, u64 h) {
+                        put(y, h, v, std::fabs(v) * cmax[i] >= eps_det ? v : 0.0);
+                    });
+                }
                 if (profile) largest_task = std::max(largest_task, omp_get_wtime() - task_start);
-                continue;
             }
-            excitations<W>(c, sp.dets[i], hash_det<W>(sp.dets[i]), eps / cmax[i], [](u64) { return true; }, record);
-            if (profile) largest_task = std::max(largest_task, omp_get_wtime() - task_start);
-        }
-        stage.flush_all();
         }
         const double t1 = omp_get_wtime();
         generate_s += t1 - t0;
-        externals += map.size();
-        const int64_t nshards = map.shards.size();
-        std::vector<i128> part(nshards * nroots, 0), part_norm(nshards * nroots, 0);
-#pragma omp parallel for schedule(dynamic, 4) num_threads(threads)
-        for (int64_t s = 0; s < nshards; ++s) {
-            map.for_each(s, [&](const Det<W> &y, const i128 *vals) {
-                if (sp.index.find(y, map.hash_of(y)) >= 0) return;   // in the space: not external
-                double weight = 1.0;                                  // the orbit's members it stands for
-                if (paired) {
-                    u64 hy[4];
-                    group->hashes<W>(y, hy);
-                    weight = group->distinct(hy);
-                }
-                int oa[MAX_ORB], ob[MAX_ORB];
-                int na = occupied<W>(y.a(), oa), nb = occupied<W>(y.b(), ob);
-                const double hyy = diagonal_energy(c, oa, na, ob, nb);
-                for (int64_t r = 0; r < nroots; ++r) {
-                    const i128 *q = vals + 4 * r;
-                    const double a = from_fixed(q[0]), b = from_fixed(q[1]);
-                    const double ad = from_fixed(q[2]), bd = from_fixed(q[3]);
-                    const double inverse = 1.0 / (energies[r] - hyy);
-                    const double square = weight * ((a * a + b) - (ad * ad + bd)) / (nd * (nd - 1.0));
-                    part[s * nroots + r] += to_fixed(square * inverse);
-                    part_norm[s * nroots + r] += to_fixed(square * inverse * inverse);
-                }
-            });
-        }
-        for (int64_t r = 0; r < nroots; ++r) {
-            i128 sum = 0, sum_norm = 0;
-            for (int64_t s = 0; s < nshards; ++s) {
-                sum += part[s * nroots + r];
-                sum_norm += part_norm[s * nroots + r];
+        if (compact.failed() || whole.failed()) {      // out of memory: NaN, stats -1
+            if (profile) std::fprintf(stderr, "itercc_sci_pt2_stochastic: out of memory\n");
+            for (int64_t r = 0; r < nroots; ++r) {
+                mean[r] = error[r] = std::nan("");
+                if (norm) norm[r] = std::nan("");
             }
-            values[batch * nroots + r] = from_fixed(sum);
-            norms[batch * nroots + r] = from_fixed(sum_norm);
+            if (stats) stats[0] = -1;
+            return;
+        }
+        // Each bucket: records grouped by external (a table of slots over
+        // the distinct externals, each with a chain of its records), each
+        // external's sums per batch, then its terms per batch.
+        const int64_t nb = RecordBuckets<W>::NB;
+        std::vector<i128> part(threads * nbatches * nroots, 0), part_norm(threads * nbatches * nroots, 0);
+        std::vector<int64_t> found(threads, 0);
+#pragma omp parallel num_threads(threads)
+        {
+            const int t = omp_get_thread_num();
+            std::vector<const u64 *> recs;
+            std::vector<u64> slots;
+            std::vector<int64_t> head, next;
+            std::vector<i128> acc(nbatches * nroots * 4, 0), sum(nbatches * nroots, 0), sum_norm(nbatches * nroots, 0);
+            std::vector<uint8_t> seen(nbatches, 0);
+            std::vector<int64_t> touched;
+            int64_t found_here = 0;
+#pragma omp for schedule(dynamic, 1) nowait
+            for (int64_t id = 0; id < 2 * nb; ++id) {
+                const bool coded = id < nb;
+                const RecordBuckets<W> &set = coded ? compact : whole;
+                const int64_t b = id % nb;
+                const int kw = set.kw;
+                recs.clear();
+                set.for_each(b, [](const u64 *) {}, [&](const u64 *r) { recs.push_back(r); });
+                const size_t n = recs.size();
+                if (!n) continue;
+                int bits = 6;
+                while ((size_t(1) << bits) < n + n / 2) ++bits;
+                const size_t mask = (size_t(1) << bits) - 1;
+                slots.assign(mask + 1, 0);
+                head.clear();
+                next.resize(n);
+                for (size_t j = 0; j < n; ++j) {
+                    const u64 *r = recs[j];
+                    const u64 h = r[kw], tag = (h >> 32) & 0xFFFFFFFFULL;
+                    for (size_t k = static_cast<size_t>((h * 0x9e3779b97f4a7c15ULL) >> (64 - bits));; k = (k + 1) & mask) {
+                        const u64 slot = slots[k];
+                        if (!slot) {
+                            slots[k] = (tag << 32) | (head.size() + 1);
+                            head.push_back(static_cast<int64_t>(j));
+                            next[j] = -1;
+                            break;
+                        }
+                        if ((slot >> 32) == tag) {
+                            const size_t e = (slot & 0xFFFFFFFFULL) - 1;
+                            const u64 *q = recs[head[e]];
+                            bool equal = true;
+                            for (int w = 0; w < kw; ++w) equal = equal && q[w] == r[w];
+                            if (equal) {
+                                next[j] = head[e];
+                                head[e] = static_cast<int64_t>(j);
+                                break;
+                            }
+                        }
+                    }
+                }
+                for (size_t e = 0; e < head.size(); ++e) {
+                    touched.clear();
+                    for (int64_t j = head[e]; j >= 0; j = next[j]) {
+                        const u64 *r = recs[j];
+                        const int64_t u = static_cast<int64_t>(r[kw + 1]);
+                        double value, kept;
+                        std::memcpy(&value, &r[kw + 2], sizeof(double));
+                        std::memcpy(&kept, &r[kw + 3], sizeof(double));
+                        const int64_t i = unique[u];
+                        const double p = cmax[i] / total_weight;
+                        for (int64_t d = first[u]; d < first[u + 1]; ++d) {
+                            const int64_t batch = draws[d].batch;
+                            const double w = draws[d].w;
+                            if (!seen[batch]) {
+                                seen[batch] = 1;
+                                touched.push_back(batch);
+                            }
+                            const double scale = w * (nd - 1.0) / p - w * w / (p * p);
+                            i128 *a = acc.data() + batch * nroots * 4;
+                            for (int64_t k = 0; k < nroots; ++k) {
+                                const double ck = coeffs[k * count + i];
+                                const double term = value * ck, kept_term = kept * ck;
+                                a[4 * k] += to_fixed(w * term / p);
+                                a[4 * k + 1] += to_fixed(scale * term * term);
+                                a[4 * k + 2] += to_fixed(w * kept_term / p);
+                                a[4 * k + 3] += to_fixed(scale * kept_term * kept_term);
+                            }
+                        }
+                    }
+                    const u64 *r = recs[head[e]];
+                    Det<W> y;
+                    if (coded)
+                        codec.decode(r, y);
+                    else
+                        std::memcpy(y.w, r, sizeof(y.w));
+                    found_here += touched.size();
+                    const bool internal = sp.index.find(y, r[kw]) >= 0;      // in the space: not external
+                    double weight = 1.0;                                      // the orbit's members it stands for
+                    double hyy = 0.0;
+                    if (!internal) {
+                        if (paired) {
+                            u64 hy[4];
+                            group->hashes<W>(y, hy);
+                            weight = group->distinct(hy);
+                        }
+                        hyy = near(y);
+                    }
+                    for (const int64_t batch : touched) {
+                        i128 *q = acc.data() + batch * nroots * 4;
+                        if (!internal)
+                            for (int64_t k = 0; k < nroots; ++k) {
+                                const double a = from_fixed(q[4 * k]), bb = from_fixed(q[4 * k + 1]);
+                                const double ad = from_fixed(q[4 * k + 2]), bd = from_fixed(q[4 * k + 3]);
+                                const double inverse = 1.0 / (energies[k] - hyy);
+                                const double square = weight * ((a * a + bb) - (ad * ad + bd)) / (nd * (nd - 1.0));
+                                sum[batch * nroots + k] += to_fixed(square * inverse);
+                                sum_norm[batch * nroots + k] += to_fixed(square * inverse * inverse);
+                            }
+                        for (int64_t k = 0; k < 4 * nroots; ++k) q[k] = 0;
+                        seen[batch] = 0;
+                    }
+                }
+            }
+            found[t] = found_here;
+            for (int64_t k = 0; k < nbatches * nroots; ++k) {
+                part[t * nbatches * nroots + k] = sum[k];
+                part_norm[t * nbatches * nroots + k] = sum_norm[k];
+            }
+        }
+        for (int t = 0; t < threads; ++t) {
+            externals += found[t];
+            for (int64_t k = 0; k < nbatches * nroots; ++k) {
+                total[k] += part[t * nbatches * nroots + k];
+                total_norm[k] += part_norm[t * nbatches * nroots + k];
+            }
+        }
+        if (automatic && range == 0) {
+            // The probe's records per key, projected over the other keys,
+            // set the fewest ranges that fit the memory limit.
+            double coded_records = 0.0, whole_records = 0.0;
+            for (int64_t b = 0; b < nb; ++b) {
+                coded_records += static_cast<double>(compact.records(b));
+                whole_records += static_cast<double>(whole.records(b));
+            }
+            const double scale = static_cast<double>(BATCH_KEYS - hi) / std::max<uint32_t>(hi - lo, 1);
+            coded_records *= scale;
+            whole_records *= scale;
+            auto need = [&](double q) {
+                return (coded_records / q) * compact.bytes_per_record() + compact.fixed_bytes(coded_records / q) +
+                       (whole_records / q) * whole.bytes_per_record() + whole.fixed_bytes(whole_records / q);
+            };
+            int64_t parts = 1;
+            while (parts < 4096 && need(static_cast<double>(parts)) > static_cast<double>(c.pt2_memory)) ++parts;
+            for (int64_t q = 0; q < parts; ++q)
+                ranges.emplace_back(hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * q) / parts),
+                                    hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * (q + 1)) / parts));
         }
         pass_s += omp_get_wtime() - t1;
     }
+    for (int64_t k = 0; k < nbatches * nroots; ++k) {
+        values[k] = from_fixed(total[k]);
+        norms[k] = from_fixed(total_norm[k]);
+    }
     if (profile)
-        std::fprintf(stderr, "itercc_sci_pt2_stochastic: %lld batches, %lld distinct samples, %lld terms, %lld externals; "
-                     "generate %.2f s (largest task %.3f s), final pass %.2f s\n", static_cast<long long>(nbatches),
-                     static_cast<long long>(distinct_total), static_cast<long long>(terms),
+        std::fprintf(stderr, "itercc_sci_pt2_stochastic: %lld batches, %lld draws of %lld distinct determinants, %zu "
+                     "passes, %lld terms, %lld externals; generate %.2f s (largest task %.3f s), final pass %.2f s\n",
+                     static_cast<long long>(nbatches), static_cast<long long>(distinct_total),
+                     static_cast<long long>(nunique), ranges.size(), static_cast<long long>(terms),
                      static_cast<long long>(externals), generate_s, largest_task, pass_s);
     for (int64_t r = 0; r < nroots; ++r) {
         double m = 0.0, v = 0.0;

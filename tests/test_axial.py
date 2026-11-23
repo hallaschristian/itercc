@@ -242,6 +242,26 @@ def test_automatic_pt2_batches_equal_one_pass(lih):
         sci.kernels.sci_space_free(space)
 
 
+def test_pt2_record_key_codes_equal_whole_keys(lih, monkeypatch):
+    """PT2 records keyed by their difference from the leading determinant
+    give the same bits as records with whole keys (ITERCC_SCI_KEY_CODES=0),
+    deterministic and semistochastic, over determinants and over orbits."""
+    hc, eric = lih["complex"]
+    model, axial = lih["model"], lih["axial"]
+    sci = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz, orbital_mirror=axial.mirror)
+    options = dict(spin_parity=1, epsilons=(3e-3,), pt2_epsilon=0.0, pt2_deterministic=2e-4, pt2_samples=30,
+                   pt2_sample_batches=20, seed=3)
+    runs = {}
+    for codes in ("1", "0"):
+        monkeypatch.setenv("ITERCC_SCI_KEY_CODES", codes)
+        runs[codes] = [sci.solve(2, mirror_parity=parity, **options).stages[-1] for parity in (None, 1)]
+    for coded, whole in zip(runs["1"], runs["0"]):
+        np.testing.assert_array_equal(coded.pt2, whole.pt2)
+        np.testing.assert_array_equal(coded.pt2_error, whole.pt2_error)
+        np.testing.assert_array_equal(coded.pt2_norm, whole.pt2_norm)
+        assert coded.pt2_externals == whole.pt2_externals
+
+
 def test_selection_closes_the_group_in_the_kernel(lih):
     """Selection from one member per orbit, closed under the swap and the
     reflection by the kernel, finds the space the whole space finds."""

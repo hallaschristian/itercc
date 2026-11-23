@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Semistochastic PT2 on records: each distinct sampled determinant
+  generates its terms once (heaviest first) instead of once per batch that
+  drew it (the leading determinant is drawn in almost every batch; one
+  CuF triple-zeta Pi stage spent 85 s on one such task), and the terms are
+  summed per external and batch from records instead of a shared hash map;
+  the same 128-bit sums, so the same results. PT2 records key an external
+  by its difference from the leading determinant (16 bytes; whole keys
+  beyond 13 differing spin orbitals): 40-byte instead of 72-byte records
+  at 130 orbitals, so about half the passes. `ITERCC_SCI_KEY_CODES=0`
+  keeps whole keys (diagnostic). CuF 18e aug-cc-pVDZ-DK, 0.9M
+  determinants, 10 x 800 samples: 18.8 -> 11.7 s.
+
 - Fixed: the deterministic PT2 of a large space (26 electrons, 130
   orbitals) aborted with std::bad_alloc on 56 threads. Its record arenas
   took 2 MiB blocks from malloc's heaps and marked each for huge pages,
