@@ -232,6 +232,13 @@ struct itercc_sci_context {
     // Reflection y -> -y of axial orbitals: orbital p -> mirror[p] (an
     // involution, with phase +1); empty when not given.
     std::vector<int32_t> mirror;
+    // When every orbital's reflection is itself or a neighbour (axial
+    // orbitals: each +m orbital next to its -m partner), pair_low marks the
+    // lower orbital of each swapped pair (bit p of word p / 64): a
+    // determinant's reflection is then a few word operations and its phase
+    // the parity of its fully occupied pairs (mirror_det).
+    bool mirror_adjacent = false;
+    u64 pair_low[4] = {0, 0, 0, 0};
     // Memory for a deterministic PT2's hash map (bytes; 0 none): with 0
     // batches the PT2 picks the fewest that fit (itercc_sci_set_pt2_memory).
     int64_t pt2_memory = 0;
@@ -473,6 +480,79 @@ void excitations(const Ctx &c, const Det<W> &x, u64 hx, double threshold, Accept
     }
 }
 
+// The heat-bath double lists regrouped for PT2 passes over ranges of the
+// orbit sum (ImageGroup::batch_key): an excitation (p q -> r s) of x lands at
+// sum(x) - tsum[p] - tsum[q] + U, U = tsum[r] + tsum[s] (spins as the
+// excitation's), so within each pair the entries go into G groups by the top
+// GBITS bits of U, each in decreasing magnitude with its largest one. A pass
+// whose range is a fraction w of the sums visits about w G + 2 groups per pair
+// (and skips those below the threshold) instead of every entry above the
+// threshold: the passes no longer rescan all excitations.
+struct GroupedLists {
+    static constexpr int GBITS = 6;
+    static constexpr int G = 1 << GBITS;
+    std::vector<Entry> os, ss[2];
+    std::vector<uint32_t> os_off, ss_off[2];     // per pair: G + 1 offsets from the pair's start
+    std::vector<double> os_max, ss_max[2];       // per pair and group: the largest magnitude (0: empty)
+    bool shared = true;                          // one same-spin grouping for both spins
+
+    static int group_of(u64 u) { return static_cast<int>(u >> (64 - GBITS)); }
+
+    // The groups that [start, start + len) meets, counted from start's: a
+    // window of nearly the whole circle may end in its first group again.
+    static int groups(u64 start, u64 len)
+    {
+        const unsigned __int128 span = static_cast<unsigned __int128>(start & ((u64(1) << (64 - GBITS)) - 1)) + len;
+        return static_cast<int>(std::min<unsigned __int128>(G, ((span - 1) >> (64 - GBITS)) + 1));
+    }
+
+    static void group(const std::vector<int64_t> &start, const std::vector<Entry> &src, const u64 *ta,
+                      const u64 *tb, std::vector<Entry> &dst, std::vector<uint32_t> &off, std::vector<double> &mx,
+                      int threads)
+    {
+        const int64_t npair = static_cast<int64_t>(start.size()) - 1;
+        dst.resize(src.size());
+        off.assign(npair * (G + 1), 0);
+        mx.assign(npair * G, 0.0);
+#pragma omp parallel for schedule(dynamic, 64) num_threads(threads)
+        for (int64_t pair = 0; pair < npair; ++pair) {
+            const int64_t b = start[pair], e = start[pair + 1];
+            if (b == e) continue;
+            uint32_t *o = &off[pair * (G + 1)];
+            for (int64_t k = b; k < e; ++k) ++o[group_of(ta[src[k].r] + tb[src[k].s]) + 1];
+            for (int g = 0; g < G; ++g) o[g + 1] += o[g];
+            uint32_t fill[G];
+            for (int g = 0; g < G; ++g) fill[g] = o[g];
+            for (int64_t k = b; k < e; ++k) {            // in order: each group stays sorted
+                const int g = group_of(ta[src[k].r] + tb[src[k].s]);
+                if (fill[g] == o[g]) mx[pair * G + g] = std::fabs(src[k].v);
+                dst[b + fill[g]++] = src[k];
+            }
+        }
+    }
+
+    GroupedLists(const Ctx &c, const u64 (*tsum)[256], int threads)
+    {
+        group(c.os_start, c.os, tsum[0], tsum[1], os, os_off, os_max, threads);
+        for (int p = 0; p < 256 && shared; ++p) shared = tsum[0][p] == tsum[1][p];
+        for (int spin = 0; spin < (shared ? 1 : 2); ++spin)
+            group(c.ss_start, c.ss, tsum[spin], tsum[spin], ss[spin], ss_off[spin], ss_max[spin], threads);
+    }
+
+    double bytes() const
+    {
+        double b = os.size() * sizeof(Entry) + os_off.size() * 4.0 + os_max.size() * 8.0;
+        for (int spin = 0; spin < 2; ++spin) b += ss[spin].size() * sizeof(Entry) + ss_off[spin].size() * 4.0 + ss_max[spin].size() * 8.0;
+        return b;
+    }
+};
+
+// A pass's range of orbit sums, [lo, lo + len) on the circle of 64-bit sums.
+struct KeyWindow {
+    const GroupedLists *lists;
+    u64 lo, len;
+};
+
 // excitations() with the hashes of each y's images under the group of the
 // alpha-beta swap T and the orbital reflection M (e, T, M, TM; `keys[k]` the
 // Zobrist keys of image k, hx[k] those of x's images): accept(s), s the
@@ -481,7 +561,8 @@ void excitations(const Ctx &c, const Det<W> &x, u64 hx, double threshold, Accept
 // emit(y, value, hy), hy[4]. Every flip of an orbital updates all four.
 template <int W, class Accept, class Emit>
 void excitations_images(const Ctx &c, const Det<W> &x, const u64 *hx, const u64 (*keys)[2][256], u64 sx,
-                        const u64 (*tsum)[256], double threshold, Accept &&accept, Emit &&emit)
+                        const u64 (*tsum)[256], double threshold, Accept &&accept, Emit &&emit,
+                        const KeyWindow *window = nullptr)
 {
     const int64_t n = c.n;
     int oa[MAX_ORB], ob[MAX_ORB];
@@ -497,11 +578,10 @@ void excitations_images(const Ctx &c, const Det<W> &x, const u64 *hx, const u64 
             const u64 sp = sx - tsum[0][p] - tsum[1][q];
             const int64_t pair = p * n + q;
             bool hashed = false;
-            for (int64_t e = c.os_start[pair]; e < c.os_start[pair + 1]; ++e) {
-                const Entry &en = c.os[e];
-                if (std::fabs(en.v) < threshold) break;
-                if (test(x.a(), en.r) || test(x.b(), en.s)) continue;
-                if (!accept(sp + tsum[0][en.r] + tsum[1][en.s])) continue;
+            auto candidate = [&](const Entry &en) {       // false: below the threshold
+                if (std::fabs(en.v) < threshold) return false;
+                if (test(x.a(), en.r) || test(x.b(), en.s)) return true;
+                if (!accept(sp + tsum[0][en.r] + tsum[1][en.s])) return true;
                 if (!hashed) {
                     for (int k = 0; k < 4; ++k) hp[k] = hx[k];
                     flip_hash(hp, 0, p);
@@ -517,7 +597,25 @@ void excitations_images(const Ctx &c, const Det<W> &x, const u64 *hx, const u64 
                 flip(y.b(), q);
                 flip(y.b(), en.s);
                 emit(y, phase<W>(x.a(), p, en.r) * phase<W>(x.b(), q, en.s) * en.v, hy);
-            }
+                return true;
+            };
+            if (window) {
+                const GroupedLists &L = *window->lists;
+                constexpr int G = GroupedLists::G;
+                const u64 start = window->lo - sp;
+                const int g0 = GroupedLists::group_of(start), ng = L.groups(start, window->len);
+                const uint32_t *o = &L.os_off[pair * (G + 1)];
+                const double *mx = &L.os_max[pair * G];
+                const int64_t base = c.os_start[pair];
+                for (int t = 0; t < ng; ++t) {
+                    const int g = (g0 + t) & (G - 1);
+                    if (mx[g] < threshold) continue;
+                    for (int64_t e = base + o[g]; e < base + o[g + 1]; ++e)
+                        if (!candidate(L.os[e])) break;
+                }
+            } else
+                for (int64_t e = c.os_start[pair]; e < c.os_start[pair + 1]; ++e)
+                    if (!candidate(c.os[e])) break;
         }
     for (int spin = 0; spin < 2; ++spin) {
         const int *occ = spin ? ob : oa;
@@ -530,11 +628,10 @@ void excitations_images(const Ctx &c, const Det<W> &x, const u64 *hx, const u64 
                 const u64 sp = sx - ts[p] - ts[q];
                 const int64_t pair = p * n + q;
                 bool hashed = false;
-                for (int64_t e = c.ss_start[pair]; e < c.ss_start[pair + 1]; ++e) {
-                    const Entry &en = c.ss[e];
-                    if (std::fabs(en.v) < threshold) break;
-                    if (test(xs, en.r) || test(xs, en.s)) continue;
-                    if (!accept(sp + ts[en.r] + ts[en.s])) continue;
+                auto candidate = [&](const Entry &en) {   // false: below the threshold
+                    if (std::fabs(en.v) < threshold) return false;
+                    if (test(xs, en.r) || test(xs, en.s)) return true;
+                    if (!accept(sp + ts[en.r] + ts[en.s])) return true;
                     if (!hashed) {
                         for (int k = 0; k < 4; ++k) hp[k] = hx[k];
                         flip_hash(hp, spin, p);
@@ -553,7 +650,26 @@ void excitations_images(const Ctx &c, const Det<W> &x, const u64 *hx, const u64 
                     flip(ys, q);
                     flip(ys, en.s);
                     emit(y, sign * en.v, hy);
-                }
+                    return true;
+                };
+                if (window) {
+                    const GroupedLists &L = *window->lists;
+                    constexpr int G = GroupedLists::G;
+                    const int list = L.shared ? 0 : spin;
+                    const u64 start = window->lo - sp;
+                    const int g0 = GroupedLists::group_of(start), ng = L.groups(start, window->len);
+                    const uint32_t *o = &L.ss_off[list][pair * (G + 1)];
+                    const double *mx = &L.ss_max[list][pair * G];
+                    const int64_t base = c.ss_start[pair];
+                    for (int t = 0; t < ng; ++t) {
+                        const int g = (g0 + t) & (G - 1);
+                        if (mx[g] < threshold) continue;
+                        for (int64_t e = base + o[g]; e < base + o[g + 1]; ++e)
+                            if (!candidate(L.ss[list][e])) break;
+                    }
+                } else
+                    for (int64_t e = c.ss_start[pair]; e < c.ss_start[pair + 1]; ++e)
+                        if (!candidate(c.ss[e])) break;
             }
     }
     for (int spin = 0; spin < 2; ++spin) {
@@ -1566,6 +1682,27 @@ template <int W> void partners_impl(Space<W> &sp, int64_t *out, int threads);
 // permutation that orders each string's reflected creators again.
 template <int W> inline double mirror_det(const Ctx &c, const Det<W> &x, Det<W> &out)
 {
+    if (c.mirror_adjacent) {
+        // Swap the bits of each pair (lower bit p, upper p + 1, possibly in
+        // the next word); the only inversions are the fully occupied pairs.
+        int full = 0;
+        for (int spin = 0; spin < 2; ++spin) {
+            const u64 *xs = x.w + spin * W;
+            u64 *ys = out.w + spin * W;
+            for (int k = 0; k < W; ++k) {
+                const u64 low = c.pair_low[k];
+                const u64 high = (low << 1) | (k ? c.pair_low[k - 1] >> 63 : 0);   // upper partners in word k
+                const u64 up = xs[k] & low;                    // lower members occupied -> move up
+                const u64 down = xs[k] & high;                 // upper members occupied -> move down
+                ys[k] = (xs[k] & ~(low | high)) | (up << 1) | (down >> 1);
+                if (k) ys[k] |= (xs[k - 1] & c.pair_low[k - 1]) >> 63;           // from bit 63 below
+                if (k + 1 < W) ys[k] |= ((xs[k + 1] & ((c.pair_low[k] >> 63) & 1)) << 63);  // from bit 0 above
+                full += popc(up & (down >> 1));
+                if (k + 1 < W && (c.pair_low[k] >> 63) & 1) full += static_cast<int>((xs[k] >> 63) & xs[k + 1] & 1);
+            }
+        }
+        return full & 1 ? -1.0 : 1.0;
+    }
     int inversions = 0;
     for (int spin = 0; spin < 2; ++spin) {
         const u64 *xs = x.w + spin * W;
@@ -2141,6 +2278,24 @@ struct ImageGroup {
         return m;
     }
 
+    // Number of distinct images of y: the group's order over that of y's
+    // stabilizer (word comparisons; distinct() counts hashes instead).
+    template <int W> int images_of(const Ctx &c, const Det<W> &y) const
+    {
+        Det<W> m;
+        bool reflected = false;
+        int stabilizer = 1;
+        for (int t = 1; t < count; ++t) {
+            const int g = elements[t];
+            if ((g & 2) && !reflected) {
+                mirror_det<W>(c, y, m);
+                reflected = true;
+            }
+            stabilizer += same<W>(g == 1 ? swapped<W>(y) : g == 2 ? m : swapped<W>(m), y);
+        }
+        return count / stabilizer;
+    }
+
     // Number of distinct images (hashes) among the group's elements.
     int distinct(const u64 *h) const
     {
@@ -2489,6 +2644,12 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
     const char *codes_switch = std::getenv("ITERCC_SCI_KEY_CODES");     // "0": whole keys (diagnostic)
     const bool use_codes = !(codes_switch && codes_switch[0] == '0');
     RecordBuckets<W> compact(2, static_cast<int>(nroots), threads), whole(2 * W, static_cast<int>(nroots), threads);
+    // With several passes over orbits, the double lists grouped by orbit sum
+    // (each pass then scans only the groups that reach its range).
+    std::unique_ptr<GroupedLists> grouped;
+    if (paired && (batches > 1 || (batches == 0 && c.pt2_memory > 0)))
+        grouped.reset(new GroupedLists(c, group->tsum, threads));
+    const double grouped_bytes = grouped ? grouped->bytes() : 0.0;
     // Batches are ranges of the externals' 23-bit keys: `batches` equal ones,
     // or (batches 0, with a memory limit) a probe of 1/256 of the keys whose
     // contributions set the fewest ranges that fit the limit for the rest
@@ -2542,6 +2703,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                         const uint32_t k = ImageGroup::batch_key(sum);
                         return every || (k >= lo && k < hi);
                     };
+                    const KeyWindow window{grouped.get(), static_cast<u64>(lo) << 41, static_cast<u64>(hi - lo) << 41};
                     excitations_images<W>(c, sp.dets[i], hx, G.key, G.orbit_sum<W>(sp.dets[i]), G.tsum,
                                           eps / cmax[i], in_batch, [&](const Det<W> &y, double v, const u64 *hy) {
                         int which;
@@ -2554,7 +2716,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                         for (int64_t k = 0; k < nroots; ++k) add[k] = to_numerator(f * v * coeffs[k * count + i]);
                         if (!no_map) store(image_of<W>(y, m, which), hmin, add);
                         ++batch_contributions;
-                    });
+                    }, every || !grouped ? nullptr : &window);
                     continue;
                 }
                 auto in_batch = [&](u64 h) {
@@ -2652,11 +2814,7 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                         std::memcpy(y.w, e, sizeof(y.w));
                     if (sp.index.find(y, e[kw]) >= 0) continue;       // in the space: not external
                     int images = 1;                                    // the orbit's members it stands for
-                    if (paired) {
-                        u64 hy[4];
-                        group->hashes<W>(y, hy);
-                        images = group->distinct(hy);
-                    }
+                    if (paired) images = group->images_of<W>(c, y);
                     found_here += images;
                     const double hyy = near(y);
                     const int64_t *vals = reinterpret_cast<const int64_t *>(e + kw + 1);
@@ -2700,8 +2858,10 @@ void pt2_impl(Space<W> &sp, const double *coeffs, int64_t nroots, const double *
                 return (coded_records / q) * compact.bytes_per_record() + compact.fixed_bytes(coded_records / q) +
                        (whole_records / q) * whole.bytes_per_record() + whole.fixed_bytes(whole_records / q);
             };
+            const double room = std::max(static_cast<double>(c.pt2_memory) - grouped_bytes,
+                                         0.25 * static_cast<double>(c.pt2_memory));
             int64_t parts = 1;
-            while (parts < 4096 && need(static_cast<double>(parts)) > static_cast<double>(c.pt2_memory)) ++parts;
+            while (parts < 4096 && need(static_cast<double>(parts)) > room) ++parts;
             for (int64_t b = 0; b < parts; ++b)
                 ranges.emplace_back(hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * b) / parts),
                                     hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * (b + 1)) / parts));
@@ -2813,6 +2973,9 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
     const char *codes_switch = std::getenv("ITERCC_SCI_KEY_CODES");     // "0": whole keys (diagnostic)
     const bool use_codes = !(codes_switch && codes_switch[0] == '0');
     RecordBuckets<W> compact(2, 3, threads), whole(2 * W, 3, threads);
+    std::unique_ptr<GroupedLists> grouped;       // several passes over orbits: lists grouped by orbit sum
+    if (paired && c.pt2_memory > 0) grouped.reset(new GroupedLists(c, group->tsum, threads));
+    const double grouped_bytes = grouped ? grouped->bytes() : 0.0;
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
     const bool automatic = c.pt2_memory > 0;
     ranges.emplace_back(0u, automatic ? BATCH_KEYS / 256 : BATCH_KEYS);
@@ -2871,6 +3034,7 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
                         const uint32_t k = ImageGroup::batch_key(sum);
                         return every || (k >= lo && k < hi);
                     };
+                    const KeyWindow window{grouped.get(), static_cast<u64>(lo) << 41, static_cast<u64>(hi - lo) << 41};
                     excitations_images<W>(c, x, hx, G.key, G.orbit_sum<W>(x), G.tsum, threshold, in_range,
                                           [&](const Det<W> &y, double v, const u64 *hy) {
                         int which;
@@ -2896,7 +3060,7 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
                         kept_sum *= weight;
                         if (sum == 0.0 && kept_sum == 0.0) return;
                         put(image_of<W>(y, m, which), hmin, sum, kept_sum);
-                    });
+                    }, every || !grouped ? nullptr : &window);
                 } else {
                     auto in_range = [&](u64 h) {
                         const uint32_t k = batch_key(h);
@@ -3017,11 +3181,7 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
                     double weight = 1.0;                                      // the orbit's members it stands for
                     double hyy = 0.0;
                     if (!internal) {
-                        if (paired) {
-                            u64 hy[4];
-                            group->hashes<W>(y, hy);
-                            weight = group->distinct(hy);
-                        }
+                        if (paired) weight = group->images_of<W>(c, y);
                         hyy = near(y);
                     }
                     for (const int64_t batch : touched) {
@@ -3068,8 +3228,10 @@ void pt2_stochastic_impl(Space<W> &sp, const double *coeffs, int64_t nroots, con
                 return (coded_records / q) * compact.bytes_per_record() + compact.fixed_bytes(coded_records / q) +
                        (whole_records / q) * whole.bytes_per_record() + whole.fixed_bytes(whole_records / q);
             };
+            const double room = std::max(static_cast<double>(c.pt2_memory) - grouped_bytes,
+                                         0.25 * static_cast<double>(c.pt2_memory));
             int64_t parts = 1;
-            while (parts < 4096 && need(static_cast<double>(parts)) > static_cast<double>(c.pt2_memory)) ++parts;
+            while (parts < 4096 && need(static_cast<double>(parts)) > room) ++parts;
             for (int64_t q = 0; q < parts; ++q)
                 ranges.emplace_back(hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * q) / parts),
                                     hi + static_cast<uint32_t>((static_cast<u64>(BATCH_KEYS - hi) * (q + 1)) / parts));
@@ -3480,6 +3642,13 @@ int itercc_sci_set_mirror(void *ctx, const int64_t *mirror)
     for (int64_t p = 0; p < n; ++p)
         if (mirror[p] < 0 || mirror[p] >= n || mirror[mirror[p]] != p) return -1;
     c->mirror.assign(mirror, mirror + n);
+    c->mirror_adjacent = true;
+    for (int w = 0; w < 4; ++w) c->pair_low[w] = 0;
+    for (int64_t p = 0; p < n; ++p) {
+        const int64_t q = mirror[p];
+        if (q != p && q != p + 1 && q != p - 1) c->mirror_adjacent = false;
+        if (q == p + 1) c->pair_low[p >> 6] |= u64(1) << (p & 63);
+    }
     return 0;
 }
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- PT2 passes no longer rescan every excitation: over symmetry orbits, each
+  pair's heat-bath double list is regrouped (per PT2) into 64 groups by the
+  top bits of its entries' orbit-sum keys, each in decreasing magnitude, so a
+  pass over a range of externals visits only the groups that reach it (an
+  extra pass costs about a tenth of a scan; a 26-electron triple-zeta stage
+  used 24 passes). Reflections of axial determinants whose mirror pairs are
+  neighbouring orbitals are a few word operations, their phase the parity
+  of fully occupied pairs (the general inversion count was a third of PT2
+  generation); an external's number of distinct images is the group order
+  over its stabilizer's (word comparisons instead of four image hashes).
+  CuF 18e aug-cc-pVDZ-DK, 0.9M determinants, PT2 to 1e-6: 20.4 -> 18.1 s;
+  semistochastic 11.9 -> 10.4 s.
+
 - Semistochastic PT2 on records: each distinct sampled determinant
   generates its terms once (heaviest first) instead of once per batch that
   drew it (the leading determinant is drawn in almost every batch; one

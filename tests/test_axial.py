@@ -233,7 +233,9 @@ def test_automatic_pt2_batches_equal_one_pass(lih):
             return pt2, norm, stats
         for group in (None, (1.0, 0.0), (1.0, 1.0)):
             one = run(1, 0, group)
-            for batches, memory in ((0, 2 << 20), (0, 0), (5, 0)):       # 2 MiB forces many passes
+            # 2 MiB: many passes; 8 GiB: the probe and one pass over 255/256
+            # of the keys (a window that wraps almost the whole circle).
+            for batches, memory in ((0, 2 << 20), (0, 8 << 30), (0, 0), (2, 0), (5, 0)):
                 other = run(batches, memory, group)
                 np.testing.assert_array_equal(other[0], one[0])
                 np.testing.assert_array_equal(other[1], one[1])
