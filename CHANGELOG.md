@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `RestrictedCC.solve` takes `diis_triples="auto"` by default: T3 starts
+  with plain Jacobi steps (no triples history) and joins DIIS, with a
+  RuntimeWarning, once its residual has risen three iterations running to
+  three times its lowest value. CuF CCSDT (aug-cc-pVDZ-DK, 26 electrons)
+  has a stiff triples mode that each Jacobi step amplified 1.65x from
+  iteration 12, ending in a nonfinite iterate after about 60 iterations; in
+  DIIS it converges. `False` keeps the old behaviour, `True` extrapolates
+  T3 from the start.
+
 - PT2 passes no longer rescan every excitation: over symmetry orbits, each
   pair's heat-bath double list is regrouped (per PT2) into 64 groups by the
   top bits of its entries' orbit-sum keys, each in decreasing magnitude, so a

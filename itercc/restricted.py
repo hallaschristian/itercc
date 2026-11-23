@@ -933,13 +933,18 @@ class RestrictedCC:
 
     @_runtime.threaded
     def solve(self, *, initial=None, energy_tol=1e-11, residual_tol=1e-9,
-              max_iter=100, diis_size=6, diis_triples=False, level_shift=0.0,
+              max_iter=100, diis_size=6, diis_triples="auto", level_shift=0.0,
               damping=0.0, callback=None, checkpoint_callback=None):
         """Iterate all amplitudes, with a raw spatial residual test at every rank.
 
         DIIS extrapolates T1/T2 by default to bound the T3 history. T3 is
         updated on every step. Use diis_triples=True to extrapolate all three
         ranks. This keeps one full amplitude and step per DIIS history slot.
+        With "auto" (the default) T3 starts outside DIIS and joins it, with a
+        RuntimeWarning, once its residual rises three iterations running to
+        three times its lowest value: a stiff triples mode that plain Jacobi
+        steps amplify (CuF aug-cc-pVDZ-DK: x1.65 per step) converges in DIIS.
+        False never extrapolates T3.
         callback receives each Iteration record after evaluating its residual.
         checkpoint_callback receives the one-based evaluation index, record,
         and current amplitudes before the update. Treat the arrays as read-only
@@ -948,6 +953,10 @@ class RestrictedCC:
         if not (np.isfinite(energy_tol) and energy_tol > 0
                 and np.isfinite(residual_tol) and residual_tol > 0):
             raise ValueError("Expected positive finite convergence thresholds")
+        auto_triples = isinstance(diis_triples, str) and diis_triples == "auto"
+        if not auto_triples and not isinstance(diis_triples, (bool, np.bool_)):
+            raise ValueError('diis_triples must be True, False or "auto"')
+        diis_triples = bool(diis_triples) if not auto_triples else False
         if (not isinstance(max_iter, Integral) or max_iter < 1
                 or not isinstance(diis_size, Integral) or diis_size < 0
                 or not 0 <= damping < 1 or not np.isfinite(level_shift) or level_shift < 0):
@@ -982,6 +991,9 @@ class RestrictedCC:
             diis = _BlockDIIS(diis_size, compiled is not None, self._cpu_threads)
         d3o_array = np.array(d3o, dtype=np.float64)
         d3v = np.ascontiguousarray(d3v)
+        # "auto": watch the T3 residual while T3 takes plain Jacobi steps (host steps only).
+        auto_triples = auto_triples and jacobi is None and len(self.triples_indices) > 0 and diis_size >= 2
+        rising, lowest, previous = 0, np.inf, np.inf
         history = []
         last, converged = np.inf, False
         # One dressing array, and for CCSDT heap blocks, serve every iteration
@@ -1023,6 +1035,22 @@ class RestrictedCC:
                     if energy_ready and max(maxima) <= residual_tol:
                         converged = True
                         break
+                    if auto_triples and not diis_triples:
+                        rising = rising + 1 if maxima[2] > previous else 0
+                        previous, lowest = maxima[2], min(lowest, maxima[2])
+                        if rising >= 3 and maxima[2] > 3 * lowest:
+                            warnings.warn(
+                                f"Triples residual rose {rising} iterations running to {maxima[2]:.2e} "
+                                f"(lowest {lowest:.2e}) under plain Jacobi steps; extrapolating T3 in DIIS "
+                                f"from iteration {iteration + 1} (diis_triples=True from the start avoids "
+                                "the detour; False keeps T3 out)", RuntimeWarning, stacklevel=3)
+                            # T1/T2 history is restarted with T3 alongside it.
+                            if self._diis_columns is not None:
+                                diis = _SymmetricBlockDIIS(diis_size, self._diis_columns, compiled is not None,
+                                                           self._cpu_threads)
+                            else:
+                                diis = _BlockDIIS(diis_size, compiled is not None, self._cpu_threads)
+                            diis_triples = True
                     if can_update:
                         if not device_gate:
                             r1, r2, r3 = residuals

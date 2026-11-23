@@ -169,3 +169,26 @@ def test_block_diis_agrees_with_flat_diis():
         for got, wanted in zip(actual, expected):
             np.testing.assert_allclose(got, wanted, atol=2e-14, rtol=0)
 
+
+class _OvershootingTriples(RestrictedCC):
+    """Triples residual scaled by 3: the same solution, but a plain Jacobi T3 step overshoots by
+    a factor -2 (a stand-in for a stiff triples mode)."""
+
+    def _residuals(self, amplitudes, *args, **kwargs):
+        r1, r2, r3 = super()._residuals(amplitudes, *args, **kwargs)
+        return r1, r2, 3.0 * r3
+
+
+def test_auto_triples_diis_rescues_a_diverging_triples_mode():
+    model = make_model(3, 3)
+    criteria = dict(energy_tol=1e-12, residual_tol=1e-10, max_iter=200)
+    expected = RestrictedCC(*model).solve(**criteria)
+    assert expected.converged
+    with pytest.raises(FloatingPointError), np.errstate(over="ignore", invalid="ignore"):
+        _OvershootingTriples(*model).solve(diis_triples=False, **criteria)
+    with pytest.warns(RuntimeWarning, match="extrapolating T3 in DIIS"):
+        result = _OvershootingTriples(*model).solve(**criteria)
+    assert result.converged
+    assert result.energy == pytest.approx(expected.energy, abs=1e-10, rel=0)
+    with pytest.raises(ValueError):
+        RestrictedCC(*model).solve(diis_triples="yes", **criteria)
