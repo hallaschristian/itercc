@@ -408,9 +408,14 @@ extrapolate_gap(ground, excited)      # the excitation energy, extrapolated
   `-1` odd (triplets): spaces contain each determinant's alpha-beta swap.
   `references` fix the irrep (default the aufbau determinant); `s2` checks
   the spin of each root.
-- PT2 holds one hash-map entry per external determinant (about 80-100
-  bytes for two roots and up to 128 orbitals: the entry and two or three
-  8-byte slots; about 200 in the semistochastic part); `pt2_batches=k` makes k passes over 1/k of them.
+- Deterministic PT2 keeps one record per contribution H_ai c_i (about 56
+  bytes for two roots and up to 128 orbitals), written sequentially into
+  per-thread buckets and summed per external in cache-sized tables (about
+  200 bytes per external in the semistochastic part). Every pass scans all
+  excitations again, so fewer passes are faster: `pt2_batches="auto"` (the
+  default) probes 1/32 of the externals and takes the fewest passes whose
+  records fit the memory budget; `pt2_batches=k` makes k passes over 1/k of
+  them. The result is the same to the last bit for any number of passes.
   The Hamiltonian keeps its upper triangle (about 5.5 bytes per nonzero in
   single precision, 9.5 in double: values plus compressed column gaps; plus
   about 33 doubles per determinant and product vector).

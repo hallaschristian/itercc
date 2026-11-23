@@ -209,6 +209,67 @@ def test_reflection_pt2_matches_and_samples_without_bias(lih):
     assert np.all(np.abs(runs[0].pt2 - stage.pt2) < 3 * runs[0].pt2_error + 1e-12)
 
 
+def test_automatic_pt2_batches_equal_one_pass(lih):
+    """With 0 batches and a memory limit the PT2 probes 1/32 of the
+    externals and takes the fewest passes that fit; the fixed-point sums are
+    the same bits as one pass, over determinants and over orbits."""
+    hc, eric = lih["complex"]
+    model, axial = lih["model"], lih["axial"]
+    sci = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz, orbital_mirror=axial.mirror)
+    exact = sci.solve(2, spin_parity=1, mirror_parity=1, epsilons=(1e-3,))
+    vectors = np.ascontiguousarray(exact.vectors)
+    electronic = np.ascontiguousarray(exact.energies - sci.constant)
+    space = sci._space(exact.determinants)
+    try:
+        def run(batches, memory, group):
+            sci.kernels.sci_set_pt2_memory(sci._ctx, memory)
+            pt2, norm, stats = np.zeros(2), np.zeros(2), np.zeros(2, dtype=np.int64)
+            if group is None:
+                sci.kernels.sci_pt2(space, vectors.ctypes.data, 2, electronic.ctypes.data, 0.0, batches,
+                                    pt2.ctypes.data, norm.ctypes.data, stats.ctypes.data, 3)
+            else:
+                sci.kernels.sci_pt2_orbits(space, vectors.ctypes.data, 2, electronic.ctypes.data, 0.0, batches,
+                                           *group, pt2.ctypes.data, norm.ctypes.data, stats.ctypes.data, 3)
+            return pt2, norm, stats
+        for group in (None, (1.0, 0.0), (1.0, 1.0)):
+            one = run(1, 0, group)
+            for batches, memory in ((0, 2 << 20), (0, 0), (5, 0)):       # 2 MiB forces many passes
+                other = run(batches, memory, group)
+                np.testing.assert_array_equal(other[0], one[0])
+                np.testing.assert_array_equal(other[1], one[1])
+                assert other[2][0] == one[2][0]
+    finally:
+        sci.kernels.sci_space_free(space)
+
+
+def test_selection_closes_the_group_in_the_kernel(lih):
+    """Selection from one member per orbit, closed under the swap and the
+    reflection by the kernel, finds the space the whole space finds."""
+    hc, eric = lih["complex"]
+    model, axial = lih["model"], lih["axial"]
+    sci = SelectedCI(hc, eric, 4, model.constant, orbital_lz=axial.lz, orbital_mirror=axial.mirror)
+    ground = sci.solve(2, spin_parity=1, mirror_parity=1, epsilons=(3e-3,))
+    dets = ground.determinants
+    cmax = np.ascontiguousarray(np.max(np.abs(ground.vectors), axis=0))
+    space = sci._space(dets)
+    try:
+        def select(c, flags):
+            c = np.ascontiguousarray(c)
+            return sci._take(sci.kernels.sci_select(space, c.ctypes.data, 3e-4, flags, 3))
+        reference = sci._close(select(cmax, 1), True)
+        reps = sci._representatives(space, len(dets), (1, 1))
+        assert 0 < reps.sum() < len(dets)
+        closed = select(np.where(reps, cmax, 0.0), 3)
+    finally:
+        sci.kernels.sci_space_free(space)
+    def as_set(rows):
+        return {bytes(r) for r in np.ascontiguousarray(rows)}
+    assert len(closed) == len(reference) > 0
+    assert as_set(closed) == as_set(reference)
+    np.testing.assert_array_equal(sci._unique(closed), closed)            # sorted and distinct
+    assert as_set(sci._close(closed, True)) == as_set(closed)               # closed under the reflection
+
+
 def test_natural_virtuals_keep_axial_pairs(lih):
     """Frozen natural virtuals of a selected-CI density in axial orbitals:
     pairs kept together, labels and reflection consistent; keeping every

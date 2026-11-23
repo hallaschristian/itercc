@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define ITERCC_CORE_ABI 47
+#define ITERCC_CORE_ABI 48
 
 /* Each row gathers through a signed one-based int32 map. bases encode a
  * signed one-based source base, zero means an entirely zero row. maps are
@@ -952,18 +952,25 @@ int64_t itercc_sci_ham_bytes(const void *ham);
 /* The full symmetric matrix of a (small) Hamiltonian handle, n x n row-major. */
 void itercc_sci_ham_dense(const void *ham, double *out);
 /* Determinants outside the space with |H_ai| cmax_i >= eps for some i of
- * the space (sorted, unique); with partners, also their alpha-beta swaps. */
-void *itercc_sci_select(void *space, const double *cmax, double eps, int partners, int threads);
+ * the space (sorted, unique); flags bit 0: also their alpha-beta swaps, bit
+ * 1: also their reflections (itercc_sci_set_mirror) and, with bit 0, those's
+ * swaps, so the output is closed under the group. */
+void *itercc_sci_select(void *space, const double *cmax, double eps, int flags, int threads);
 int64_t itercc_sci_buffer_rows(const void *buffer);
 void itercc_sci_buffer_copy(const void *buffer, uint64_t *out);
 void itercc_sci_buffer_free(void *buffer);
 /* Epstein-Nesbet second-order energies of nroots (<= 16) states (coeffs:
  * nroots x count, energies: variational, without the constant) over the
  * determinants outside the space reached with |H_ai c_i| >= eps, in
- * `batches` passes over hash-partitioned external determinants; stats (may
+ * `batches` passes over hash-partitioned external determinants (0: the
+ * fewest whose records fit itercc_sci_set_pt2_memory's limit, sized by a
+ * probe pass over 1/32 of them; one pass without a limit); stats (may
  * be NULL, two entries): external determinants, the largest batch; norm
  * (may be NULL) gets the first-order norm sum_a (num_a / (E - H_aa))^2 of
  * each state, for the renormalized correction E2 / (1 + norm). */
+/* Memory (bytes) a deterministic PT2 of this context may give its hash maps
+ * when called with 0 batches. */
+void itercc_sci_set_pt2_memory(void *ctx, int64_t bytes);
 void itercc_sci_pt2(void *space, const double *coeffs, int64_t nroots, const double *energies, double eps,
                     int64_t batches, double *out, double *norm, int64_t *stats, int threads);
 /* The same with the terms H_ai c_i kept by |H_ai| screen_i >= eps for a

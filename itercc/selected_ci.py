@@ -147,8 +147,10 @@ class _Pairs:
         self.member_orbit = orbit[self.index]
         self.member_coef = coef[self.index]
         self.norm = np.sqrt(np.bincount(self.member_orbit, self.member_coef ** 2, minlength=count))
-        _, first = np.unique(self.member_orbit, return_index=True)
-        self.reps = self.index[first]
+        # Orbits are numbered in the order of their lowest members: those are
+        # the determinants whose orbit exceeds every orbit before them.
+        self.reps = np.flatnonzero(orbit > np.concatenate([[-1], np.maximum.accumulate(orbit)[:-1]]))
+        self.space = space
 
     def to_pairs(self, vectors):
         """(k, size) determinant vectors -> (k, orbits): their projections."""
@@ -449,6 +451,21 @@ class SelectedCI:
             budget = None if limit is None else MEMORY_FRACTION * limit / 2**30
         return _MemoryPlan(None if budget is None or not np.isfinite(budget) else float(budget) * 2**30)
 
+    def _pt2_batches(self, batches, size=0, per_determinant=0):
+        """The PT2 kernels' batch argument: `batches` passes, or for "auto"
+        0 with the context's PT2 memory set to the budget left beside a space
+        of `size` determinants (`per_determinant` bytes each): the kernel then
+        probes 1/32 of the externals and takes the fewest passes that fit
+        (each pass scans every excitation again). Without a budget, one pass."""
+        if batches != "auto":
+            if int(batches) < 1:
+                raise ValueError('pt2_batches must be "auto" or positive')
+            return int(batches)
+        budget = self._memory_plan().budget
+        free = 0 if budget is None else max(budget - per_determinant * size, budget / 8)
+        self.kernels.sci_set_pt2_memory(self._ctx, int(free))
+        return 0
+
     def _release(self, handle):
         """Free a compiled matrix and return the free heap to the kernel."""
         self.kernels.sci_ham_free(handle)
@@ -555,14 +572,17 @@ class SelectedCI:
             self.kernels.sci_space_free(space)
 
     def _unique(self, rows):
+        """Distinct rows in the order of their first occurrence. (Rows as
+        opaque byte strings: NumPy sorts those with memcmp, many times faster
+        than a structured view's field-wise comparisons.)"""
         rows = np.ascontiguousarray(rows, dtype=np.uint64).reshape(-1, 2 * self.words)
-        view = rows.view([("w", np.uint64, (2 * self.words,))]).ravel()
+        view = rows.view(np.dtype((np.void, rows.itemsize * rows.shape[1]))).ravel()
         _, first = np.unique(view, return_index=True)
         return rows[np.sort(first)]
 
     @_runtime.threaded
     def solve(self, nroots=1, *, references=None, spin_parity=None, epsilons=(1e-3, 3e-4, 1e-4, 5e-5),
-              pt2_epsilon=None, pt2_batches=1, pt2_deterministic=None, pt2_samples=200, pt2_sample_batches=20,
+              pt2_epsilon=None, pt2_batches="auto", pt2_deterministic=None, pt2_samples=200, pt2_sample_batches=20,
               seed=0, residual_tol=1e-5, max_space=None, max_cycles=12, new_fraction=0.01,
               max_determinants=None, callback=None, checkpoint=None, initial=None, mirror_parity=None):
         """Roots `0..nroots-1` of the selected space for each epsilon in
@@ -570,7 +590,8 @@ class SelectedCI:
         default the aufbau determinant) fix the irrep; `spin_parity` +1/-1
         selects even/odd total spin (needs nalpha == nbeta). With
         `pt2_epsilon`, each stage gets Epstein-Nesbet corrections in
-        `pt2_batches` passes (more passes, less memory). With
+        `pt2_batches` passes (more passes, less memory; "auto": the fewest
+        whose hash maps fit the memory budget). With
         `pt2_deterministic` (> pt2_epsilon) the correction is semistochastic:
         exact above `pt2_deterministic`, plus E2[pt2_epsilon] -
         E2[pt2_deterministic] estimated from `pt2_sample_batches` batches of
@@ -643,10 +664,10 @@ class SelectedCI:
                 if self._functions(space, len(dets), spin_parity, mirror_parity) >= 4 * nroots + 4:
                     break
                 ones = np.ones(len(dets))          # held while the kernel reads it
-                buffer = self.kernels.sci_select(space, ones.ctypes.data, 1e-2, int(partners), threads)
+                buffer = self.kernels.sci_select(space, ones.ctypes.data, 1e-2, int(partners) | 2 * mirror, threads)
             finally:
                 self.kernels.sci_space_free(space)
-            new = self._close(self._take(buffer), mirror)
+            new = self._take(buffer)           # closed under the swap and the reflection
             if len(new) == 0:
                 break
             dets = np.concatenate([dets, new])
@@ -658,12 +679,35 @@ class SelectedCI:
                                 pt2_deterministic, pt2_samples, pt2_sample_batches, seed, residual_tol, max_space,
                                 max_cycles, new_fraction, max_determinants, callback, checkpoint, mirror_parity)
         finally:
+            self._last_pairs = None
             if self._kept is not None:
                 self.kernels.sci_ham_free(self._kept)
                 self._kept = None
 
     _kept = None
     _kept_n = 0
+    _last_pairs = None
+
+    def _representatives(self, space, size, group):
+        """Mask of each orbit's lowest-index member under `group` = (spin
+        parity, reflection parity). |<gy|H|gi> c_gi| = |<y|H|i> c_i|, so the
+        determinants selected from these members alone, closed under the group
+        (the selection's swap partners, then `_close`), are those selected
+        from the whole space, for a quarter (Sigma) or half the generation."""
+        last = self._last_pairs
+        if (last is not None and last.space == space and last.size == size
+                and (last.sign, last.mirror_sign) == (float(group[0]), float(group[1]))):
+            reps = last.reps
+        else:
+            orbit, coef = np.empty(size, dtype=np.int64), np.empty(size)
+            if int(self.kernels.sci_orbits(space, float(group[0]), float(group[1]), orbit.ctypes.data,
+                                           coef.ctypes.data, self._threads())) < 0:
+                return np.ones(size, dtype=bool)
+            # Orbits are numbered in the order of their lowest members.
+            reps = np.flatnonzero(orbit > np.concatenate([[-1], np.maximum.accumulate(orbit)[:-1]]))
+        mask = np.zeros(size, dtype=bool)
+        mask[reps] = True
+        return mask
 
     def _functions(self, space, size, spin_parity, mirror_parity):
         """The number of basis functions of a space for the given parities
@@ -747,8 +791,12 @@ class SelectedCI:
                         seconds["davidson"] += time.perf_counter() - start
                     start = time.perf_counter()
                     cmax = np.ascontiguousarray(np.max(np.abs(vectors), axis=0))
-                    buffer = self.kernels.sci_select(space, cmax.ctypes.data, float(eps), int(partners), threads)
-                    new = self._close(self._take(buffer), mirror)
+                    if group is not None:       # one member per orbit: the closure adds the rest
+                        cmax[~self._representatives(space, len(dets), group)] = 0.0
+                    self._last_pairs = None     # (its arrays are not needed past the selection)
+                    buffer = self.kernels.sci_select(space, cmax.ctypes.data, float(eps), int(partners) | 2 * mirror,
+                                                     threads)
+                    new = self._take(buffer)    # closed under the swap and the reflection
                     seconds["select"] += time.perf_counter() - start
                     kept = held + 8 * 34 * nroots * len(dets) if self._kept is not None else 0
                     fits, extends = plan.check(len(dets) + len(new), per_determinant, kept)
@@ -779,13 +827,14 @@ class SelectedCI:
                             stats = np.zeros(2, dtype=np.int64)
                             electronic = np.ascontiguousarray(energies - self.constant)
                             exact_eps = pt2_epsilon if pt2_deterministic is None else pt2_deterministic
+                            passes = self._pt2_batches(pt2_batches, len(dets), per_determinant)
                             if group is None:
                                 self.kernels.sci_pt2(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
-                                                     float(exact_eps), int(pt2_batches), pt2.ctypes.data,
+                                                     float(exact_eps), passes, pt2.ctypes.data,
                                                      pt2_norm.ctypes.data, stats.ctypes.data, threads)
                             else:       # each orbit of externals once
                                 self.kernels.sci_pt2_orbits(space, vectors.ctypes.data, nroots, electronic.ctypes.data,
-                                                            float(exact_eps), int(pt2_batches), float(group[0]),
+                                                            float(exact_eps), passes, float(group[0]),
                                                             float(group[1]), pt2.ctypes.data, pt2_norm.ctypes.data,
                                                             stats.ctypes.data, threads)
                             externals = int(stats[0])
@@ -882,6 +931,7 @@ class SelectedCI:
         expanded."""
         if pairs is not None and pairs is not False:
             basis = _Pairs(self, space, size, *pairs)
+            self._last_pairs = basis            # the cycle's selection reuses its orbits
             if previous is not None:
                 previous = basis.to_pairs(previous)
             if fill_from is not None:
@@ -1168,8 +1218,8 @@ class SelectedCI:
                     if xs:
                         cmax = np.ascontiguousarray(np.max(xs, axis=0))
                         buffer = self.kernels.sci_select(response._space, cmax.ctypes.data, float(stage.epsilon),
-                                                         int(partners), threads)
-                        fresh.append(self._close(self._take(buffer), mirror))
+                                                         int(partners) | 2 * mirror, threads)
+                        fresh.append(self._take(buffer))
                     fresh = [f for f in fresh if len(f)]
                     new = self._difference(response._space, np.concatenate(fresh)) if fresh else union[:0]
                     fits, extends = plan.check(len(union) + len(new), per_determinant, response.hamiltonian_bytes)
@@ -1188,7 +1238,7 @@ class SelectedCI:
         return results
 
     def field_solver_factory(self, determinants, *, spin_parity=1, residual_tol=1e-9, pt2_epsilon=None,
-                             pt2_batches=1, renormalized=False, pt2_screen=None):
+                             pt2_batches="auto", renormalized=False, pt2_screen=None):
         """`solver_factory(h, orbital_irreps)` for `finite_field_polarizability`:
         each field point diagonalizes its Hamiltonian in the fixed space
         `determinants` (for example a `polarizability` result's `.space`), so the field
@@ -1197,7 +1247,7 @@ class SelectedCI:
         the same space, up to the field extrapolation). With `pt2_epsilon`
         each energy adds the deterministic Epstein-Nesbet correction of its
         field's state (renormalized with `renormalized`), in `pt2_batches`
-        passes: the second differences then give the PT2-corrected
+        passes ("auto": the fewest that fit the memory budget): the second differences then give the PT2-corrected
         polarizability of the space, which converges with the space much
         faster than the variational one (the screening makes E2 piecewise
         smooth in the field: each dropped term is below pt2_epsilon^2 over
@@ -1255,8 +1305,9 @@ class SelectedCI:
                 out, norm, stats = np.zeros(1), np.zeros(1), np.zeros(2, dtype=np.int64)
                 space = sci._space(dets)
                 try:
+                    passes = sci._pt2_batches(pt2_batches, len(dets), 64)
                     sci.kernels.sci_pt2_screened(space, vector.ctypes.data, 1, electronic.ctypes.data,
-                                                 screen.ctypes.data, float(pt2_epsilon), int(pt2_batches),
+                                                 screen.ctypes.data, float(pt2_epsilon), passes,
                                                  out.ctypes.data, norm.ctypes.data, stats.ctypes.data,
                                                  sci._threads())
                 finally:

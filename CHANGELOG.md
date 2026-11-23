@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Faster selected-CI stages (core ABI 48), same results. Deterministic PT2:
+  contributions are written as records into per-thread buckets and summed
+  per external in cache-sized tables (no shared hash map); batches are
+  ranges of an orbit-invariant additive key tested before an excitation's
+  image hashes are formed; `pt2_batches="auto"` (now the default) probes
+  1/32 of the externals and takes the fewest passes that fit the memory
+  budget (`itercc_sci_set_pt2_memory`); externals' diagonal energies come
+  from the leading determinant's in O(k^2); per-thread sums no longer share
+  cache lines. Selection: `itercc_sci_select` flag bit 1 adds reflections in
+  the kernel (the NumPy closure took 95% of a Sigma selection), and Sigma/Pi
+  series select from one determinant per orbit. CuF 18e aug-cc-pVDZ-DK
+  axial Sigma series to 3.0M determinants (12 threads): 122 -> 80 s
+  (selection 10.9 -> 0.7 s, PT2 19.5 -> 9.7 s at 3.0M); energies identical,
+  PT2 within 1e-16 Eh.
+
 - Larger Douglas-Kroll basis sets bundled (copied unchanged from PySCF
   2.14.0): aug-cc-pVTZ-DK, aug-cc-pVQZ-DK, aug-cc-pV5Z-DK, aug-cc-pwCVQZ-DK
   and aug-cc-pwCV5Z-DK, so scalar-relativistic models up to 5Z build without

@@ -151,7 +151,7 @@ Singlet EOM-EE-CCSDT (or EOM-CCSD with `method="ccsd"`). `solver` is the
 `from itercc.selected_ci import SelectedCI, SelectedCIResponse, extrapolate_gap, rotate_integrals`. Heat-bath selected CI with
 Epstein-Nesbet PT2 (near-full CI) of any real orbital Hamiltonian, compiled CPU kernels, up to 256 orbitals.
 - `.solve(nroots=1, *, references=None, spin_parity=None, epsilons=(1e-3, 3e-4, 1e-4, 5e-5), pt2_epsilon=None,
-  pt2_batches=1, pt2_deterministic=None, pt2_samples=200, pt2_sample_batches=20, seed=0, residual_tol=1e-5,
+  pt2_batches="auto", pt2_deterministic=None, pt2_samples=200, pt2_sample_batches=20, seed=0, residual_tol=1e-5,
   max_space=None, max_cycles=12, new_fraction=0.01, max_determinants=None, callback=None) -> SCIResult` (`stages`: epsilon, determinants, nonzeros, energies, pt2, s2, seconds).
 - `spin_parity` +1 even spin (singlets), -1 odd (triplets); `references` (rows from `.determinant(alpha, beta)`,
   `.aufbau()`, `.single_excitations(row, irrep=)`) fix the irrep.
@@ -163,7 +163,7 @@ Epstein-Nesbet PT2 (near-full CI) of any real orbital Hamiltonian, compiled CPU 
   spaces=None, solve_options=None, initial=None)
   -> [SCIPolarizability]` per stage (`polarizabilities`: `response.Polarizability` per wavelength, `tensors_au`,
   `dipole_au`, `determinants`, `space`): linear response in a space grown with dipole- and response-coupled
-  determinants; equals full CI in the full space. `.field_solver_factory(space, *, pt2_epsilon=None, pt2_batches=1,
+  determinants; equals full CI in the full space. `.field_solver_factory(space, *, pt2_epsilon=None, pt2_batches="auto",
   renormalized=False, pt2_screen=None)` for `finite_field_polarizability` (with pt2_epsilon: E_var + E_PT2 per field,
   the PT2-corrected tensor; pt2_screen fixes the PT2 screening so E2 is smooth in the field).
 - `SelectedCIResponse(sci, dipoles, determinants, *, spin_parity=1, previous=None)`: fixed-space response with the
@@ -171,8 +171,9 @@ Epstein-Nesbet PT2 (near-full CI) of any real orbital Hamiltonian, compiled CPU 
   `.static(j)`, `.field_screen(field_au)` (|c0| + F max_j |x_j|, for pt2_screen); `.close()` frees its Hamiltonian.
 - `.density_matrix(result, weights)`, `.natural_orbitals(result)` -> (occupations, coefficients, irreps);
   `rotate_integrals(h, eri, coefficients)`.
-- PT2 memory: about 96 bytes per external determinant (two roots, <= 128 orbitals); `pt2_batches=k` divides it by k
-  (each extra pass costs little: generating excitations is about a fifth of PT2's time). At most 63 alpha electrons.
+- PT2 memory: about 56 bytes per contribution H_ai c_i (two roots, <= 128 orbitals); `pt2_batches="auto"` (default)
+  takes the fewest passes that fit the memory budget (every pass rescans all excitations), `pt2_batches=k` k passes;
+  bit-identical results for any count. At most 63 alpha electrons.
 - Semistochastic PT2: `pt2_deterministic=` (exact above it) + seeded samples below; `stage.pt2_error`.
 - `spin_pairs=True`: with `spin_parity`, one function per alpha-beta swap pair (half the Hamiltonian; PT2 per pair).
 - Linear molecules: `itercc.axial.axial_orbitals(basis, mo_coeff)` -> `.real`, `.transform`, `.lz`, `.mirror`;

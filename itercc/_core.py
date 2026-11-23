@@ -17,7 +17,7 @@ import sys
 import threading
 from . import _runtime
 
-CORE_ABI = 47
+CORE_ABI = 48
 CUDA_ABI = 2
 _P, _I, _D, _T = ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.c_int
 # name (without the itercc_ prefix): (argument types, result type)
@@ -129,6 +129,7 @@ CPU_FUNCTIONS = {
     "sci_hamiltonian_pairs_extend": ([_P, _P, _I, _D, _D, _D, _T, _T], _P),
     "sci_orbits": ([_P, _D, _D, _P, _P, _T], _I),
     "sci_set_mirror": ([_P, _P], _T),
+    "sci_set_pt2_memory": ([_P, _I], None),
     "sci_ham_nnz": ([_P], _I),
     "sci_ham_free": ([_P], None),
     "sci_ham_diagonal": ([_P, _P], None),
