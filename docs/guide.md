@@ -332,9 +332,49 @@ dynamic and damped): `SelectedCIResponse` in a fixed space has this
 interface, and `SelectedCI.polarizability` grows the space; see Near-full CI
 below.
 
+### CCSDTQ linear response (`QuadruplesDipoleResponse`)
+
+```python
+from itercc import QuadruplesDipoleResponse, RestrictedCCSDTQ
+from itercc.spatial_symmetry import sector_labels
+
+def solver(irrep):        # labels that keep the irrep totally symmetric
+    return RestrictedCCSDTQ(model.h, model.eri, model.nocc, model.constant, backend="cpu",
+                            orbital_irreps=sector_labels(model.orbital_irreps, irrep))
+solvers = {k: solver(k) for k in {0, *dipole_irreps}}
+ground = solvers[0].solve(diis_quadruples="host", energy_tol=1e-12, residual_tol=2e-11)
+signature = solvers[0].layout_signature()          # the layout of ground's T4
+amplitudes = {k: s.combine_states([(1.0, ground.amplitudes, signature)]) for k, s in solvers.items()}
+response = QuadruplesDipoleResponse(solvers, amplitudes, dipoles, model.orbital_irreps,
+                                    dipole_irreps=dipole_irreps, axes=(0, 2), recycle_gib=1.0)
+response.polarizability(1064.0, tol=1e-6, restart=8).tensor_au
+```
+
+- The `DipoleResponse` algorithm (dipole solves at +-omega, one zero-shift
+  property solve per component, warm starts and shift recycling) with every
+  ingredient taken from the complete CCSDTQ residual: Jacobian actions from
+  `eom_ccsdtq.FiniteDifferenceEOM` (one residual per action outside the
+  totally symmetric sector), the dipole right-hand side as
+  Res(T; h + p) - Res(T; h) (the residual is linear in h), and the mixed
+  second derivatives from residuals at T + a d with fixed multiples of one
+  step, exact for the quartic BCH residual. No CCSDTQ Lambda or left
+  equations are needed. CPU solvers with `precision="double"`, real
+  frequencies only (no damping).
+- Each sector G of a dipole needs a solver with `sector_labels(labels, G)`
+  and the ground amplitudes in its layout; the property solves run on the
+  sector-0 (full group) solver. `axes` skips axes (yy = xx for a linear
+  molecule).
+- Per component and frequency: the dipole solves, one property solve, and
+  five residuals (four static) for the property right-hand side in a sector
+  G != 0, ten (seven) in sector 0.
+- Checks: four electrons (CCSDTQ is FCI) match the FCI response to 7e-10 au
+  where LR-CCSDT is off by 1.6e-5; six electrons match the finite-field
+  CCSDTQ derivative to 1.3e-9 au; symmetry sectors match the dense tensor.
+
 ### Finite fields (CCSDTQ and any other ground state)
 
-Analytic response stops at CCSDT. `finite_field_polarizability` takes the
+Analytic response stops at CCSDT (`QuadruplesDipoleResponse` above
+differentiates the CCSDTQ residual instead). `finite_field_polarizability` takes the
 second derivative of any ground-state energy in a uniform field, with the same
 fixed orbitals, so CCSDTQ gives its static tensor too:
 

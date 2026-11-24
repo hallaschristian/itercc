@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `QuadruplesDipoleResponse` (`itercc.response_ccsdtq`): fixed-orbital
+  LR-CCSDTQ dipole polarizabilities at real frequencies on the compiled CPU
+  solver. It runs the `DipoleResponse` algorithm (dipole solves at +-omega
+  and one zero-shift property solve per component, which folds in the ground
+  multipliers) with every ingredient taken from the CCSDTQ residual: the
+  finite-difference Jacobian of `FiniteDifferenceEOM` in each symmetry
+  sector, the dipole right-hand side as Res(T; h + p) - Res(T; h), and the
+  mixed second derivatives from residual stencils that are exact for the
+  quartic residual; no CCSDTQ Lambda or left-hand equations are needed.
+  Four electrons (CCSDTQ is FCI) reproduce the FCI response to
+  7e-10 au (LR-CCSDT is 1.6e-5 off); six electrons reproduce the
+  finite-field CCSDTQ derivative to 1.3e-9 au.
+
 - `RestrictedCC.solve` takes `diis_triples="auto"` by default: T3 starts
   with plain Jacobi steps (no triples history) and joins DIIS, with a
   RuntimeWarning, once its residual has risen three iterations running to
